@@ -100,11 +100,7 @@ template <typename T, int D, int V = D>
   thread U o[v_per_thread];    // Forward output (for delta computation)
 
   // Threadgroup memory for reductions and communication
-  threadgroup U shared_scores[BN];       // Attention scores for current KV block
-  threadgroup U shared_dP[BN];           // dP values for softmax gradient
   threadgroup U shared_delta[1];         // delta = sum(dO * O)
-  threadgroup U shared_dV[BN * D];       // Accumulated dV (transposed layout)
-  threadgroup U shared_dK[BN * D];       // Accumulated dK per simdgroup
   threadgroup U shared_dQ[BN * D];       // For dQ reduction across simdgroups
 
   // Compute positions (same as forward)
@@ -178,10 +174,8 @@ template <typename T, int D, int V = D>
   // Load logsumexp for this query position
   U lse = logsumexp[0];
 
-  // Initialize shared dV, dK, dQ to zero
+  // Initialize shared_dQ to zero
   for (int idx = simd_gid * BD + simd_lid; idx < BN * D; idx += BN * BD) {
-    shared_dV[idx] = 0;
-    shared_dK[idx] = 0;
     shared_dQ[idx] = 0;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -222,8 +216,9 @@ template <typename T, int D, int V = D>
         score += static_cast<U>(fmask[0]);
       }
 
-      // Reconstruct attention probability: P = exp(S - logsumexp)
-      U prob = fast::exp(score - lse);
+      // Reconstruct attention probability: P = 2^(S - logsumexp)
+      // Using exp2 because forward kernel computes LSE in log base 2 domain
+      U prob = fast::exp2(score - lse);
 
       // Compute dP = dO @ V^T for this KV position
       U dP = 0;
@@ -454,7 +449,8 @@ template <typename T, int D, int V = D>
         score += static_cast<U>(fm_ptr[mask_offset]);
       }
 
-      U prob = fast::exp(score - lse);
+      // Reconstruct probability using exp2 (forward uses log2 domain)
+      U prob = fast::exp2(score - lse);
 
       // Compute dP
       U dP = 0;

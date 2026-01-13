@@ -810,12 +810,14 @@ bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s, bool h
   const int query_seq_len = q.shape(2);
 
   // For short sequences (seq <= 8), use vector VJP kernel
-  // Supports head dims: 64, 96, 128, 256
+  // Supports head dims: 64, 96, 128
+  // NOTE: D=256 exceeds Metal's 32KB threadgroup memory limit:
+  //   shared_delta[1] + shared_dQ[BN * D] = 4 + 32*256*4 = 32,772 bytes > 32,768
   // NOTE: For half/bfloat16 dtypes, the vector VJP kernel uses float32 accumulator
   // buffers which are then converted back to the original dtype (see eval_gpu).
   if (query_seq_len <= 8) {
     const bool supported_head_dim = (query_head_dim == 64 || query_head_dim == 96 ||
-                                     query_head_dim == 128 || query_head_dim == 256);
+                                     query_head_dim == 128);
     return !supported_head_dim;
   }
 

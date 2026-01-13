@@ -52,11 +52,11 @@ instantiate_sdpa_vector_heads(float16_t)
       qk_dim,                                                   \
       value_dim)
 
+// Note: D=256 exceeds Metal's 32KB threadgroup memory limit for vector VJP kernel
 #define instantiate_sdpa_vector_vjp_heads(type)    \
   instantiate_sdpa_vector_vjp(type, 64, 64)        \
   instantiate_sdpa_vector_vjp(type, 96, 96)        \
-  instantiate_sdpa_vector_vjp(type, 128, 128)      \
-  instantiate_sdpa_vector_vjp(type, 256, 256)
+  instantiate_sdpa_vector_vjp(type, 128, 128)
 
 instantiate_sdpa_vector_vjp_heads(float)
 instantiate_sdpa_vector_vjp_heads(bfloat16_t)
@@ -71,11 +71,11 @@ instantiate_sdpa_vector_vjp_heads(float16_t)
       qk_dim,                                                   \
       value_dim)
 
+// Note: D=256 exceeds Metal's 32KB threadgroup memory limit for vector VJP kernel
 #define instantiate_sdpa_vector_vjp_accumulate_heads(type)    \
   instantiate_sdpa_vector_vjp_accumulate(type, 64, 64)        \
   instantiate_sdpa_vector_vjp_accumulate(type, 96, 96)        \
-  instantiate_sdpa_vector_vjp_accumulate(type, 128, 128)      \
-  instantiate_sdpa_vector_vjp_accumulate(type, 256, 256)
+  instantiate_sdpa_vector_vjp_accumulate(type, 128, 128)
 
 // Note: Only instantiate for half/bfloat16 since float32 doesn't need accumulate variant
 instantiate_sdpa_vector_vjp_accumulate_heads(bfloat16_t)
