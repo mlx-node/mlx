@@ -234,9 +234,10 @@ template <typename T, int D, int V = D>
 
       // Compute dK = scale * dS * Q (this position)
       // Each thread computes its portion of dK
-      // Note: q[j] already has scale applied, so divide it out to get unscaled query
+      // Note: q[j] already has scale applied (q[j] = scale * Q[j]), so:
+      // dK = scale * dS * Q = scale * dS * (q[j] / scale) = dS * q[j]
       for (int j = 0; j < qk_per_thread; j++) {
-        U dk_val = static_cast<U>(scale) * dS * (q[j] / static_cast<U>(scale));
+        U dk_val = dS * q[j];
         // Atomic add - multiple query positions may contribute to same dK
         mlx_atomic_fetch_add_explicit(
             reinterpret_cast<device mlx_atomic<float>*>(d_keys),
@@ -274,8 +275,10 @@ template <typename T, int D, int V = D>
   // but they all contribute to the same query gradient
 
   // Store each simdgroup's partial dQ to shared memory
+  // NOTE: Use D (head dimension) not BD (simdgroup width) for the stride
+  // Each simdgroup needs D elements to store its full dQ contribution
   for (int i = 0; i < qk_per_thread; i++) {
-    shared_dQ[simd_gid * BD + simd_lid * qk_per_thread + i] = dq[i];
+    shared_dQ[simd_gid * D + simd_lid * qk_per_thread + i] = dq[i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -284,7 +287,7 @@ template <typename T, int D, int V = D>
     for (int i = 0; i < qk_per_thread; i++) {
       U sum_dq = 0;
       for (int sg = 0; sg < BN; sg++) {
-        sum_dq += shared_dQ[sg * BD + simd_lid * qk_per_thread + i];
+        sum_dq += shared_dQ[sg * D + simd_lid * qk_per_thread + i];
       }
       d_queries[i] = static_cast<T>(sum_dq);
     }
@@ -490,8 +493,10 @@ template <typename T, int D, int V = D>
   }
 
   // Reduce and write dQ
+  // NOTE: Use D (head dimension) not BD (simdgroup width) for the stride
+  // Each simdgroup needs D elements to store its full dQ contribution
   for (int i = 0; i < qk_per_thread; i++) {
-    shared_dQ[simd_gid * BD + simd_lid * qk_per_thread + i] = dq[i];
+    shared_dQ[simd_gid * D + simd_lid * qk_per_thread + i] = dq[i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -499,7 +504,7 @@ template <typename T, int D, int V = D>
     for (int i = 0; i < qk_per_thread; i++) {
       U sum_dq = 0;
       for (int sg = 0; sg < BN; sg++) {
-        sum_dq += shared_dQ[sg * BD + simd_lid * qk_per_thread + i];
+        sum_dq += shared_dQ[sg * D + simd_lid * qk_per_thread + i];
       }
       dq_ptr[i] = static_cast<T>(sum_dq);
     }

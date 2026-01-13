@@ -428,7 +428,20 @@ void attention_vjp_dq(
       MMATile<AccumType, 1, TK, MMAFrag_acc_t> VTtile;
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik++) {
-        // BD==128 barrier pattern: match forward kernel for memory access synchronization
+        // BD == 128 requires an extra barrier pattern.
+        // On some Metal GPU/driver combinations the BD=128 configuration uses a
+        // more aggressive shared-memory (threadgroup memory) layout and the
+        // compiler may reorder the transposed V loads around the MMA usage.
+        // The additional barriers here match the forward kernel's sequence and
+        // enforce a strict ordering of:
+        //   1) all stores to Vs_smem by the producer phase,
+        //   2) the transposed loads from Vs into VTtile in this loop, and
+        //   3) subsequent consumption by the MMA.
+        // This guard is compile-time (`if constexpr`) so the barrier pattern is
+        // uniform across the whole simdgroup for a given specialization.
+        // Do not remove or alter this BD == 128 barrier pattern without
+        // re-validating numerics and race-freedom against the forward kernel on
+        // all supported GPU generations.
         if constexpr (BD == 128) {
           simdgroup_barrier(mem_flags::mem_none);
         }

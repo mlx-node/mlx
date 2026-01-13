@@ -1426,6 +1426,9 @@ void ScaledDotProductAttentionVJP::eval_gpu(
       d_v.set_data(allocator::malloc(d_v.nbytes()));
     } else {
       // Float32 dtype: can use dK/dV directly with zero-initialization
+      // Must allocate memory before fill_gpu
+      d_k.set_data(allocator::malloc(d_k.nbytes()));
+      d_v.set_data(allocator::malloc(d_v.nbytes()));
       array zero = array(0.0f, q.dtype());
       fill_gpu(zero, d_k, s);
       fill_gpu(zero, d_v, s);

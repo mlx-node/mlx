@@ -464,9 +464,9 @@ template <
 
   // Output logsumexp if requested for VJP backward pass
   // LSE = max_score + log2(sum_score) in log2 domain (matches STEEL convention)
-  // Output shape: [B, H, qL, 1], laid out as linear array indexed by (B*H + head)*qL + query_pos
-  // LSE_strides[0] = qL (stride between heads)
-  // LSE_strides[1] = 1 (stride between query positions)
+  // Physical storage shape: [B*H, qL], laid out as linear array indexed by (B*H + head)*qL + query_pos
+  // LSE_strides[0] = qL (stride between (batch, head) rows)
+  // LSE_strides[1] = 1 (stride between query positions within a row)
   if (output_logsumexp) {
     // Compute linear index for (batch, head) combination
     // This matches the VJP kernel's indexing: (tidl.z * H + tidl.y) * LSE_strides[0]

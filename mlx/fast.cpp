@@ -865,12 +865,13 @@ std::vector<array> ScaledDotProductAttention::vjp(
 
   // Get logsumexp from cache (computed during eval_gpu) or from outputs
   // The forward pass caches logsumexp for VJP access even when only returning outputs[0]
+  // For vector mode (seq <= 8), logsumexp is not computed so we rely on the cache.
   const array* logsumexp_ptr = nullptr;
-  if (outputs.size() >= 2) {
-    // Normal case: logsumexp is in outputs[1]
+  if (outputs.size() >= 2 && outputs[1].buffer().ptr() != nullptr) {
+    // Normal case: logsumexp is in outputs[1] and was allocated by forward pass
     logsumexp_ptr = &outputs[1];
   } else {
-    // Forward returned only attention output; use cached logsumexp
+    // Forward didn't populate logsumexp (e.g., vector mode) - try cache
     const auto& cached = get_cached_logsumexp();
     if (!cached.has_value()) {
       // Cache not available - fall back to unfused VJP
