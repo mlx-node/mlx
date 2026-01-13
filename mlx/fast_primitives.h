@@ -258,6 +258,21 @@ class ScaledDotProductAttention : public Custom {
   bool do_causal_;
   bool has_sinks_;
   bool output_logsumexp_;
+  // Cache logsumexp for VJP backward pass
+  // This enables Flash Attention VJP to access logsumexp even when
+  // the forward pass returns only the attention output to the user.
+  // Size is small: batch * heads * seq * 1 * sizeof(float) = ~512KB per layer
+  mutable std::optional<array> cached_logsumexp_;
+
+ public:
+  // Getter for VJP to access cached logsumexp
+  const std::optional<array>& get_cached_logsumexp() const {
+    return cached_logsumexp_;
+  }
+  // Setter called during eval_gpu
+  void set_cached_logsumexp(array logsumexp) const {
+    cached_logsumexp_ = std::move(logsumexp);
+  }
 };
 
 class ScaledDotProductAttentionVJP : public Custom {
@@ -273,7 +288,7 @@ class ScaledDotProductAttentionVJP : public Custom {
         do_causal_(do_causal),
         has_sinks_(has_sinks) {}
 
-  static bool use_fallback(const array& q, Stream s);
+  static bool use_fallback(const array& q, Stream s, bool has_mask = false, bool has_sinks = false);
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {

@@ -42,7 +42,9 @@ bool fast::ScaledDotProductAttention::supports_bool_mask() {
 
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
-    Stream s) {
+    Stream s,
+    bool /* has_mask */,
+    bool /* has_sinks */) {
   return true;
 }
 

@@ -806,7 +806,7 @@ array scaled_dot_product_attention(
   }
 
   bool is_training = detail::in_grad_tracing();
-  bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
+  bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream, has_mask, has_sinks);
   bool output_logsumexp = is_training && has_fast_vjp;
   if (!ScaledDotProductAttention::use_fallback(
           q,
@@ -853,9 +853,30 @@ std::vector<array> ScaledDotProductAttention::vjp(
   assert(cotangents.size() == outputs.size());
 
   auto s = stream();
-  if (ScaledDotProductAttentionVJP::use_fallback(primals[0], s)) {
-    assert(outputs.size() == 1);
+
+  // Determine if mask is present: primals = [Q, K, V, (mask), (sinks)]
+  bool has_mask = primals.size() > static_cast<size_t>(3 + has_sinks_);
+
+  // Check if we can use Flash Attention VJP
+  if (ScaledDotProductAttentionVJP::use_fallback(primals[0], s, has_mask, has_sinks_) ||
+      !output_logsumexp_) {
     return Custom::vjp(primals, cotangents, argnums, outputs);
+  }
+
+  // Get logsumexp from cache (computed during eval_gpu) or from outputs
+  // The forward pass caches logsumexp for VJP access even when only returning outputs[0]
+  const array* logsumexp_ptr = nullptr;
+  if (outputs.size() >= 2) {
+    // Normal case: logsumexp is in outputs[1]
+    logsumexp_ptr = &outputs[1];
+  } else {
+    // Forward returned only attention output; use cached logsumexp
+    const auto& cached = get_cached_logsumexp();
+    if (!cached.has_value()) {
+      // Cache not available - fall back to unfused VJP
+      return Custom::vjp(primals, cotangents, argnums, outputs);
+    }
+    logsumexp_ptr = &cached.value();
   }
 
   auto fallback = [sdpa = fallback_, s](const std::vector<array>& inputs) {
@@ -873,8 +894,8 @@ std::vector<array> ScaledDotProductAttention::vjp(
   auto primitive = std::make_shared<ScaledDotProductAttentionVJP>(
       s, fallback, scale_, do_causal_, has_sinks_);
   std::vector<array> inputs = primals;
-  inputs.push_back(outputs[0]);
-  inputs.push_back(outputs[1]);
+  inputs.push_back(outputs[0]);          // Attention output
+  inputs.push_back(*logsumexp_ptr);      // Logsumexp (from outputs or cache)
   inputs.push_back(cotangents[0]);
   auto vjps = array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
 

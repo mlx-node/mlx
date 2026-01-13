@@ -460,7 +460,11 @@ void ScaledDotProductAttention::eval_gpu(
   }
 }
 
-bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
+bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s, bool has_mask, bool has_sinks) {
+  // Force unfused attention when masks/sinks present
+  if (has_mask || has_sinks) {
+    return true;
+  }
   // The frontend adds a padding mask when sequence length is not a multiple of
   // tile size.
   if (q.shape(2) % 128 != 0) {
