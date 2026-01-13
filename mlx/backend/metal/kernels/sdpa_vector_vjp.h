@@ -29,6 +29,14 @@ using namespace metal;
 //
 // This kernel handles the "vector" case where Q_seq is small (<=8).
 // Each threadgroup processes one (batch, head, q_seq) position.
+//
+// IMPORTANT: Stride Assumption
+// This kernel uses input strides (k_head_stride, k_seq_stride, v_head_stride,
+// v_seq_stride) for output array (d_keys, d_values) pointer arithmetic.
+// The dispatch code must ensure that output arrays have matching strides:
+//   - d_k.strides() must match k.strides() for head and seq dimensions
+//   - d_v.strides() must match v.strides() for head and seq dimensions
+// Failure to maintain this invariant will cause memory corruption.
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename T, int D, int V = D>

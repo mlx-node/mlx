@@ -475,10 +475,12 @@ template <
 
     // Write one logsumexp per query position in this tile
     // Each thread handles kRowsPT query positions
+    // align_Q=true means query length is aligned (all blocks full), so always write
+    // align_Q=false means last block is partial, so check bounds
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
       int row_pos = tid.x * BQ + tm + sm + (i * decltype(Stile)::kFragRows);
-      if (!align_Q || row_pos < params->qL) {
+      if (align_Q || row_pos < params->qL) {
         AccumType lse_val = max_score[i] + fast::log2(sum_score[i]);
         lse_out[row_pos * params->LSE_strides[1]] = static_cast<float>(lse_val);
       }
