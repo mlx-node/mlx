@@ -870,16 +870,22 @@ void sdpa_vector_vjp_dispatch(
 
   // Vector VJP kernel uses input strides for output pointer arithmetic.
   // Verify output strides match input strides to prevent memory corruption.
+  // Stride requirements:
+  //   d_k head stride must match k head stride
+  //   d_k seq stride must match k seq stride
+  //   d_v head stride must match v head stride
+  //   d_v seq stride must match v seq stride
   size_t d_k_head_stride = d_k.shape(1) == 1 ? d_k.strides(0) : d_k.strides(1);
   size_t d_v_head_stride = d_v.shape(1) == 1 ? d_v.strides(0) : d_v.strides(1);
-  assert(d_k_head_stride == k_head_stride &&
-         "d_k head stride must match k head stride for vector VJP kernel");
-  assert(d_k.strides()[2] == k_seq_stride &&
-         "d_k seq stride must match k seq stride for vector VJP kernel");
-  assert(d_v_head_stride == v_head_stride &&
-         "d_v head stride must match v head stride for vector VJP kernel");
-  assert(d_v.strides()[2] == v_seq_stride &&
-         "d_v seq stride must match v seq stride for vector VJP kernel");
+  if (d_k_head_stride != k_head_stride ||
+      d_k.strides()[2] != k_seq_stride ||
+      d_v_head_stride != v_head_stride ||
+      d_v.strides()[2] != v_seq_stride) {
+    throw std::runtime_error(
+        "Stride mismatch in vector VJP kernel: "
+        "output array strides must match input array strides. "
+        "This may occur with non-contiguous array views.");
+  }
 
   MTL::Size group_dims(1024, 1, 1);
   MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
@@ -997,16 +1003,22 @@ void sdpa_vector_vjp_accumulate_dispatch(
 
   // Vector VJP kernel uses input strides for output pointer arithmetic.
   // Verify accumulator buffer strides match input strides to prevent memory corruption.
+  // Stride requirements:
+  //   d_k_accum head stride must match k head stride
+  //   d_k_accum seq stride must match k seq stride
+  //   d_v_accum head stride must match v head stride
+  //   d_v_accum seq stride must match v seq stride
   size_t d_k_head_stride = d_k_accum.shape(1) == 1 ? d_k_accum.strides(0) : d_k_accum.strides(1);
   size_t d_v_head_stride = d_v_accum.shape(1) == 1 ? d_v_accum.strides(0) : d_v_accum.strides(1);
-  assert(d_k_head_stride == k_head_stride &&
-         "d_k_accum head stride must match k head stride for vector VJP kernel");
-  assert(d_k_accum.strides()[2] == k_seq_stride &&
-         "d_k_accum seq stride must match k seq stride for vector VJP kernel");
-  assert(d_v_head_stride == v_head_stride &&
-         "d_v_accum head stride must match v head stride for vector VJP kernel");
-  assert(d_v_accum.strides()[2] == v_seq_stride &&
-         "d_v_accum seq stride must match v seq stride for vector VJP kernel");
+  if (d_k_head_stride != k_head_stride ||
+      d_k_accum.strides()[2] != k_seq_stride ||
+      d_v_head_stride != v_head_stride ||
+      d_v_accum.strides()[2] != v_seq_stride) {
+    throw std::runtime_error(
+        "Stride mismatch in vector VJP kernel: "
+        "output array strides must match input array strides. "
+        "This may occur with non-contiguous array views.");
+  }
 
   MTL::Size group_dims(1024, 1, 1);
   MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
