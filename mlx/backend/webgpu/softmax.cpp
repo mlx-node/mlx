@@ -17,75 +17,12 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mlx::core {
 
 namespace {
-
-constexpr uint32_t WORKGROUP_SIZE = 256;
-
-// ---------------------------------------------------------------------------
-// Uniform buffer helpers
-// ---------------------------------------------------------------------------
-
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error(
-        "[WebGPU softmax] Failed to create uniform buffer");
-  }
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
-
-// ---------------------------------------------------------------------------
-// Shader module cache
-// ---------------------------------------------------------------------------
-
-WGPUShaderModule
-get_shader_module(const std::string& key, const std::string& source) {
-  static std::mutex mtx;
-  static std::unordered_map<std::string, WGPUShaderModule> cache;
-
-  std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = source.c_str();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = key.c_str();
-
-  WGPUShaderModule mod =
-      wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU softmax] Failed to create shader module: " + key);
-  }
-
-  cache[key] = mod;
-  return mod;
-}
 
 // ---------------------------------------------------------------------------
 // Softmax params
@@ -109,7 +46,7 @@ std::string make_softmax_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = " << WORKGROUP_SIZE << "u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
 
   s << "struct SoftmaxParams {\n"
     << "  data: vec4<u32>,\n"
@@ -233,8 +170,9 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   std::string acc_type = "f32";
 
   std::string entry_name = std::string("softmax_") + in_type;
-  std::string source = make_softmax_kernel(entry_name, in_type, acc_type);
-  WGPUShaderModule shader = get_shader_module(entry_name, source);
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      entry_name,
+      [&]() { return make_softmax_kernel(entry_name, in_type, acc_type); });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -245,48 +183,22 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.data[0] = static_cast<uint32_t>(axis_size);
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(SoftmaxParams));
+      wgpu::create_uniform_buffer(&params, sizeof(SoftmaxParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  // Create bind group
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[3] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = in_buf;
-  entries[0].offset = 0;
-  entries[0].size = in_buf_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = out_buf;
-  entries[1].offset = 0;
-  entries[1].size = out_buf_size;
-
-  entries[2].binding = 2;
-  entries[2].buffer = uniform_buf;
-  entries[2].offset = 0;
-  entries[2].size = sizeof(SoftmaxParams);
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 3;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error("[WebGPU softmax] Failed to create bind group");
-  }
+  WGPUBindGroup bg = wgpu::create_bind_group(
+      pipeline,
+      {{in_buf, in_buf_size},
+       {out_buf, out_buf_size},
+       {uniform_buf, sizeof(SoftmaxParams)}});
 
   // One workgroup per row
   encoder.dispatch_compute(
-      pipeline, {bg}, static_cast<uint32_t>(n_rows));
+      pipeline, bg, static_cast<uint32_t>(n_rows));
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

@@ -1,6 +1,7 @@
 // Copyright 2026 Apple Inc.
 
 #include "mlx/backend/webgpu/device.h"
+#include "mlx/backend/webgpu/utils.h"
 #include "mlx/backend/webgpu/worker.h"
 #include "mlx/utils.h"
 
@@ -13,21 +14,6 @@
 #include <stdexcept>
 
 namespace mlx::core::wgpu {
-
-namespace {
-
-// Poll the WebGPU instance until a condition becomes true.
-// Works with both Dawn (wgpuInstanceProcessEvents) and can be adapted.
-void poll_instance(WGPUInstance instance) {
-#if defined(WEBGPU_BACKEND_WGPU)
-  wgpuInstancePoll(instance, false, nullptr);
-#else
-  // Dawn uses wgpuInstanceProcessEvents
-  wgpuInstanceProcessEvents(instance);
-#endif
-}
-
-} // namespace
 
 ///////////////////////////////////////////////////////////////////////////////
 // Device implementation
@@ -189,6 +175,14 @@ Device::~Device() {
   // Clear encoders first (they hold worker threads)
   encoders_.clear();
 
+  // Release shader cache
+  for (auto& [key, mod] : shader_cache_) {
+    if (mod) {
+      wgpuShaderModuleRelease(mod);
+    }
+  }
+  shader_cache_.clear();
+
   // Release pipeline cache
   for (auto& [key, pipeline] : pipeline_cache_) {
     if (pipeline) {
@@ -245,6 +239,36 @@ WGPUComputePipeline Device::get_or_create_pipeline(
 
   pipeline_cache_[key] = pipeline;
   return pipeline;
+}
+
+WGPUShaderModule Device::get_or_create_shader_module(
+    const std::string& key,
+    const std::function<std::string()>& source_builder) {
+  std::lock_guard<std::mutex> lock(shader_mutex_);
+  auto it = shader_cache_.find(key);
+  if (it != shader_cache_.end()) {
+    return it->second;
+  }
+
+  // Cache miss: generate the source via the builder lambda
+  std::string source = source_builder();
+
+  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
+  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
+  wgsl_desc.code = source.c_str();
+
+  WGPUShaderModuleDescriptor desc = {};
+  desc.nextInChain = &wgsl_desc.chain;
+  desc.label = key.c_str();
+
+  WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device_, &desc);
+  if (!mod) {
+    throw std::runtime_error(
+        "[WebGPU] Failed to create shader module: " + key);
+  }
+
+  shader_cache_[key] = mod;
+  return mod;
 }
 
 Device& device() {
@@ -315,6 +339,21 @@ void CommandEncoder::dispatch_compute(
     wgpuComputePassEncoderSetBindGroup(
         compute_pass_, i, bind_groups[i], 0, nullptr);
   }
+  wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
+  op_count_++;
+}
+
+void CommandEncoder::dispatch_compute(
+    WGPUComputePipeline pipeline,
+    WGPUBindGroup bind_group,
+    uint32_t x,
+    uint32_t y,
+    uint32_t z) {
+  ensure_active();
+
+  wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+  wgpuComputePassEncoderSetBindGroup(
+      compute_pass_, 0, bind_group, 0, nullptr);
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
 }

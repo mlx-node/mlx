@@ -7,18 +7,12 @@
 #include "gen/wgsl_sources.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
 namespace mlx::core {
 
 namespace {
-
-constexpr uint32_t WORKGROUP_SIZE = 256;
-constexpr uint32_t N_READS = 4;
-constexpr uint32_t MAX_NDIM = 8;
 
 // Must match the WGSL CopyParams struct layout with vec4 packing.
 //
@@ -42,99 +36,12 @@ struct CopyParams {
   int32_t out_strides_1[4];     // out_strides[4..7]
 };
 
-// Create a WGPUBuffer with initial data for use as a uniform buffer.
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error("[WebGPU copy] Failed to create uniform buffer");
-  }
-
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
-
 // Get or create the shader module for copy kernels.
-// Thread-safe: uses a mutex to protect the static variable.
 WGPUShaderModule get_copy_shader_module() {
-  static std::mutex mtx;
-  static WGPUShaderModule cached_module = nullptr;
-  std::lock_guard<std::mutex> lock(mtx);
-  if (cached_module) {
-    return cached_module;
-  }
-
   auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = wgpu::kernels::copy();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = "copy_kernels";
-
-  cached_module = wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!cached_module) {
-    throw std::runtime_error("[WebGPU] Failed to create copy shader module");
-  }
-  return cached_module;
-}
-
-// Create a bind group with the given buffers.
-// Layout (auto-generated from pipeline):
-//   @group(0) @binding(0) — src storage buffer (read)
-//   @group(0) @binding(1) — dst storage buffer (read_write)
-//   @group(0) @binding(2) — params uniform buffer
-WGPUBindGroup create_copy_bind_group(
-    WGPUComputePipeline pipeline,
-    WGPUBuffer input,
-    uint64_t in_size,
-    WGPUBuffer output,
-    uint64_t out_size,
-    WGPUBuffer uniform_buf,
-    uint64_t uniform_size) {
-  auto& dev = wgpu::device();
-
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[3] = {};
-
-  entries[0].binding = 0;
-  entries[0].buffer = input;
-  entries[0].offset = 0;
-  entries[0].size = in_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = output;
-  entries[1].offset = 0;
-  entries[1].size = out_size;
-
-  entries[2].binding = 2;
-  entries[2].buffer = uniform_buf;
-  entries[2].offset = 0;
-  entries[2].size = uniform_size;
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 3;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error("[WebGPU copy] Failed to create bind group");
-  }
-  return bg;
+  return dev.get_or_create_shader_module(
+      "copy_kernels",
+      []() { return std::string(wgpu::kernels::copy()); });
 }
 
 // Map CopyType to the WGSL entry point name.
@@ -197,7 +104,7 @@ void dispatch_copy(
   params.size_ndim_offsets[3] = effective_out_offset;
 
   uint32_t ndim = params.size_ndim_offsets[1];
-  for (uint32_t i = 0; i < ndim && i < MAX_NDIM; ++i) {
+  for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
     if (i < 4) {
       params.shape_0[i] = static_cast<uint32_t>(shape[i]);
       params.in_strides_0[i] = static_cast<int32_t>(strides_in[i]);
@@ -209,29 +116,28 @@ void dispatch_copy(
     }
   }
 
-  WGPUBuffer uniform_buf = create_uniform_buffer(&params, sizeof(CopyParams));
+  WGPUBuffer uniform_buf =
+      wgpu::create_uniform_buffer(&params, sizeof(CopyParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  WGPUBindGroup bg = create_copy_bind_group(
+  WGPUBindGroup bg = wgpu::create_bind_group(
       pipeline,
-      in_buf,
-      in_buf_size,
-      out_buf,
-      out_buf_size,
-      uniform_buf,
-      sizeof(CopyParams));
+      {{in_buf, in_buf_size},
+       {out_buf, out_buf_size},
+       {uniform_buf, sizeof(CopyParams)}});
 
   // Compute workgroup count:
   // Each thread processes N_READS elements; WORKGROUP_SIZE threads per group.
-  uint32_t total_threads = (elem_count + N_READS - 1) / N_READS;
+  uint32_t total_threads =
+      (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
-      (total_threads + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+      (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
 
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+  encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

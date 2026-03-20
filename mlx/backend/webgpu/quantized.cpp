@@ -18,17 +18,12 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mlx::core {
 
 namespace {
-
-constexpr uint32_t WORKGROUP_SIZE = 256;
 
 struct QuantizedMatmulParams {
   uint32_t M;
@@ -48,56 +43,6 @@ struct QuantizedMatmulParams {
   uint32_t _pad0;
   uint32_t _pad1;
 };
-
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error(
-        "[WebGPU quantized] Failed to create uniform buffer");
-  }
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
-
-WGPUShaderModule
-get_shader_module(const std::string& key, const std::string& source) {
-  static std::mutex mtx;
-  static std::unordered_map<std::string, WGPUShaderModule> cache;
-
-  std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = source.c_str();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = key.c_str();
-
-  WGPUShaderModule mod =
-      wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU quantized] Failed to create shader module: " + key);
-  }
-
-  cache[key] = mod;
-  return mod;
-}
 
 // Generate the quantized matmul WGSL kernel.
 //
@@ -262,11 +207,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       (transpose_ ? "_t" : "_n");
   std::string pipeline_key = entry_name;
 
-  std::string source =
-      make_quantized_matmul_kernel(entry_name, x_type, bits_);
-  WGPUShaderModule shader = get_shader_module(pipeline_key, source);
-
   auto& dev = wgpu::device();
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      pipeline_key,
+      [&]() {
+        return make_quantized_matmul_kernel(entry_name, x_type, bits_);
+      });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
 
@@ -307,7 +253,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.transpose = transpose_ ? 1 : 0;
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(QuantizedMatmulParams));
+      wgpu::create_uniform_buffer(&params, sizeof(QuantizedMatmulParams));
 
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
@@ -315,59 +261,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer b_buf = wgpu::wgpu_buffer(biases);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-  // Bind group: x(0), w(1), scales(2), biases(3), out(4), params(5)
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[6] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = x_buf;
-  entries[0].offset = 0;
-  entries[0].size = wgpuBufferGetSize(x_buf);
-
-  entries[1].binding = 1;
-  entries[1].buffer = w_buf;
-  entries[1].offset = 0;
-  entries[1].size = wgpuBufferGetSize(w_buf);
-
-  entries[2].binding = 2;
-  entries[2].buffer = s_buf;
-  entries[2].offset = 0;
-  entries[2].size = wgpuBufferGetSize(s_buf);
-
-  entries[3].binding = 3;
-  entries[3].buffer = b_buf;
-  entries[3].offset = 0;
-  entries[3].size = wgpuBufferGetSize(b_buf);
-
-  entries[4].binding = 4;
-  entries[4].buffer = out_buf;
-  entries[4].offset = 0;
-  entries[4].size = wgpuBufferGetSize(out_buf);
-
-  entries[5].binding = 5;
-  entries[5].buffer = uniform_buf;
-  entries[5].offset = 0;
-  entries[5].size = sizeof(QuantizedMatmulParams);
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 6;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error(
-        "[WebGPU quantized] Failed to create bind group");
-  }
+  WGPUBindGroup bg = wgpu::create_bind_group(
+      pipeline,
+      {{x_buf, wgpuBufferGetSize(x_buf)},
+       {w_buf, wgpuBufferGetSize(w_buf)},
+       {s_buf, wgpuBufferGetSize(s_buf)},
+       {b_buf, wgpuBufferGetSize(b_buf)},
+       {out_buf, wgpuBufferGetSize(out_buf)},
+       {uniform_buf, sizeof(QuantizedMatmulParams)}});
 
   uint32_t output_size = M * N;
   uint32_t num_workgroups_x =
-      (output_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+      (output_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
 
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups_x, 1, batch_size);
+  encoder.dispatch_compute(pipeline, bg, num_workgroups_x, 1, batch_size);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

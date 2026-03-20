@@ -13,18 +13,12 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mlx::core {
 
 namespace {
-
-constexpr uint32_t WORKGROUP_SIZE = 256;
-constexpr uint32_t MAX_NDIM = 8;
 
 // C++ struct matching the WGSL BinaryParams layout (vec4-aligned).
 // Total: 112 bytes.
@@ -37,27 +31,6 @@ struct BinaryParams {
   int32_t b_strides_0[4]; // b_strides[0..3]
   int32_t b_strides_1[4]; // b_strides[4..7]
 };
-
-// ---------------------------------------------------------------------------
-// Uniform buffer creation (same pattern as copy.cpp)
-// ---------------------------------------------------------------------------
-
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error("[WebGPU binary] Failed to create uniform buffer");
-  }
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
 
 // ---------------------------------------------------------------------------
 // WGSL code generation
@@ -172,95 +145,6 @@ std::string make_binary_kernel(
     << "}\n";
 
   return s.str();
-}
-
-// ---------------------------------------------------------------------------
-// Shader module cache
-// ---------------------------------------------------------------------------
-
-WGPUShaderModule
-get_shader_module(const std::string& key, const std::string& source) {
-  static std::mutex mtx;
-  static std::unordered_map<std::string, WGPUShaderModule> cache;
-
-  std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = source.c_str();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = key.c_str();
-
-  WGPUShaderModule mod =
-      wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU binary] Failed to create shader module: " + key);
-  }
-
-  cache[key] = mod;
-  return mod;
-}
-
-// ---------------------------------------------------------------------------
-// Bind group creation (2 inputs + 1 output + 1 uniform)
-// ---------------------------------------------------------------------------
-
-WGPUBindGroup create_binary_bind_group(
-    WGPUComputePipeline pipeline,
-    WGPUBuffer a_buf,
-    uint64_t a_size,
-    WGPUBuffer b_buf,
-    uint64_t b_size,
-    WGPUBuffer out_buf,
-    uint64_t out_size,
-    WGPUBuffer uniform_buf,
-    uint64_t uniform_size) {
-  auto& dev = wgpu::device();
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[4] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = a_buf;
-  entries[0].offset = 0;
-  entries[0].size = a_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = b_buf;
-  entries[1].offset = 0;
-  entries[1].size = b_size;
-
-  entries[2].binding = 2;
-  entries[2].buffer = out_buf;
-  entries[2].offset = 0;
-  entries[2].size = out_size;
-
-  entries[3].binding = 3;
-  entries[3].buffer = uniform_buf;
-  entries[3].offset = 0;
-  entries[3].size = uniform_size;
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 4;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error("[WebGPU binary] Failed to create bind group");
-  }
-  return bg;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,12 +311,14 @@ void binary_op_gpu_dispatch(
       variant + "_" + in_type + "_" + out_wgsl_type;
   std::string pipeline_key = entry_name;
 
-  // Generate WGSL source, get shader module and pipeline
-  std::string source = make_binary_kernel(
-      entry_name, in_type, out_wgsl_type, op_expr, variant);
-  WGPUShaderModule shader = get_shader_module(pipeline_key, source);
-
+  // Get shader module with lazy codegen, then pipeline
   auto& dev = wgpu::device();
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      pipeline_key,
+      [&]() {
+        return make_binary_kernel(
+            entry_name, in_type, out_wgsl_type, op_expr, variant);
+      });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
 
@@ -460,7 +346,7 @@ void binary_op_gpu_dispatch(
     params.size_ndim[1] = static_cast<uint32_t>(shape_collapsed.size());
 
     uint32_t ndim = params.size_ndim[1];
-    for (uint32_t i = 0; i < ndim && i < MAX_NDIM; ++i) {
+    for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
       if (i < 4) {
         params.shape_0[i] = static_cast<uint32_t>(shape_collapsed[i]);
         params.a_strides_0[i] = static_cast<int32_t>(a_strides[i]);
@@ -477,7 +363,7 @@ void binary_op_gpu_dispatch(
   }
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(BinaryParams));
+      wgpu::create_uniform_buffer(&params, sizeof(BinaryParams));
 
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
@@ -486,15 +372,16 @@ void binary_op_gpu_dispatch(
   uint64_t b_buf_size = wgpuBufferGetSize(b_buf);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  WGPUBindGroup bg = create_binary_bind_group(
+  WGPUBindGroup bg = wgpu::create_bind_group(
       pipeline,
-      a_buf, a_buf_size,
-      b_buf, b_buf_size,
-      out_buf, out_buf_size,
-      uniform_buf, sizeof(BinaryParams));
+      {{a_buf, a_buf_size},
+       {b_buf, b_buf_size},
+       {out_buf, out_buf_size},
+       {uniform_buf, sizeof(BinaryParams)}});
 
-  uint32_t num_workgroups = (elem_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+  uint32_t num_workgroups =
+      (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+  encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
