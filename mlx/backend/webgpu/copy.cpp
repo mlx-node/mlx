@@ -56,7 +56,7 @@ const char* copy_type_to_entry_point(CopyType ctype) {
     case CopyType::GeneralGeneral:
       return "copy_gg";
   }
-  return "copy_v"; // fallback
+  throw std::runtime_error("[WebGPU] Unhandled CopyType");
 }
 
 // Dispatch a copy kernel.
@@ -81,10 +81,11 @@ void dispatch_copy(
       dev.get_or_create_pipeline(pipeline_key, shader, entry_point);
 
   // Compute the effective element offsets into array<u32> buffers.
-  // arr.offset() is in bytes, and the shader indexes array<u32> (4 bytes each),
-  // so we divide by 4 to get the u32 element offset.
-  // The explicit in_offset/out_offset from function parameters are in elements
-  // of the array's dtype, so we convert to u32 element offsets as well.
+  // arr.offset() is in elements of the array's dtype, and is first converted
+  // to bytes by multiplying by itemsize. The shader indexes array<u32>
+  // (4 bytes each), so we divide by 4 to get the u32 element offset.
+  // The explicit in_offset/out_offset from function parameters are also in
+  // elements of the array's dtype, so we convert to u32 element offsets.
   constexpr uint32_t U32_SIZE = 4;
   uint32_t in_byte_offset =
       static_cast<uint32_t>(in.offset()) +

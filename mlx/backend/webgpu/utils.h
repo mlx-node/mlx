@@ -46,6 +46,10 @@ inline WGPUBuffer create_buffer_with_data(
     throw std::runtime_error("[WebGPU] Failed to create buffer");
   }
   void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
+  if (!mapped) {
+    wgpuBufferRelease(buf);
+    throw std::runtime_error("[WebGPU] Failed to get mapped range");
+  }
   std::memcpy(mapped, data, byte_size);
   wgpuBufferUnmap(buf);
   return buf;
@@ -71,6 +75,9 @@ inline WGPUBindGroup create_bind_group(
   auto& dev = device();
   WGPUBindGroupLayout layout =
       wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+  if (!layout) {
+    throw std::runtime_error("[WebGPU] Failed to get bind group layout");
+  }
 
   std::vector<WGPUBindGroupEntry> entries(buffers.size());
   for (size_t i = 0; i < buffers.size(); ++i) {
