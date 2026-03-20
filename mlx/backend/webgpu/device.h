@@ -1,0 +1,130 @@
+// Copyright 2026 Apple Inc.
+
+#pragma once
+
+#include <webgpu/webgpu.h>
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "mlx/array.h"
+#include "mlx/stream.h"
+
+namespace mlx::core::wgpu {
+
+class Device;
+class Worker;
+
+class CommandEncoder {
+ public:
+  explicit CommandEncoder(Device& d);
+  ~CommandEncoder();
+
+  CommandEncoder(const CommandEncoder&) = delete;
+  CommandEncoder& operator=(const CommandEncoder&) = delete;
+
+  void set_input_array(const array& arr);
+  void set_output_array(const array& arr);
+
+  // Dispatch a compute shader
+  void dispatch_compute(
+      WGPUComputePipeline pipeline,
+      const std::vector<WGPUBindGroup>& bind_groups,
+      uint32_t x,
+      uint32_t y = 1,
+      uint32_t z = 1);
+
+  // Keep buffer alive until GPU work completes
+  void add_temporary(const array& arr) {
+    temporaries_.push_back(arr.data_shared_ptr());
+  }
+
+  // Callback after GPU work finishes
+  void add_completed_handler(std::function<void()> task);
+
+  // Batch control
+  bool needs_commit();
+  void commit();
+
+  // Commit + block until complete
+  void synchronize();
+
+  Device& device() {
+    return device_;
+  }
+
+ private:
+  // Ensure we have an active command encoder + compute pass
+  void ensure_active();
+  // End the current compute pass (if any)
+  void end_compute_pass();
+
+  Device& device_;
+  std::unique_ptr<Worker> worker_;
+
+  WGPUCommandEncoder encoder_{nullptr};
+  WGPUComputePassEncoder compute_pass_{nullptr};
+  int op_count_{0};
+  int max_ops_per_commit_;
+  int max_mb_per_commit_;
+  size_t bytes_tracked_{0};
+  std::vector<std::shared_ptr<array::Data>> temporaries_;
+};
+
+class Device {
+ public:
+  Device();
+  ~Device();
+
+  Device(const Device&) = delete;
+  Device& operator=(const Device&) = delete;
+
+  bool is_valid() const {
+    return device_ != nullptr;
+  }
+
+  WGPUDevice gpu_device() const {
+    return device_;
+  }
+  WGPUQueue gpu_queue() const {
+    return queue_;
+  }
+  WGPUInstance gpu_instance() const {
+    return instance_;
+  }
+  WGPUAdapter gpu_adapter() const {
+    return adapter_;
+  }
+
+  CommandEncoder& get_command_encoder(Stream s);
+
+  // Pipeline cache
+  WGPUComputePipeline get_or_create_pipeline(
+      const std::string& key,
+      WGPUShaderModule shader_module,
+      const char* entry_point);
+
+ private:
+  WGPUInstance instance_{nullptr};
+  WGPUAdapter adapter_{nullptr};
+  WGPUDevice device_{nullptr};
+  WGPUQueue queue_{nullptr};
+
+  std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;
+  std::mutex encoder_mutex_;
+
+  std::unordered_map<std::string, WGPUComputePipeline> pipeline_cache_;
+  std::mutex pipeline_mutex_;
+};
+
+// Get the singleton device
+Device& device();
+
+// Get the command encoder for a stream
+CommandEncoder& get_command_encoder(Stream s);
+
+} // namespace mlx::core::wgpu
