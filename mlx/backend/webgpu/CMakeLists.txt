@@ -52,6 +52,7 @@ if(WEBGPU_BACKEND STREQUAL "DAWN")
 
   target_link_libraries(mlx PRIVATE webgpu_dawn webgpu_cpp)
   target_include_directories(mlx PRIVATE ${dawn_SOURCE_DIR}/include)
+  target_compile_definitions(mlx PRIVATE WEBGPU_BACKEND_DAWN)
 
 elseif(WEBGPU_BACKEND STREQUAL "WGPU")
   # Fetch wgpu-native pre-built release
@@ -79,6 +80,7 @@ elseif(WEBGPU_BACKEND STREQUAL "WGPU")
   target_include_directories(mlx PRIVATE ${wgpu_native_SOURCE_DIR}/include)
   find_library(WGPU_LIB wgpu_native PATHS ${wgpu_native_SOURCE_DIR}/lib)
   target_link_libraries(mlx PRIVATE ${WGPU_LIB})
+  target_compile_definitions(mlx PRIVATE WEBGPU_BACKEND_WGPU)
 
 else()
   message(FATAL_ERROR "Unknown WEBGPU_BACKEND: ${WEBGPU_BACKEND}. Use DAWN or WGPU.")
