@@ -12,11 +12,8 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mlx::core {
 
@@ -48,112 +45,6 @@ struct MatmulParams {
   uint32_t _pad0;
   uint32_t _pad1;
 };
-
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error("[WebGPU matmul] Failed to create uniform buffer");
-  }
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
-
-// ---------------------------------------------------------------------------
-// Shader module cache
-// ---------------------------------------------------------------------------
-
-WGPUShaderModule
-get_shader_module(const std::string& key, const std::string& source) {
-  static std::mutex mtx;
-  static std::unordered_map<std::string, WGPUShaderModule> cache;
-
-  std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = source.c_str();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = key.c_str();
-
-  WGPUShaderModule mod =
-      wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU matmul] Failed to create shader module: " + key);
-  }
-
-  cache[key] = mod;
-  return mod;
-}
-
-// ---------------------------------------------------------------------------
-// Bind group creation (2 inputs + 1 output + 1 uniform)
-// ---------------------------------------------------------------------------
-
-WGPUBindGroup create_matmul_bind_group(
-    WGPUComputePipeline pipeline,
-    WGPUBuffer a_buf,
-    uint64_t a_size,
-    WGPUBuffer b_buf,
-    uint64_t b_size,
-    WGPUBuffer out_buf,
-    uint64_t out_size,
-    WGPUBuffer uniform_buf,
-    uint64_t uniform_size) {
-  auto& dev = wgpu::device();
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[4] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = a_buf;
-  entries[0].offset = 0;
-  entries[0].size = a_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = b_buf;
-  entries[1].offset = 0;
-  entries[1].size = b_size;
-
-  entries[2].binding = 2;
-  entries[2].buffer = out_buf;
-  entries[2].offset = 0;
-  entries[2].size = out_size;
-
-  entries[3].binding = 3;
-  entries[3].buffer = uniform_buf;
-  entries[3].offset = 0;
-  entries[3].size = uniform_size;
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 4;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error("[WebGPU matmul] Failed to create bind group");
-  }
-  return bg;
-}
 
 // ---------------------------------------------------------------------------
 // WGSL GEMV kernel generation
@@ -410,11 +301,14 @@ void dispatch_gemv(
       std::string("gemv_") + trans_suffix + "_" + wgsl_type;
   std::string pipeline_key = entry_name;
 
-  std::string source =
-      make_gemv_kernel(entry_name, wgsl_type, a_transposed, b_transposed);
-  WGPUShaderModule shader = get_shader_module(pipeline_key, source);
-
   auto& dev = wgpu::device();
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      pipeline_key,
+      [&]() {
+        return make_gemv_kernel(
+            entry_name, wgsl_type, a_transposed, b_transposed);
+      });
+
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
 
@@ -436,24 +330,24 @@ void dispatch_gemv(
   params.batch_stride_c = batch_stride_c;
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(MatmulParams));
+      wgpu::create_uniform_buffer(&params, sizeof(MatmulParams));
 
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-  WGPUBindGroup bg = create_matmul_bind_group(
+  WGPUBindGroup bg = wgpu::create_bind_group(
       pipeline,
-      a_buf, wgpuBufferGetSize(a_buf),
-      b_buf, wgpuBufferGetSize(b_buf),
-      out_buf, wgpuBufferGetSize(out_buf),
-      uniform_buf, sizeof(MatmulParams));
+      {{a_buf, wgpuBufferGetSize(a_buf)},
+       {b_buf, wgpuBufferGetSize(b_buf)},
+       {out_buf, wgpuBufferGetSize(out_buf)},
+       {uniform_buf, sizeof(MatmulParams)}});
 
   uint32_t output_size = M * N;
   uint32_t num_workgroups_x =
       (output_size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
 
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups_x, 1, batch_count);
+  encoder.dispatch_compute(pipeline, bg, num_workgroups_x, 1, batch_count);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -491,11 +385,14 @@ void dispatch_gemm(
       std::string("gemm_") + trans_suffix + "_" + wgsl_type;
   std::string pipeline_key = entry_name;
 
-  std::string source =
-      make_gemm_kernel(entry_name, wgsl_type, a_transposed, b_transposed);
-  WGPUShaderModule shader = get_shader_module(pipeline_key, source);
-
   auto& dev = wgpu::device();
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      pipeline_key,
+      [&]() {
+        return make_gemm_kernel(
+            entry_name, wgsl_type, a_transposed, b_transposed);
+      });
+
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
 
@@ -517,24 +414,24 @@ void dispatch_gemm(
   params.batch_stride_c = batch_stride_c;
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(MatmulParams));
+      wgpu::create_uniform_buffer(&params, sizeof(MatmulParams));
 
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-  WGPUBindGroup bg = create_matmul_bind_group(
+  WGPUBindGroup bg = wgpu::create_bind_group(
       pipeline,
-      a_buf, wgpuBufferGetSize(a_buf),
-      b_buf, wgpuBufferGetSize(b_buf),
-      out_buf, wgpuBufferGetSize(out_buf),
-      uniform_buf, sizeof(MatmulParams));
+      {{a_buf, wgpuBufferGetSize(a_buf)},
+       {b_buf, wgpuBufferGetSize(b_buf)},
+       {out_buf, wgpuBufferGetSize(out_buf)},
+       {uniform_buf, sizeof(MatmulParams)}});
 
   // Grid: (ceil(N/16), ceil(M/16), batch_size)
   uint32_t wg_x = (N + TILE_SIZE - 1) / TILE_SIZE;
   uint32_t wg_y = (M + TILE_SIZE - 1) / TILE_SIZE;
 
-  encoder.dispatch_compute(pipeline, {bg}, wg_x, wg_y, batch_count);
+  encoder.dispatch_compute(pipeline, bg, wg_x, wg_y, batch_count);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -722,10 +619,10 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         << "(params.alpha * matmul_val + params.beta * c_val);\n"
         << "}\n";
 
-    std::string source = src.str();
-    WGPUShaderModule shader = get_shader_module(pipeline_key, source);
-
     auto& dev = wgpu::device();
+    WGPUShaderModule shader = dev.get_or_create_shader_module(
+        pipeline_key, [&]() { return src.str(); });
+
     WGPUComputePipeline pipeline =
         dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
 
@@ -744,47 +641,20 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     ep.beta = beta_;
 
     WGPUBuffer uniform_buf =
-        create_uniform_buffer(&ep, sizeof(EpilogueParams));
+        wgpu::create_uniform_buffer(&ep, sizeof(EpilogueParams));
 
-    // Bind group: c_in (binding 0), out_buf (binding 1), params (binding 2)
     WGPUBuffer c_buf = wgpu::wgpu_buffer(c_contig);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-    WGPUBindGroupLayout layout =
-        wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-    WGPUBindGroupEntry entries[3] = {};
-    entries[0].binding = 0;
-    entries[0].buffer = c_buf;
-    entries[0].offset = 0;
-    entries[0].size = wgpuBufferGetSize(c_buf);
-
-    entries[1].binding = 1;
-    entries[1].buffer = out_buf;
-    entries[1].offset = 0;
-    entries[1].size = wgpuBufferGetSize(out_buf);
-
-    entries[2].binding = 2;
-    entries[2].buffer = uniform_buf;
-    entries[2].offset = 0;
-    entries[2].size = sizeof(EpilogueParams);
-
-    WGPUBindGroupDescriptor bg_desc = {};
-    bg_desc.layout = layout;
-    bg_desc.entryCount = 3;
-    bg_desc.entries = entries;
-
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-    wgpuBindGroupLayoutRelease(layout);
-
-    if (!bg) {
-      throw std::runtime_error(
-          "[WebGPU matmul] Failed to create epilogue bind group");
-    }
+    WGPUBindGroup bg = wgpu::create_bind_group(
+        pipeline,
+        {{c_buf, wgpuBufferGetSize(c_buf)},
+         {out_buf, wgpuBufferGetSize(out_buf)},
+         {uniform_buf, sizeof(EpilogueParams)}});
 
     uint32_t num_workgroups =
         (ep.size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
-    encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+    encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);

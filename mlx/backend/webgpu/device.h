@@ -30,10 +30,18 @@ class CommandEncoder {
   void set_input_array(const array& arr);
   void set_output_array(const array& arr);
 
-  // Dispatch a compute shader
+  // Dispatch a compute shader (multiple bind groups)
   void dispatch_compute(
       WGPUComputePipeline pipeline,
       const std::vector<WGPUBindGroup>& bind_groups,
+      uint32_t x,
+      uint32_t y = 1,
+      uint32_t z = 1);
+
+  // Dispatch a compute shader (single bind group, avoids vector allocation)
+  void dispatch_compute(
+      WGPUComputePipeline pipeline,
+      WGPUBindGroup bind_group,
       uint32_t x,
       uint32_t y = 1,
       uint32_t z = 1);
@@ -108,6 +116,12 @@ class Device {
       WGPUShaderModule shader_module,
       const char* entry_point);
 
+  // Shader module cache with lazy source generation.
+  // The source_builder lambda is only called on cache miss.
+  WGPUShaderModule get_or_create_shader_module(
+      const std::string& key,
+      const std::function<std::string()>& source_builder);
+
  private:
   WGPUInstance instance_{nullptr};
   WGPUAdapter adapter_{nullptr};
@@ -119,6 +133,9 @@ class Device {
 
   std::unordered_map<std::string, WGPUComputePipeline> pipeline_cache_;
   std::mutex pipeline_mutex_;
+
+  std::unordered_map<std::string, WGPUShaderModule> shader_cache_;
+  std::mutex shader_mutex_;
 };
 
 // Get the singleton device

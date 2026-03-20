@@ -17,77 +17,12 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstring>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mlx::core {
 
 namespace {
-
-constexpr uint32_t WORKGROUP_SIZE = 256;
-constexpr uint32_t N_READS = 4;
-constexpr uint32_t MAX_NDIM = 8;
-
-// ---------------------------------------------------------------------------
-// Uniform buffer helpers
-// ---------------------------------------------------------------------------
-
-WGPUBuffer create_uniform_buffer(const void* data, size_t byte_size) {
-  auto& dev = wgpu::device();
-  WGPUBufferDescriptor desc = {};
-  desc.size = byte_size;
-  desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-  desc.mappedAtCreation = true;
-
-  WGPUBuffer buf = wgpuDeviceCreateBuffer(dev.gpu_device(), &desc);
-  if (!buf) {
-    throw std::runtime_error(
-        "[WebGPU reduce] Failed to create uniform buffer");
-  }
-  void* mapped = wgpuBufferGetMappedRange(buf, 0, byte_size);
-  std::memcpy(mapped, data, byte_size);
-  wgpuBufferUnmap(buf);
-  return buf;
-}
-
-// ---------------------------------------------------------------------------
-// Shader module cache
-// ---------------------------------------------------------------------------
-
-WGPUShaderModule
-get_shader_module(const std::string& key, const std::string& source) {
-  static std::mutex mtx;
-  static std::unordered_map<std::string, WGPUShaderModule> cache;
-
-  std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  auto& dev = wgpu::device();
-
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {};
-  wgsl_desc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
-  wgsl_desc.code = source.c_str();
-
-  WGPUShaderModuleDescriptor desc = {};
-  desc.nextInChain = &wgsl_desc.chain;
-  desc.label = key.c_str();
-
-  WGPUShaderModule mod =
-      wgpuDeviceCreateShaderModule(dev.gpu_device(), &desc);
-  if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU reduce] Failed to create shader module: " + key);
-  }
-
-  cache[key] = mod;
-  return mod;
-}
 
 // ---------------------------------------------------------------------------
 // Reduction op helpers for WGSL codegen
@@ -237,52 +172,6 @@ std::string get_out_type(
 }
 
 // ---------------------------------------------------------------------------
-// Bind group creation
-// ---------------------------------------------------------------------------
-
-WGPUBindGroup create_reduce_bind_group(
-    WGPUComputePipeline pipeline,
-    WGPUBuffer in_buf,
-    uint64_t in_size,
-    WGPUBuffer out_buf,
-    uint64_t out_size,
-    WGPUBuffer uniform_buf,
-    uint64_t uniform_size) {
-  auto& dev = wgpu::device();
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[3] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = in_buf;
-  entries[0].offset = 0;
-  entries[0].size = in_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = out_buf;
-  entries[1].offset = 0;
-  entries[1].size = out_size;
-
-  entries[2].binding = 2;
-  entries[2].buffer = uniform_buf;
-  entries[2].offset = 0;
-  entries[2].size = uniform_size;
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 3;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error("[WebGPU reduce] Failed to create bind group");
-  }
-  return bg;
-}
-
-// ---------------------------------------------------------------------------
 // WGSL kernel generation: all_reduce
 // ---------------------------------------------------------------------------
 
@@ -303,8 +192,8 @@ std::string make_all_reduce_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = " << WORKGROUP_SIZE << "u;\n";
-  s << "const N_READS: u32 = " << N_READS << "u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
+  s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
 
   s << "struct AllReduceParams {\n"
     << "  data: vec4<u32>,\n"
@@ -398,8 +287,8 @@ std::string make_row_reduce_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = " << WORKGROUP_SIZE << "u;\n";
-  s << "const N_READS: u32 = " << N_READS << "u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
+  s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
 
   s << "struct RowReduceParams {\n"
     << "  row_size_num_rows: vec4<u32>,\n"
@@ -560,7 +449,7 @@ std::string make_col_reduce_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = " << WORKGROUP_SIZE << "u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
 
   s << "struct ColReduceParams {\n"
     << "  data: vec4<u32>,\n"
@@ -677,7 +566,7 @@ std::string make_init_reduce_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = " << WORKGROUP_SIZE << "u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
 
   s << "struct InitParams {\n"
     << "  data: vec4<u32>,\n" // [size, pad, pad, pad]
@@ -731,8 +620,9 @@ void gpu_init_reduce(
 
   std::string entry_name =
       std::string("init_reduce_") + info.short_name + "_" + out_type;
-  std::string source = make_init_reduce_kernel(entry_name, out_type, info);
-  WGPUShaderModule shader = get_shader_module(entry_name, source);
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      entry_name,
+      [&]() { return make_init_reduce_kernel(entry_name, out_type, info); });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -742,7 +632,7 @@ void gpu_init_reduce(
   AllReduceParams params{};
   params.data[0] = static_cast<uint32_t>(out.size());
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(AllReduceParams));
+      wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
@@ -776,8 +666,9 @@ void gpu_init_reduce(
   }
 
   uint32_t num_workgroups =
-      (static_cast<uint32_t>(out.size()) + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+      (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
+      wgpu::WORKGROUP_SIZE;
+  encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -807,7 +698,7 @@ void gpu_all_reduce(
 
   // ContiguousAllReduce guarantees size() == data_size()
   uint32_t input_size = static_cast<uint32_t>(in.size());
-  uint32_t elems_per_wg = WORKGROUP_SIZE * N_READS;
+  uint32_t elems_per_wg = wgpu::WORKGROUP_SIZE * wgpu::N_READS;
   uint32_t num_workgroups = (input_size + elems_per_wg - 1) / elems_per_wg;
 
   // Clamp to reasonable number of workgroups
@@ -817,9 +708,12 @@ void gpu_all_reduce(
 
   std::string entry_name =
       std::string("all_reduce_") + info.short_name + "_" + in_type;
-  std::string source =
-      make_all_reduce_kernel(entry_name, in_type, acc_type, out_type, info);
-  WGPUShaderModule shader = get_shader_module(entry_name, source);
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      entry_name,
+      [&]() {
+        return make_all_reduce_kernel(
+            entry_name, in_type, acc_type, out_type, info);
+      });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -835,18 +729,20 @@ void gpu_all_reduce(
     AllReduceParams params{};
     params.data[0] = input_size;
     WGPUBuffer uniform_buf =
-        create_uniform_buffer(&params, sizeof(AllReduceParams));
+        wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer inter_buf = wgpu::wgpu_buffer(intermediate);
     uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
     uint64_t inter_buf_size = wgpuBufferGetSize(inter_buf);
 
-    WGPUBindGroup bg = create_reduce_bind_group(
-        pipeline, in_buf, in_buf_size, inter_buf, inter_buf_size, uniform_buf,
-        sizeof(AllReduceParams));
+    WGPUBindGroup bg = wgpu::create_bind_group(
+        pipeline,
+        {{in_buf, in_buf_size},
+         {inter_buf, inter_buf_size},
+         {uniform_buf, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+    encoder.dispatch_compute(pipeline, bg, num_workgroups);
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);
     wgpuBufferRelease(uniform_buf);
@@ -856,9 +752,12 @@ void gpu_all_reduce(
     // from input)
     std::string entry2 =
         std::string("all_reduce_") + info.short_name + "_" + out_type;
-    std::string source2 =
-        make_all_reduce_kernel(entry2, out_type, acc_type, out_type, info);
-    WGPUShaderModule shader2 = get_shader_module(entry2, source2);
+    WGPUShaderModule shader2 = dev.get_or_create_shader_module(
+        entry2,
+        [&]() {
+          return make_all_reduce_kernel(
+              entry2, out_type, acc_type, out_type, info);
+        });
     WGPUComputePipeline pipeline2 =
         dev.get_or_create_pipeline(entry2, shader2, entry2.c_str());
 
@@ -868,16 +767,18 @@ void gpu_all_reduce(
     AllReduceParams params2{};
     params2.data[0] = num_workgroups;
     WGPUBuffer uniform_buf2 =
-        create_uniform_buffer(&params2, sizeof(AllReduceParams));
+        wgpu::create_uniform_buffer(&params2, sizeof(AllReduceParams));
 
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
     uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-    WGPUBindGroup bg2 = create_reduce_bind_group(
-        pipeline2, inter_buf, inter_buf_size, out_buf, out_buf_size,
-        uniform_buf2, sizeof(AllReduceParams));
+    WGPUBindGroup bg2 = wgpu::create_bind_group(
+        pipeline2,
+        {{inter_buf, inter_buf_size},
+         {out_buf, out_buf_size},
+         {uniform_buf2, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline2, {bg2}, 1);
+    encoder.dispatch_compute(pipeline2, bg2, 1);
     wgpuBindGroupRelease(bg2);
     wgpuBufferDestroy(uniform_buf2);
     wgpuBufferRelease(uniform_buf2);
@@ -888,18 +789,20 @@ void gpu_all_reduce(
     AllReduceParams params{};
     params.data[0] = input_size;
     WGPUBuffer uniform_buf =
-        create_uniform_buffer(&params, sizeof(AllReduceParams));
+        wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
     uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
     uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-    WGPUBindGroup bg = create_reduce_bind_group(
-        pipeline, in_buf, in_buf_size, out_buf, out_buf_size, uniform_buf,
-        sizeof(AllReduceParams));
+    WGPUBindGroup bg = wgpu::create_bind_group(
+        pipeline,
+        {{in_buf, in_buf_size},
+         {out_buf, out_buf_size},
+         {uniform_buf, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline, {bg}, 1);
+    encoder.dispatch_compute(pipeline, bg, 1);
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);
     wgpuBufferRelease(uniform_buf);
@@ -939,10 +842,12 @@ void gpu_row_reduce(
   std::string entry_name = std::string("row_reduce_") + variant_str + "_" +
       info.short_name + "_" + in_type;
 
-  std::string source =
-      make_row_reduce_kernel(entry_name, in_type, acc_type, out_type, info,
-                             general);
-  WGPUShaderModule shader = get_shader_module(entry_name, source);
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      entry_name,
+      [&]() {
+        return make_row_reduce_kernel(
+            entry_name, in_type, acc_type, out_type, info, general);
+      });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -963,7 +868,7 @@ void gpu_row_reduce(
     uint32_t ndim = static_cast<uint32_t>(cshape.size());
     params.row_size_num_rows[2] = ndim;
 
-    for (uint32_t i = 0; i < ndim && i < MAX_NDIM; ++i) {
+    for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
       if (i < 4) {
         params.shape_0[i] = static_cast<uint32_t>(cshape[i]);
         params.strides_0[i] = static_cast<int32_t>(cstrides[i]);
@@ -996,20 +901,22 @@ void gpu_row_reduce(
   }
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(RowReduceParams));
+      wgpu::create_uniform_buffer(&params, sizeof(RowReduceParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  WGPUBindGroup bg = create_reduce_bind_group(
-      pipeline, in_buf, in_buf_size, out_buf, out_buf_size, uniform_buf,
-      sizeof(RowReduceParams));
+  WGPUBindGroup bg = wgpu::create_bind_group(
+      pipeline,
+      {{in_buf, in_buf_size},
+       {out_buf, out_buf_size},
+       {uniform_buf, sizeof(RowReduceParams)}});
 
   // One workgroup per output row
   uint32_t num_workgroups = static_cast<uint32_t>(out.size());
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+  encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -1041,9 +948,12 @@ void gpu_col_reduce(
 
   std::string entry_name =
       std::string("col_reduce_") + info.short_name + "_" + in_type;
-  std::string source =
-      make_col_reduce_kernel(entry_name, in_type, acc_type, out_type, info);
-  WGPUShaderModule shader = get_shader_module(entry_name, source);
+  WGPUShaderModule shader = dev.get_or_create_shader_module(
+      entry_name,
+      [&]() {
+        return make_col_reduce_kernel(
+            entry_name, in_type, acc_type, out_type, info);
+      });
   WGPUComputePipeline pipeline =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -1075,7 +985,7 @@ void gpu_col_reduce(
   uint32_t ndim = static_cast<uint32_t>(cshape.size());
   params.data[2] = ndim;
 
-  for (uint32_t i = 0; i < ndim && i < MAX_NDIM; ++i) {
+  for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
     if (i < 4) {
       params.shape_0[i] = static_cast<uint32_t>(cshape[i]);
       params.strides_0[i] = static_cast<int32_t>(cstrides[i]);
@@ -1094,7 +1004,7 @@ void gpu_col_reduce(
     non_col_reductions *= static_cast<uint32_t>(plan.shape[i]);
   }
 
-  for (uint32_t i = 0; i < reduce_ndim && i < MAX_NDIM; ++i) {
+  for (uint32_t i = 0; i < reduce_ndim && i < wgpu::MAX_NDIM; ++i) {
     if (i < 4) {
       params.reduce_shape_0[i] = static_cast<uint32_t>(plan.shape[i]);
       params.reduce_strides_0[i] = static_cast<int32_t>(plan.strides[i]);
@@ -1110,21 +1020,24 @@ void gpu_col_reduce(
   params.extra[1] = static_cast<uint32_t>(out.size());
 
   WGPUBuffer uniform_buf =
-      create_uniform_buffer(&params, sizeof(ColReduceParams));
+      wgpu::create_uniform_buffer(&params, sizeof(ColReduceParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  WGPUBindGroup bg = create_reduce_bind_group(
-      pipeline, in_buf, in_buf_size, out_buf, out_buf_size, uniform_buf,
-      sizeof(ColReduceParams));
+  WGPUBindGroup bg = wgpu::create_bind_group(
+      pipeline,
+      {{in_buf, in_buf_size},
+       {out_buf, out_buf_size},
+       {uniform_buf, sizeof(ColReduceParams)}});
 
   // Each thread handles one output element
   uint32_t num_workgroups =
-      (static_cast<uint32_t>(out.size()) + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, {bg}, num_workgroups);
+      (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
+      wgpu::WORKGROUP_SIZE;
+  encoder.dispatch_compute(pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
