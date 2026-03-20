@@ -2,6 +2,7 @@
 
 #include "mlx/backend/webgpu/allocator.h"
 #include "mlx/backend/webgpu/device.h"
+#include "mlx/backend/webgpu/utils.h"
 #include "mlx/memory.h"
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
@@ -11,19 +12,6 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
-
-namespace {
-
-// Poll the WebGPU instance until async operations complete.
-void poll_instance(WGPUInstance instance) {
-#if defined(WEBGPU_BACKEND_WGPU)
-  wgpuInstancePoll(instance, false, nullptr);
-#else
-  wgpuInstanceProcessEvents(instance);
-#endif
-}
-
-} // namespace
 
 namespace mlx::core {
 
@@ -275,7 +263,7 @@ void* Buffer::raw_ptr() {
     std::unique_lock<std::mutex> lock(map_data.mtx);
     while (!map_data.done) {
       lock.unlock();
-      poll_instance(dev.gpu_instance());
+      wgpu::poll_instance(dev.gpu_instance());
       lock.lock();
     }
   }
