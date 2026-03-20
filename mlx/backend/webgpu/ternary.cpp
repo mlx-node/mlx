@@ -22,9 +22,10 @@ namespace mlx::core {
 namespace {
 
 // C++ struct matching the WGSL TernaryParams layout (vec4-aligned).
-// Total: 160 bytes.
+// Total: 176 bytes.
 struct TernaryParams {
   uint32_t size_ndim[4]; // [size, ndim, pad, pad]
+  uint32_t offsets[4];   // [cond_offset, true_offset, false_offset, out_offset]
   uint32_t shape_0[4];   // shape[0..3]
   uint32_t shape_1[4];   // shape[4..7]
   int32_t a_strides_0[4]; // condition strides[0..3]
@@ -54,6 +55,7 @@ std::string make_select_kernel(
 
   s << "struct TernaryParams {\n"
     << "  size_ndim: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "  shape_0: vec4<u32>,\n"
     << "  shape_1: vec4<u32>,\n"
     << "  a_strides_0: vec4<i32>,\n"
@@ -134,22 +136,27 @@ std::string make_select_kernel(
     << "  let size = params.size_ndim.x;\n"
     << "  if (idx >= size) { return; }\n";
 
+  s << "  let cond_off = params.offsets.x;\n"
+    << "  let true_off = params.offsets.y;\n"
+    << "  let false_off = params.offsets.z;\n"
+    << "  let out_off = params.offsets.w;\n";
+
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let a_idx = elem_to_loc_a(idx, ndim);\n"
-      << "  let b_idx = elem_to_loc_b(idx, ndim);\n"
-      << "  let c_idx = elem_to_loc_c(idx, ndim);\n"
+      << "  let a_idx = elem_to_loc_a(idx, ndim) + cond_off;\n"
+      << "  let b_idx = elem_to_loc_b(idx, ndim) + true_off;\n"
+      << "  let c_idx = elem_to_loc_c(idx, ndim) + false_off;\n"
       << "  let condition = cond[a_idx] != 0u;\n"
       << "  let t_val = true_vals[b_idx];\n"
       << "  let f_val = false_vals[c_idx];\n";
   } else {
     // VectorVectorVector (contiguous) -- all use same index
-    s << "  let condition = cond[idx] != 0u;\n"
-      << "  let t_val = true_vals[idx];\n"
-      << "  let f_val = false_vals[idx];\n";
+    s << "  let condition = cond[idx + cond_off] != 0u;\n"
+      << "  let t_val = true_vals[idx + true_off];\n"
+      << "  let f_val = false_vals[idx + false_off];\n";
   }
 
-  s << "  out[idx] = select(f_val, t_val, condition);\n"
+  s << "  out[idx + out_off] = select(f_val, t_val, condition);\n"
     << "}\n";
 
   return s.str();
@@ -203,6 +210,12 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Fill uniform buffer
   TernaryParams params{};
   uint32_t elem_count;
+
+  // Compute element offsets for each array
+  params.offsets[0] = static_cast<uint32_t>(cond.offset());
+  params.offsets[1] = static_cast<uint32_t>(b.offset());
+  params.offsets[2] = static_cast<uint32_t>(c.offset());
+  params.offsets[3] = static_cast<uint32_t>(out.offset());
 
   if (variant == "g") {
     auto [shape_collapsed, strides_vec] =

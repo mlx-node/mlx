@@ -130,7 +130,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::uint32:
       return "u32";
     case Dtype::Val::uint64:
-      return "u32"; // No native u64 in WGSL
+      throw std::runtime_error("[WebGPU] uint64 is not supported on WebGPU backend");
     case Dtype::Val::int8:
       return "i32"; // WebGPU lacks 8-bit
     case Dtype::Val::int16:
@@ -138,7 +138,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::int32:
       return "i32";
     case Dtype::Val::int64:
-      return "i32"; // No native i64 in WGSL
+      throw std::runtime_error("[WebGPU] int64 is not supported on WebGPU backend");
     case Dtype::Val::float16:
       return "f16";
     case Dtype::Val::bfloat16:
@@ -146,7 +146,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::float32:
       return "f32";
     case Dtype::Val::float64:
-      return "f32"; // No native f64 in WGSL
+      throw std::runtime_error("[WebGPU] float64 is not supported on WebGPU backend");
     case Dtype::Val::complex64:
       return "f32"; // complex needs custom struct
     default:

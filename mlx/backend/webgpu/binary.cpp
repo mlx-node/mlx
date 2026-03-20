@@ -21,9 +21,10 @@ namespace mlx::core {
 namespace {
 
 // C++ struct matching the WGSL BinaryParams layout (vec4-aligned).
-// Total: 112 bytes.
+// Total: 128 bytes.
 struct BinaryParams {
   uint32_t size_ndim[4]; // [size, ndim, pad, pad]
+  uint32_t offsets[4];   // [a_offset, b_offset, out_offset, pad]
   uint32_t shape_0[4];   // shape[0..3]
   uint32_t shape_1[4];   // shape[4..7]
   int32_t a_strides_0[4]; // a_strides[0..3]
@@ -60,6 +61,7 @@ std::string make_binary_kernel(
   // Params struct (same layout for all variants; only .x/.y used for simple)
   s << "struct BinaryParams {\n"
     << "  size_ndim: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "  shape_0: vec4<u32>,\n"
     << "  shape_1: vec4<u32>,\n"
     << "  a_strides_0: vec4<i32>,\n"
@@ -121,27 +123,31 @@ std::string make_binary_kernel(
     << "  let size = params.size_ndim.x;\n"
     << "  if (idx >= size) { return; }\n";
 
+  s << "  let a_off = params.offsets.x;\n"
+    << "  let b_off = params.offsets.y;\n"
+    << "  let out_off = params.offsets.z;\n";
+
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let a_idx = elem_to_loc_a(idx, ndim);\n"
-      << "  let b_idx = elem_to_loc_b(idx, ndim);\n"
+      << "  let a_idx = elem_to_loc_a(idx, ndim) + a_off;\n"
+      << "  let b_idx = elem_to_loc_b(idx, ndim) + b_off;\n"
       << "  let a_val = a[a_idx];\n"
       << "  let b_val = b[b_idx];\n";
   } else if (variant == "ss") {
-    s << "  let a_val = a[0];\n"
-      << "  let b_val = b[0];\n";
+    s << "  let a_val = a[a_off];\n"
+      << "  let b_val = b[b_off];\n";
   } else if (variant == "sv") {
-    s << "  let a_val = a[0];\n"
-      << "  let b_val = b[idx];\n";
+    s << "  let a_val = a[a_off];\n"
+      << "  let b_val = b[idx + b_off];\n";
   } else if (variant == "vs") {
-    s << "  let a_val = a[idx];\n"
-      << "  let b_val = b[0];\n";
+    s << "  let a_val = a[idx + a_off];\n"
+      << "  let b_val = b[b_off];\n";
   } else { // vv
-    s << "  let a_val = a[idx];\n"
-      << "  let b_val = b[idx];\n";
+    s << "  let a_val = a[idx + a_off];\n"
+      << "  let b_val = b[idx + b_off];\n";
   }
 
-  s << "  out[idx] = " << op_expr << ";\n"
+  s << "  out[idx + out_off] = " << op_expr << ";\n"
     << "}\n";
 
   return s.str();
@@ -330,6 +336,11 @@ void binary_op_gpu_dispatch(
   // Fill uniform buffer
   BinaryParams params{};
   uint32_t elem_count;
+
+  // Compute element offsets for each array
+  params.offsets[0] = static_cast<uint32_t>(a.offset());
+  params.offsets[1] = static_cast<uint32_t>(b.offset());
+  params.offsets[2] = static_cast<uint32_t>(out.offset());
 
   if (bopt == BinaryOpType::General) {
     auto [shape_collapsed, strides_vec] =

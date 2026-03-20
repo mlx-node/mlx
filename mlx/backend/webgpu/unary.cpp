@@ -21,9 +21,10 @@ namespace mlx::core {
 namespace {
 
 // C++ struct matching the WGSL UnaryParams layout (vec4-aligned).
-// Total: 80 bytes.
+// Total: 96 bytes.
 struct UnaryParams {
   uint32_t size_ndim[4]; // [size, ndim, pad, pad]
+  uint32_t offsets[4];   // [in_offset, out_offset, pad, pad]
   uint32_t shape_0[4];   // shape[0..3]
   uint32_t shape_1[4];   // shape[4..7]
   int32_t strides_0[4];  // strides[0..3]
@@ -57,6 +58,7 @@ std::string make_unary_kernel(
 
   s << "struct UnaryParams {\n"
     << "  size_ndim: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "  shape_0: vec4<u32>,\n"
     << "  shape_1: vec4<u32>,\n"
     << "  strides_0: vec4<i32>,\n"
@@ -99,15 +101,18 @@ std::string make_unary_kernel(
     << "  let size = params.size_ndim.x;\n"
     << "  if (idx >= size) { return; }\n";
 
+  s << "  let in_off = params.offsets.x;\n"
+    << "  let out_off = params.offsets.y;\n";
+
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let in_idx = elem_to_loc(idx, ndim);\n"
+      << "  let in_idx = elem_to_loc(idx, ndim) + in_off;\n"
       << "  let in_val = input[in_idx];\n";
   } else {
-    s << "  let in_val = input[idx];\n";
+    s << "  let in_val = input[idx + in_off];\n";
   }
 
-  s << "  output[idx] = " << op_expr << ";\n"
+  s << "  output[idx + out_off] = " << op_expr << ";\n"
     << "}\n";
 
   return s.str();
@@ -387,6 +392,10 @@ void unary_op_gpu_dispatch(
   // Fill uniform buffer
   UnaryParams params{};
   uint32_t elem_count;
+
+  // Compute element offsets for each array
+  params.offsets[0] = static_cast<uint32_t>(in.offset());
+  params.offsets[1] = static_cast<uint32_t>(out.offset());
 
   if (!contiguous) {
     // General: collapse contiguous dims for efficiency
