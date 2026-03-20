@@ -58,8 +58,15 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 //   Sqrt, Square, Ceil, Floor, Round, Erf, ErfInv,
 //   LogicalNot, BitwiseInvert
 
-// AddMM — implemented in matmul.cpp
-NO_GPU(Arange)
+// AddMM, Matmul — implemented in matmul.cpp
+// Arange — implemented in arange.cpp
+// Gather, GatherAxis — implemented in indexing.cpp
+// Scatter, ScatterAxis — implemented in indexing.cpp
+// Select — implemented in ternary.cpp
+// QuantizedMatmul, QQMatmul — implemented in quantized.cpp
+// Reduce — implemented in reduce.cpp
+// Softmax — implemented in softmax.cpp
+
 NO_GPU(ArgPartition)
 NO_GPU(ArgReduce)
 NO_GPU(ArgSort)
@@ -85,8 +92,6 @@ NO_GPU(ExpandDims)
 NO_GPU(FFT)
 NO_GPU(Flatten)
 NO_GPU(Full)
-NO_GPU(Gather)
-NO_GPU(GatherAxis)
 NO_GPU(GatherMM)
 NO_GPU(GatherQMM)
 NO_GPU(Hadamard)
@@ -94,24 +99,16 @@ NO_GPU(Imag)
 NO_GPU(Load)
 NO_GPU(LogSumExp)
 NO_GPU_MULTI(LUF)
-// Matmul — implemented in matmul.cpp
 NO_GPU(Pad)
 NO_GPU(Partition)
 NO_GPU_MULTI(QRF)
-NO_GPU(QuantizedMatmul)
-NO_GPU(QQMatmul)
 NO_GPU(RandomBits)
 NO_GPU(Real)
-// Reduce — implemented in reduce.cpp
 NO_GPU(Reshape)
 NO_GPU(Scan)
-NO_GPU(Scatter)
-NO_GPU(ScatterAxis)
-NO_GPU(Select)
 NO_GPU(SegmentedMM)
 NO_GPU(Slice)
 NO_GPU(SliceUpdate)
-// Softmax — implemented in softmax.cpp
 NO_GPU(Sort)
 NO_GPU_MULTI(Split)
 NO_GPU(Squeeze)
