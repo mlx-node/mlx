@@ -20,6 +20,12 @@ namespace mlx::core {
 
 namespace {
 
+static CopyType infer_copy_type(const array& arr) {
+  if (arr.data_size() == 1) return CopyType::Scalar;
+  if (arr.flags().row_contiguous) return CopyType::Vector;
+  return CopyType::General;
+}
+
 // ---------------------------------------------------------------------------
 // Gather kernel
 // ---------------------------------------------------------------------------
@@ -658,17 +664,15 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name = std::string("gather_") + val_type + "_" +
       idx_type + "_n" + std::to_string(nidx);
-  std::string pipeline_key = entry_name;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_gather_kernel(
             entry_name, val_type, idx_type, nidx, src.ndim(), idx_ndim);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   for (const auto& in : inputs) {
@@ -713,11 +717,11 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
     bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
   }
 
-  WGPUBindGroup bg = wgpu::create_bind_group(pipeline, bind_entries);
+  WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
   uint32_t num_workgroups =
       (params.out_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -747,16 +751,14 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name =
       std::string("gather_axis_") + val_type + "_" + idx_type;
-  std::string pipeline_key = entry_name;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_gather_axis_kernel(entry_name, val_type, idx_type);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(src);
@@ -823,11 +825,11 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});
 
-  WGPUBindGroup bg = wgpu::create_bind_group(pipeline, bind_entries);
+  WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
   uint32_t num_workgroups =
       (params.total_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -847,15 +849,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& upd = inputs.back();
 
   // Copy src into out first
-  CopyType copy_type;
-  if (inputs[0].data_size() == 1) {
-    copy_type = CopyType::Scalar;
-  } else if (inputs[0].flags().row_contiguous) {
-    copy_type = CopyType::Vector;
-  } else {
-    copy_type = CopyType::General;
-  }
-  copy_gpu(inputs[0], out, copy_type, s);
+  copy_gpu(inputs[0], out, infer_copy_type(inputs[0]), s);
 
   // Empty update -- done
   if (upd.size() == 0) {
@@ -876,17 +870,15 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name = std::string("scatter_") + val_type + "_" +
       idx_type + "_n" + std::to_string(nidx);
-  std::string pipeline_key = entry_name;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_scatter_kernel(
             entry_name, val_type, idx_type, nidx);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   for (const auto& in : inputs) {
@@ -930,11 +922,11 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
     bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
   }
 
-  WGPUBindGroup bg = wgpu::create_bind_group(pipeline, bind_entries);
+  WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
   uint32_t num_workgroups =
       (params.upd_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -956,15 +948,7 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& upd = inputs[2];
 
   // Copy src into out first
-  CopyType copy_type;
-  if (src.data_size() == 1) {
-    copy_type = CopyType::Scalar;
-  } else if (src.flags().row_contiguous) {
-    copy_type = CopyType::Vector;
-  } else {
-    copy_type = CopyType::General;
-  }
-  copy_gpu(src, out, copy_type, s);
+  copy_gpu(src, out, infer_copy_type(src), s);
 
   // Empty update -- done
   if (upd.size() == 0) {
@@ -976,16 +960,14 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name =
       std::string("scatter_axis_") + val_type + "_" + idx_type;
-  std::string pipeline_key = entry_name;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_scatter_axis_kernel(entry_name, val_type, idx_type);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(upd);
@@ -1058,11 +1040,11 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});
 
-  WGPUBindGroup bg = wgpu::create_bind_group(pipeline, bind_entries);
+  WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
   uint32_t num_workgroups =
       (params.total_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

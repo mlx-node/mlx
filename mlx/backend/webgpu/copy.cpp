@@ -77,7 +77,7 @@ void dispatch_copy(
   const char* entry_point = copy_type_to_entry_point(ctype);
   std::string pipeline_key = std::string("copy_") + entry_point;
 
-  WGPUComputePipeline pipeline =
+  auto pe =
       dev.get_or_create_pipeline(pipeline_key, shader, entry_point);
 
   // Compute the effective element offsets into array<u32> buffers.
@@ -126,7 +126,7 @@ void dispatch_copy(
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{in_buf, in_buf_size},
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(CopyParams)}});
@@ -138,7 +138,7 @@ void dispatch_copy(
   uint32_t num_workgroups =
       (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
 
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

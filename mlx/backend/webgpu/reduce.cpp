@@ -623,7 +623,7 @@ void gpu_init_reduce(
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() { return make_init_reduce_kernel(entry_name, out_type, info); });
-  WGPUComputePipeline pipeline =
+  auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_output_array(out);
@@ -637,38 +637,15 @@ void gpu_init_reduce(
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
-  // init_reduce has only 2 bindings: output + uniform
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-
-  WGPUBindGroupEntry entries[2] = {};
-  entries[0].binding = 0;
-  entries[0].buffer = out_buf;
-  entries[0].offset = 0;
-  entries[0].size = out_buf_size;
-
-  entries[1].binding = 1;
-  entries[1].buffer = uniform_buf;
-  entries[1].offset = 0;
-  entries[1].size = sizeof(AllReduceParams);
-
-  WGPUBindGroupDescriptor bg_desc = {};
-  bg_desc.layout = layout;
-  bg_desc.entryCount = 2;
-  bg_desc.entries = entries;
-
-  WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
-
-  if (!bg) {
-    throw std::runtime_error(
-        "[WebGPU reduce] Failed to create init bind group");
-  }
+  WGPUBindGroup bg = wgpu::create_bind_group(
+      pe.layout,
+      {{out_buf, out_buf_size},
+       {uniform_buf, sizeof(AllReduceParams)}});
 
   uint32_t num_workgroups =
       (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -714,7 +691,7 @@ void gpu_all_reduce(
         return make_all_reduce_kernel(
             entry_name, in_type, acc_type, out_type, info);
       });
-  WGPUComputePipeline pipeline =
+  auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);
@@ -737,12 +714,12 @@ void gpu_all_reduce(
     uint64_t inter_buf_size = wgpuBufferGetSize(inter_buf);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
-        pipeline,
+        pe.layout,
         {{in_buf, in_buf_size},
          {inter_buf, inter_buf_size},
          {uniform_buf, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline, bg, num_workgroups);
+    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);
     wgpuBufferRelease(uniform_buf);
@@ -758,7 +735,7 @@ void gpu_all_reduce(
           return make_all_reduce_kernel(
               entry2, out_type, acc_type, out_type, info);
         });
-    WGPUComputePipeline pipeline2 =
+    auto pe2 =
         dev.get_or_create_pipeline(entry2, shader2, entry2.c_str());
 
     encoder.set_input_array(intermediate);
@@ -773,12 +750,12 @@ void gpu_all_reduce(
     uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
     WGPUBindGroup bg2 = wgpu::create_bind_group(
-        pipeline2,
+        pe2.layout,
         {{inter_buf, inter_buf_size},
          {out_buf, out_buf_size},
          {uniform_buf2, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline2, bg2, 1);
+    encoder.dispatch_compute(pe2.pipeline, bg2, 1);
     wgpuBindGroupRelease(bg2);
     wgpuBufferDestroy(uniform_buf2);
     wgpuBufferRelease(uniform_buf2);
@@ -797,12 +774,12 @@ void gpu_all_reduce(
     uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
-        pipeline,
+        pe.layout,
         {{in_buf, in_buf_size},
          {out_buf, out_buf_size},
          {uniform_buf, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pipeline, bg, 1);
+    encoder.dispatch_compute(pe.pipeline, bg, 1);
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);
     wgpuBufferRelease(uniform_buf);
@@ -848,7 +825,7 @@ void gpu_row_reduce(
         return make_row_reduce_kernel(
             entry_name, in_type, acc_type, out_type, info, general);
       });
-  WGPUComputePipeline pipeline =
+  auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);
@@ -909,14 +886,14 @@ void gpu_row_reduce(
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{in_buf, in_buf_size},
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(RowReduceParams)}});
 
   // One workgroup per output row
   uint32_t num_workgroups = static_cast<uint32_t>(out.size());
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -954,7 +931,7 @@ void gpu_col_reduce(
         return make_col_reduce_kernel(
             entry_name, in_type, acc_type, out_type, info);
       });
-  WGPUComputePipeline pipeline =
+  auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);
@@ -1028,7 +1005,7 @@ void gpu_col_reduce(
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{in_buf, in_buf_size},
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(ColReduceParams)}});
@@ -1037,7 +1014,7 @@ void gpu_col_reduce(
   uint32_t num_workgroups =
       (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

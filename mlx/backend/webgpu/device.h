@@ -110,8 +110,13 @@ class Device {
 
   CommandEncoder& get_command_encoder(Stream s);
 
+  struct PipelineEntry {
+    WGPUComputePipeline pipeline;
+    WGPUBindGroupLayout layout;
+  };
+
   // Pipeline cache
-  WGPUComputePipeline get_or_create_pipeline(
+  PipelineEntry get_or_create_pipeline(
       const std::string& key,
       WGPUShaderModule shader_module,
       const char* entry_point);
@@ -131,7 +136,7 @@ class Device {
   std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;
   std::mutex encoder_mutex_;
 
-  std::unordered_map<std::string, WGPUComputePipeline> pipeline_cache_;
+  std::unordered_map<std::string, PipelineEntry> pipeline_cache_;
   std::mutex pipeline_mutex_;
 
   std::unordered_map<std::string, WGPUShaderModule> shader_cache_;

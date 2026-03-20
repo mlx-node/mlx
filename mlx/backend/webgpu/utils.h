@@ -5,8 +5,11 @@
 #include <webgpu/webgpu.h>
 
 #include <cstring>
+#include <initializer_list>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -70,14 +73,9 @@ inline WGPUBuffer create_storage_buffer(const void* data, size_t byte_size) {
 // Create a bind group with a dynamic number of buffer entries.
 // Each pair is (buffer, size). Bindings are assigned sequentially from 0.
 inline WGPUBindGroup create_bind_group(
-    WGPUComputePipeline pipeline,
+    WGPUBindGroupLayout layout,
     const std::vector<std::pair<WGPUBuffer, uint64_t>>& buffers) {
   auto& dev = device();
-  WGPUBindGroupLayout layout =
-      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-  if (!layout) {
-    throw std::runtime_error("[WebGPU] Failed to get bind group layout");
-  }
 
   std::vector<WGPUBindGroupEntry> entries(buffers.size());
   for (size_t i = 0; i < buffers.size(); ++i) {
@@ -94,7 +92,6 @@ inline WGPUBindGroup create_bind_group(
   bg_desc.entries = entries.data();
 
   WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
-  wgpuBindGroupLayoutRelease(layout);
 
   if (!bg) {
     throw std::runtime_error("[WebGPU] Failed to create bind group");
@@ -151,6 +148,53 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
       return "f32"; // complex needs custom struct
     default:
       throw std::runtime_error("[wgpu] Unsupported dtype for WGSL");
+  }
+}
+
+// Emit "enable f16;\n\n" if any of the given types is "f16"
+inline void emit_f16_enable(std::ostringstream& s, std::initializer_list<std::string_view> types) {
+  for (auto t : types) {
+    if (t == "f16") {
+      s << "enable f16;\n\n";
+      return;
+    }
+  }
+}
+
+// Emit a WGSL elem_to_loc function for strided indexing
+inline void emit_elem_to_loc(
+    std::ostringstream& s,
+    const std::string& func_name,
+    const std::string& shape_accessor,
+    const std::string& stride_accessor) {
+  s << "fn " << func_name << "(idx: u32, ndim: u32) -> u32 {\n"
+    << "  var loc: u32 = 0u;\n"
+    << "  var idx_rem = idx;\n"
+    << "  for (var d: u32 = ndim - 1u; d < ndim; d = d - 1u) {\n"
+    << "    let s = " << shape_accessor << "(d);\n"
+    << "    let st = " << stride_accessor << "(d);\n"
+    << "    loc += (idx_rem % s) * u32(st);\n"
+    << "    idx_rem /= s;\n"
+    << "  }\n"
+    << "  return loc;\n"
+    << "}\n\n";
+}
+
+// Fill vec4 pairs for shape and stride params
+inline void fill_vec4_params(
+    uint32_t* shape_0, uint32_t* shape_1,
+    int32_t* strides_0, int32_t* strides_1,
+    const std::vector<int32_t>& shape,
+    const std::vector<int64_t>& strides,
+    uint32_t ndim) {
+  for (uint32_t i = 0; i < ndim && i < MAX_NDIM; ++i) {
+    if (i < 4) {
+      shape_0[i] = static_cast<uint32_t>(shape[i]);
+      strides_0[i] = static_cast<int32_t>(strides[i]);
+    } else {
+      shape_1[i - 4] = static_cast<uint32_t>(shape[i]);
+      strides_1[i - 4] = static_cast<int32_t>(strides[i]);
+    }
   }
 }
 
