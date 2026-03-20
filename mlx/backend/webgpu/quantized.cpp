@@ -205,16 +205,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   std::string entry_name = std::string("qmatmul_") + x_type +
       "_b" + std::to_string(bits_) +
       (transpose_ ? "_t" : "_n");
-  std::string pipeline_key = entry_name;
-
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_quantized_matmul_kernel(entry_name, x_type, bits_);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(x);
@@ -262,7 +259,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{x_buf, wgpuBufferGetSize(x_buf)},
        {w_buf, wgpuBufferGetSize(w_buf)},
        {s_buf, wgpuBufferGetSize(s_buf)},
@@ -274,7 +271,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   uint32_t num_workgroups_x =
       (output_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
 
-  encoder.dispatch_compute(pipeline, bg, num_workgroups_x, 1, batch_size);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups_x, 1, batch_size);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

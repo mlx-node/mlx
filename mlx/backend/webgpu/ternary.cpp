@@ -192,14 +192,11 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name =
       std::string("select_") + variant + "_" + val_type;
-  std::string pipeline_key = entry_name;
-
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() { return make_select_kernel(entry_name, val_type, variant); });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(cond);
@@ -260,7 +257,7 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{cond_buf, wgpuBufferGetSize(cond_buf)},
        {b_buf, wgpuBufferGetSize(b_buf)},
        {c_buf, wgpuBufferGetSize(c_buf)},
@@ -269,7 +266,7 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

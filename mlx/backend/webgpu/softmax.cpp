@@ -173,8 +173,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() { return make_softmax_kernel(entry_name, in_type, acc_type); });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);
   encoder.set_output_array(out);
@@ -191,14 +190,14 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{in_buf, in_buf_size},
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(SoftmaxParams)}});
 
   // One workgroup per row
   encoder.dispatch_compute(
-      pipeline, bg, static_cast<uint32_t>(n_rows));
+      pe.pipeline, bg, static_cast<uint32_t>(n_rows));
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

@@ -103,14 +103,11 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   std::string entry_name =
       std::string("arange_") + out_type + (is_integer ? "_int" : "_float");
-  std::string pipeline_key = entry_name;
-
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() { return make_arange_kernel(entry_name, out_type, is_integer); });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_output_array(out);
@@ -143,13 +140,13 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
       is_integer ? sizeof(ArangeParamsInt) : sizeof(ArangeParamsFloat);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{out_buf, out_buf_size},
        {uniform_buf, params_size}});
 
   uint32_t num_workgroups =
       (data_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
