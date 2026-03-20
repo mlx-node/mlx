@@ -208,16 +208,14 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
     encoder.add_temporary(in);
   }
 
-  // Set up output: try to donate the input buffer if possible.
-  if (in.is_donatable()) {
-    out.copy_shared_buffer(in);
-  } else {
-    out.set_data(
-        allocator::malloc(in.data_size() * in.itemsize()),
-        in.data_size(),
-        in.strides(),
-        in.flags());
-  }
+  // Set up output. We always need a separate buffer because the WGSL shader
+  // binds input as read-only and output as read-write, and WebGPU does not
+  // allow the same buffer in both roles simultaneously.
+  out.set_data(
+      allocator::malloc(in.data_size() * in.itemsize()),
+      in.data_size(),
+      in.strides(),
+      in.flags());
 
   int axis_size = in.shape().back();
   int n_rows = static_cast<int>(in.data_size()) / axis_size;
