@@ -101,7 +101,14 @@ else()
                  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/cuda/no_cuda.cpp)
 endif()
 
-if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
+if(MLX_BUILD_WEBGPU)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu)
+else()
+  target_sources(mlx
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu/no_webgpu.cpp)
+endif()
+
+if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_WEBGPU)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/gpu)
 else()
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/no_gpu)
