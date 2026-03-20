@@ -226,6 +226,12 @@ void* Buffer::raw_ptr() {
   WGPUCommandEncoderDescriptor enc_desc = {};
   WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(dev.gpu_device(), &enc_desc);
+  if (!encoder) {
+    wgpuBufferDestroy(staging);
+    wgpuBufferRelease(staging);
+    throw std::runtime_error(
+        "[WebGPU] Failed to create command encoder for buffer readback");
+  }
   wgpuCommandEncoderCopyBufferToBuffer(
       encoder, wbuf.buffer, 0, staging, 0, wbuf.size);
   WGPUCommandBuffer cmd_buf = wgpuCommandEncoderFinish(encoder, nullptr);
@@ -276,6 +282,13 @@ void* Buffer::raw_ptr() {
   // Copy mapped data to CPU allocation
   const void* mapped =
       wgpuBufferGetConstMappedRange(staging, 0, wbuf.size);
+  if (!mapped) {
+    wgpuBufferUnmap(staging);
+    wgpuBufferDestroy(staging);
+    wgpuBufferRelease(staging);
+    throw std::runtime_error(
+        "[WebGPU] Failed to get mapped range for staging buffer readback");
+  }
   void* cpu_data = std::malloc(wbuf.size);
   if (!cpu_data) {
     wgpuBufferUnmap(staging);

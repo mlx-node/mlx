@@ -94,7 +94,13 @@ void Worker::thread_fn() {
     // Run tasks outside the lock
     for (size_t i = 0; i < tasks.size(); ++i) {
       auto task = std::move(tasks[i]);
-      task();
+      try {
+        task();
+      } catch (const std::exception& e) {
+        fprintf(stderr, "[WebGPU] Exception in completion handler: %s\n", e.what());
+      } catch (...) {
+        fprintf(stderr, "[WebGPU] Unknown exception in completion handler\n");
+      }
     }
   }
 }
