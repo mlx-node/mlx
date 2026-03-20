@@ -58,7 +58,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 //   Sqrt, Square, Ceil, Floor, Round, Erf, ErfInv,
 //   LogicalNot, BitwiseInvert
 
-NO_GPU(AddMM)
+// AddMM — implemented in matmul.cpp
 NO_GPU(Arange)
 NO_GPU(ArgPartition)
 NO_GPU(ArgReduce)
@@ -94,7 +94,7 @@ NO_GPU(Imag)
 NO_GPU(Load)
 NO_GPU(LogSumExp)
 NO_GPU_MULTI(LUF)
-NO_GPU(Matmul)
+// Matmul — implemented in matmul.cpp
 NO_GPU(Pad)
 NO_GPU(Partition)
 NO_GPU_MULTI(QRF)
