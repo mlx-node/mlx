@@ -58,9 +58,8 @@ void Event::signal(Stream s) {
       ec->cv.notify_all();
     });
   } else {
-    // GPU stream: commit pending work, then signal after GPU completes
+    // GPU stream: add handler, then commit once
     auto& encoder = wgpu::get_command_encoder(s);
-    encoder.commit();
     encoder.add_completed_handler([ec, target]() {
       ec->value.store(target, std::memory_order_release);
       {

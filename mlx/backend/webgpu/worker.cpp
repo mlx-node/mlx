@@ -2,6 +2,8 @@
 
 #include "mlx/backend/webgpu/worker.h"
 
+#include <cstdio>
+
 namespace mlx::core::wgpu {
 
 Worker::Worker() : worker_(&Worker::thread_fn, this) {}
@@ -38,7 +40,13 @@ void Worker::commit(WGPUQueue queue) {
   };
   auto* cb_data = new CallbackData{this, batch};
 
-  auto callback = [](WGPUQueueWorkDoneStatus /* status */, void* userdata) {
+  auto callback = [](WGPUQueueWorkDoneStatus status, void* userdata) {
+    if (status != WGPUQueueWorkDoneStatus_Success) {
+      fprintf(
+          stderr,
+          "[WebGPU] Queue work done failed (status=%d)\n",
+          static_cast<int>(status));
+    }
     auto* data = static_cast<CallbackData*>(userdata);
     {
       std::lock_guard<std::mutex> lock(data->worker->mtx_);
@@ -60,8 +68,8 @@ void Worker::commit(WGPUQueue queue) {
 }
 
 void Worker::thread_fn() {
+  uint64_t current_batch = 0;
   while (true) {
-    uint64_t current_batch = 0;
     Tasks tasks;
     {
       std::unique_lock<std::mutex> lk(mtx_);
