@@ -5,8 +5,10 @@
 #include "mlx/utils.h"
 
 #include <cassert>
+#include <condition_variable>
 #include <cstdio>
 #include <future>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
