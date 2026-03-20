@@ -66,9 +66,8 @@ void Fence::update(Stream s, const array&, bool /* cross_device */) {
       f->cv.notify_all();
     });
   } else {
-    // GPU stream: commit pending work, signal after GPU completes
+    // GPU stream: add handler, then commit once
     auto& encoder = wgpu::get_command_encoder(s);
-    encoder.commit();
     encoder.add_completed_handler([target, fence_ptr = fence_]() {
       auto* f = static_cast<FenceImpl*>(fence_ptr.get());
       f->value.store(target, std::memory_order_release);

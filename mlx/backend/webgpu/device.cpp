@@ -44,11 +44,16 @@ Device::Device() {
       &adapter_opts,
       [](WGPURequestAdapterStatus status,
          WGPUAdapter adapter,
-         char const* /* message */,
+         char const* message,
          void* userdata) {
         auto* ud = static_cast<AdapterUserData*>(userdata);
         if (status == WGPURequestAdapterStatus_Success) {
           ud->adapter = adapter;
+        } else {
+          fprintf(
+              stderr,
+              "[WebGPU] Adapter request failed: %s\n",
+              message ? message : "unknown");
         }
         {
           std::lock_guard<std::mutex> lock(ud->mtx);
@@ -106,11 +111,16 @@ Device::Device() {
       &device_desc,
       [](WGPURequestDeviceStatus status,
          WGPUDevice device,
-         char const* /* message */,
+         char const* message,
          void* userdata) {
         auto* ud = static_cast<DeviceUserData*>(userdata);
         if (status == WGPURequestDeviceStatus_Success) {
           ud->device = device;
+        } else {
+          fprintf(
+              stderr,
+              "[WebGPU] Device request failed: %s\n",
+              message ? message : "unknown");
         }
         {
           std::lock_guard<std::mutex> lock(ud->mtx);
@@ -311,10 +321,16 @@ void CommandEncoder::ensure_active() {
   if (!encoder_) {
     WGPUCommandEncoderDescriptor enc_desc = {};
     encoder_ = wgpuDeviceCreateCommandEncoder(device_.gpu_device(), &enc_desc);
+    if (!encoder_) {
+      throw std::runtime_error("[WebGPU] Failed to create command encoder");
+    }
   }
   if (!compute_pass_) {
     WGPUComputePassDescriptor pass_desc = {};
     compute_pass_ = wgpuCommandEncoderBeginComputePass(encoder_, &pass_desc);
+    if (!compute_pass_) {
+      throw std::runtime_error("[WebGPU] Failed to create compute pass");
+    }
   }
 }
 
@@ -378,6 +394,11 @@ void CommandEncoder::commit() {
 
     // Finish and submit
     WGPUCommandBuffer cmd_buf = wgpuCommandEncoderFinish(encoder_, nullptr);
+    if (!cmd_buf) {
+      wgpuCommandEncoderRelease(encoder_);
+      encoder_ = nullptr;
+      throw std::runtime_error("[WebGPU] Failed to finish command encoder");
+    }
     wgpuQueueSubmit(device_.gpu_queue(), 1, &cmd_buf);
     wgpuCommandBufferRelease(cmd_buf);
 

@@ -9,7 +9,7 @@ namespace mlx::core::gpu {
 bool is_available() {
   try {
     return wgpu::device().is_valid();
-  } catch (...) {
+  } catch (const std::runtime_error&) {
     return false;
   }
 }
