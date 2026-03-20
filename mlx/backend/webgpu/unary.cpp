@@ -372,18 +372,15 @@ void unary_op_gpu_dispatch(
   // Build entry point name and pipeline key
   std::string entry_name = std::string("unary_") + short_name + "_" +
       variant + "_" + in_type + "_" + out_wgsl_type;
-  std::string pipeline_key = entry_name;
-
   // Get shader module with lazy codegen, then pipeline
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
         return make_unary_kernel(
             entry_name, in_type, out_wgsl_type, op_expr, variant);
       });
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(in);
@@ -434,14 +431,14 @@ void unary_op_gpu_dispatch(
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{in_buf, in_buf_size},
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(UnaryParams)}});
 
   uint32_t num_workgroups =
       (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);

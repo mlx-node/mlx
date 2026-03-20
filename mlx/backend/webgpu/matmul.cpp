@@ -271,10 +271,13 @@ TransposeResult check_transpose(
 }
 
 // ---------------------------------------------------------------------------
-// GEMV dispatch
+// Unified matmul dispatch (GEMV and GEMM)
 // ---------------------------------------------------------------------------
 
-void dispatch_gemv(
+enum class MatmulKind { GEMV, GEMM };
+
+static void dispatch_matmul(
+    MatmulKind kind,
     const array& a,
     const array& b,
     array& out,
@@ -297,20 +300,20 @@ void dispatch_gemv(
   trans_suffix += (a_transposed ? "T" : "N");
   trans_suffix += (b_transposed ? "T" : "N");
 
+  const char* prefix = (kind == MatmulKind::GEMV) ? "gemv_" : "gemm_";
   std::string entry_name =
-      std::string("gemv_") + trans_suffix + "_" + wgsl_type;
-  std::string pipeline_key = entry_name;
+      std::string(prefix) + trans_suffix + "_" + wgsl_type;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
+      entry_name,
       [&]() {
-        return make_gemv_kernel(
-            entry_name, wgsl_type, a_transposed, b_transposed);
+        return (kind == MatmulKind::GEMV)
+            ? make_gemv_kernel(entry_name, wgsl_type, a_transposed, b_transposed)
+            : make_gemm_kernel(entry_name, wgsl_type, a_transposed, b_transposed);
       });
 
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+  auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(a);
@@ -337,101 +340,23 @@ void dispatch_gemv(
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
+      pe.layout,
       {{a_buf, wgpuBufferGetSize(a_buf)},
        {b_buf, wgpuBufferGetSize(b_buf)},
        {out_buf, wgpuBufferGetSize(out_buf)},
        {uniform_buf, sizeof(MatmulParams)}});
 
-  uint32_t output_size = M * N;
-  uint32_t num_workgroups_x =
-      (output_size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
-
-  encoder.dispatch_compute(pipeline, bg, num_workgroups_x, 1, batch_count);
-
-  wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
-}
-
-// ---------------------------------------------------------------------------
-// Tiled GEMM dispatch
-// ---------------------------------------------------------------------------
-
-void dispatch_gemm(
-    const array& a,
-    const array& b,
-    array& out,
-    uint32_t M,
-    uint32_t N,
-    uint32_t K,
-    bool a_transposed,
-    uint32_t lda,
-    bool b_transposed,
-    uint32_t ldb,
-    uint32_t batch_count,
-    uint32_t batch_stride_a,
-    uint32_t batch_stride_b,
-    uint32_t batch_stride_c,
-    const Stream& s) {
-  const char* wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
-
-  // Build transpose suffix
-  std::string trans_suffix;
-  trans_suffix += (a_transposed ? "T" : "N");
-  trans_suffix += (b_transposed ? "T" : "N");
-
-  std::string entry_name =
-      std::string("gemm_") + trans_suffix + "_" + wgsl_type;
-  std::string pipeline_key = entry_name;
-
-  auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      pipeline_key,
-      [&]() {
-        return make_gemm_kernel(
-            entry_name, wgsl_type, a_transposed, b_transposed);
-      });
-
-  WGPUComputePipeline pipeline =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
-
-  auto& encoder = wgpu::get_command_encoder(s);
-  encoder.set_input_array(a);
-  encoder.set_input_array(b);
-  encoder.set_output_array(out);
-
-  MatmulParams params{};
-  params.M = M;
-  params.N = N;
-  params.K = K;
-  params.lda = lda;
-  params.ldb = ldb;
-  params.ldc = N; // output is always row-major
-  params.batch_size = batch_count;
-  params.batch_stride_a = batch_stride_a;
-  params.batch_stride_b = batch_stride_b;
-  params.batch_stride_c = batch_stride_c;
-
-  WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(MatmulParams));
-
-  WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
-  WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
-  WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-
-  WGPUBindGroup bg = wgpu::create_bind_group(
-      pipeline,
-      {{a_buf, wgpuBufferGetSize(a_buf)},
-       {b_buf, wgpuBufferGetSize(b_buf)},
-       {out_buf, wgpuBufferGetSize(out_buf)},
-       {uniform_buf, sizeof(MatmulParams)}});
-
-  // Grid: (ceil(N/16), ceil(M/16), batch_size)
-  uint32_t wg_x = (N + TILE_SIZE - 1) / TILE_SIZE;
-  uint32_t wg_y = (M + TILE_SIZE - 1) / TILE_SIZE;
-
-  encoder.dispatch_compute(pipeline, bg, wg_x, wg_y, batch_count);
+  if (kind == MatmulKind::GEMV) {
+    uint32_t output_size = M * N;
+    uint32_t num_workgroups_x =
+        (output_size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
+    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups_x, 1, batch_count);
+  } else {
+    // Grid: (ceil(N/16), ceil(M/16), batch_size)
+    uint32_t wg_x = (N + TILE_SIZE - 1) / TILE_SIZE;
+    uint32_t wg_y = (M + TILE_SIZE - 1) / TILE_SIZE;
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y, batch_count);
+  }
 
   wgpuBindGroupRelease(bg);
   wgpuBufferDestroy(uniform_buf);
@@ -484,15 +409,10 @@ void matmul_dispatch(
   uint32_t batch_stride_c = M * N;
 
   // Use GEMV for M=1 or N=1 cases
-  if (M == 1 || N == 1) {
-    dispatch_gemv(
-        a, b, out, M, N, K, a_transposed, lda, b_transposed, ldb,
-        batch_count, batch_stride_a, batch_stride_b, batch_stride_c, s);
-  } else {
-    dispatch_gemm(
-        a, b, out, M, N, K, a_transposed, lda, b_transposed, ldb,
-        batch_count, batch_stride_a, batch_stride_b, batch_stride_c, s);
-  }
+  MatmulKind kind = (M == 1 || N == 1) ? MatmulKind::GEMV : MatmulKind::GEMM;
+  dispatch_matmul(
+      kind, a, b, out, M, N, K, a_transposed, lda, b_transposed, ldb,
+      batch_count, batch_stride_a, batch_stride_b, batch_stride_c, s);
 }
 
 } // namespace
@@ -588,7 +508,6 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     const char* wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
     std::string entry_name =
         std::string("addmm_epilogue_") + wgsl_type;
-    std::string pipeline_key = entry_name;
 
     std::ostringstream src;
     if (std::string(wgsl_type) == "f16") {
@@ -621,10 +540,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     auto& dev = wgpu::device();
     WGPUShaderModule shader = dev.get_or_create_shader_module(
-        pipeline_key, [&]() { return src.str(); });
+        entry_name, [&]() { return src.str(); });
 
-    WGPUComputePipeline pipeline =
-        dev.get_or_create_pipeline(pipeline_key, shader, entry_name.c_str());
+    auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
     encoder.set_input_array(c_contig);
 
@@ -647,14 +565,14 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
-        pipeline,
+        pe.layout,
         {{c_buf, wgpuBufferGetSize(c_buf)},
          {out_buf, wgpuBufferGetSize(out_buf)},
          {uniform_buf, sizeof(EpilogueParams)}});
 
     uint32_t num_workgroups =
         (ep.size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
-    encoder.dispatch_compute(pipeline, bg, num_workgroups);
+    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
     wgpuBindGroupRelease(bg);
     wgpuBufferDestroy(uniform_buf);

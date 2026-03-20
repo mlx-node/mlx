@@ -194,9 +194,12 @@ Device::~Device() {
   shader_cache_.clear();
 
   // Release pipeline cache
-  for (auto& [key, pipeline] : pipeline_cache_) {
-    if (pipeline) {
-      wgpuComputePipelineRelease(pipeline);
+  for (auto& [key, entry] : pipeline_cache_) {
+    if (entry.layout) {
+      wgpuBindGroupLayoutRelease(entry.layout);
+    }
+    if (entry.pipeline) {
+      wgpuComputePipelineRelease(entry.pipeline);
     }
   }
   pipeline_cache_.clear();
@@ -225,7 +228,7 @@ CommandEncoder& Device::get_command_encoder(Stream s) {
   return *it->second;
 }
 
-WGPUComputePipeline Device::get_or_create_pipeline(
+Device::PipelineEntry Device::get_or_create_pipeline(
     const std::string& key,
     WGPUShaderModule shader_module,
     const char* entry_point) {
@@ -247,8 +250,16 @@ WGPUComputePipeline Device::get_or_create_pipeline(
         "[WebGPU] Failed to create compute pipeline: " + key);
   }
 
-  pipeline_cache_[key] = pipeline;
-  return pipeline;
+  WGPUBindGroupLayout layout =
+      wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+  if (!layout) {
+    throw std::runtime_error(
+        "[WebGPU] Failed to get bind group layout: " + key);
+  }
+
+  PipelineEntry entry{pipeline, layout};
+  pipeline_cache_[key] = entry;
+  return entry;
 }
 
 WGPUShaderModule Device::get_or_create_shader_module(
