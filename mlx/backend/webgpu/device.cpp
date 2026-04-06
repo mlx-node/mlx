@@ -308,8 +308,8 @@ CommandEncoder& get_command_encoder(Stream s) {
 
 CommandEncoder::CommandEncoder(Device& d)
     : device_(d), worker_(std::make_unique<Worker>()) {
-  max_ops_per_commit_ = env::max_ops_per_buffer(64);
-  max_mb_per_commit_ = env::max_mb_per_buffer(256);
+  max_ops_per_commit_ = env::max_ops_per_buffer(512);
+  max_mb_per_commit_ = env::max_mb_per_buffer(512);
 }
 
 CommandEncoder::~CommandEncoder() {
@@ -350,6 +350,9 @@ void CommandEncoder::end_compute_pass() {
     wgpuComputePassEncoderEnd(compute_pass_);
     wgpuComputePassEncoderRelease(compute_pass_);
     compute_pass_ = nullptr;
+    // Reset cached state — new compute pass needs fresh setPipeline/setBindGroup
+    last_pipeline_ = nullptr;
+    last_bind_group_ = nullptr;
   }
 }
 
@@ -361,7 +364,11 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
-  wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+  // Skip redundant setPipeline if same as last dispatch
+  if (pipeline != last_pipeline_) {
+    wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+    last_pipeline_ = pipeline;
+  }
   for (uint32_t i = 0; i < bind_groups.size(); ++i) {
     wgpuComputePassEncoderSetBindGroup(
         compute_pass_, i, bind_groups[i], 0, nullptr);
@@ -378,9 +385,17 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
-  wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
-  wgpuComputePassEncoderSetBindGroup(
-      compute_pass_, 0, bind_group, 0, nullptr);
+  // Skip redundant setPipeline if same as last dispatch
+  if (pipeline != last_pipeline_) {
+    wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+    last_pipeline_ = pipeline;
+  }
+  // Skip redundant setBindGroup if same as last dispatch
+  if (bind_group != last_bind_group_) {
+    wgpuComputePassEncoderSetBindGroup(
+        compute_pass_, 0, bind_group, 0, nullptr);
+    last_bind_group_ = bind_group;
+  }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
 }

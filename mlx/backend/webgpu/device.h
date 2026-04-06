@@ -81,6 +81,10 @@ class CommandEncoder {
   int max_mb_per_commit_;
   size_t bytes_tracked_{0};
   std::vector<std::shared_ptr<array::Data>> temporaries_;
+
+  // Track last-set pipeline/bindgroups to skip redundant RPC calls
+  WGPUComputePipeline last_pipeline_{nullptr};
+  WGPUBindGroup last_bind_group_{nullptr};
 };
 
 class Device {
