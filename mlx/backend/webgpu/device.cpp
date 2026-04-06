@@ -385,6 +385,15 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
+#if defined(__wasm__)
+  // Fused dispatch: single RPC roundtrip instead of 3 separate calls
+  extern "C" void mlx_wgpu_fused_dispatch(
+      WGPUComputePassEncoder, WGPUComputePipeline, WGPUBindGroup,
+      uint32_t, uint32_t, uint32_t);
+  mlx_wgpu_fused_dispatch(compute_pass_, pipeline, bind_group, x, y, z);
+  last_pipeline_ = pipeline;
+  last_bind_group_ = bind_group;
+#else
   // Skip redundant setPipeline if same as last dispatch
   if (pipeline != last_pipeline_) {
     wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
@@ -397,6 +406,7 @@ void CommandEncoder::dispatch_compute(
     last_bind_group_ = bind_group;
   }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
+#endif
   op_count_++;
 }
 

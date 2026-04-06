@@ -82,8 +82,14 @@ elseif(WEBGPU_BACKEND STREQUAL "WGPU")
   target_link_libraries(mlx PRIVATE ${WGPU_LIB})
   target_compile_definitions(mlx PRIVATE WEBGPU_BACKEND_WGPU)
 
+elseif(WEBGPU_BACKEND STREQUAL "WASI_IMPORT")
+  # WASI/WASM path: WebGPU functions are provided as WASM imports from JS bridge.
+  # No library to link — functions resolve at WASM instantiation time.
+  # We only need the webgpu.h header, which is included via the repo's bundled copy.
+  message(STATUS "WebGPU backend: WASI_IMPORT (functions provided by JS bridge)")
+
 else()
-  message(FATAL_ERROR "Unknown WEBGPU_BACKEND: ${WEBGPU_BACKEND}. Use DAWN or WGPU.")
+  message(FATAL_ERROR "Unknown WEBGPU_BACKEND: ${WEBGPU_BACKEND}. Use DAWN, WGPU, or WASI_IMPORT.")
 endif()
 
 # ---------- Embed WGSL kernel sources ----------
