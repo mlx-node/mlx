@@ -265,7 +265,9 @@ if(WIN32)
   target_link_libraries(mlx PRIVATE dl)
 endif()
 
-if(MLX_BUILD_CPU)
+option(MLX_NO_BLAS "Disable BLAS/LAPACK (for WASM builds)" OFF)
+
+if(MLX_BUILD_CPU AND NOT MLX_NO_BLAS)
   find_library(ACCELERATE_LIBRARY Accelerate)
   if(ACCELERATE_LIBRARY)
     message(STATUS "Accelerate found ${ACCELERATE_LIBRARY}")
