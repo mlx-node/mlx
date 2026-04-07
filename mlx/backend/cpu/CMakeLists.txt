@@ -45,17 +45,11 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/eig.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/eigh.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/encoder.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cblas.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/masked_mm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
@@ -66,14 +60,26 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/threefry.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/luf.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/qrf.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/svd.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/inverse.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_BINARY_DIR}/compiled_preamble.cpp)
+
+# BLAS/LAPACK-dependent sources (excluded when MLX_NO_BLAS is ON)
+if(NOT MLX_NO_BLAS)
+  target_sources(
+    mlx
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/eig.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/eigh.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cblas.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/masked_mm.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/luf.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/qrf.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/svd.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/inverse.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp)
+endif()
 
 if(MLX_BUILD_ACCELERATE)
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/bnns.cpp)
