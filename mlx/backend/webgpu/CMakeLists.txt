@@ -85,8 +85,9 @@ elseif(WEBGPU_BACKEND STREQUAL "WGPU")
 elseif(WEBGPU_BACKEND STREQUAL "WASI_IMPORT")
   # WASI/WASM path: WebGPU functions are provided as WASM imports from JS bridge.
   # No library to link — functions resolve at WASM instantiation time.
-  # We only need the webgpu.h header, which is included via the repo's bundled copy.
+  # Use the bundled minimal webgpu.h header.
   message(STATUS "WebGPU backend: WASI_IMPORT (functions provided by JS bridge)")
+  target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 else()
   message(FATAL_ERROR "Unknown WEBGPU_BACKEND: ${WEBGPU_BACKEND}. Use DAWN, WGPU, or WASI_IMPORT.")
