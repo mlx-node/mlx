@@ -4,16 +4,20 @@
 
 #include <webgpu/webgpu.h>
 
-#include <condition_variable>
 #include <functional>
+#include <vector>
+
+#if !defined(__wasi__)
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <thread>
-#include <vector>
+#endif
 
 namespace mlx::core::wgpu {
 
 // Run tasks in a worker thread, synchronized with WebGPU queue completion.
+// On WASI, tasks run synchronously during commit (no background thread).
 class Worker {
  public:
   Worker();
@@ -29,6 +33,10 @@ class Worker {
   void commit(WGPUQueue queue);
 
  private:
+  using Tasks = std::vector<std::function<void()>>;
+  Tasks pending_tasks_;
+
+#if !defined(__wasi__)
   void thread_fn();
 
   std::mutex mtx_;
@@ -39,10 +47,9 @@ class Worker {
 
   bool stop_{false};
 
-  using Tasks = std::vector<std::function<void()>>;
-  Tasks pending_tasks_;
   std::map<uint64_t, Tasks> worker_tasks_;
   std::thread worker_;
+#endif
 };
 
 } // namespace mlx::core::wgpu

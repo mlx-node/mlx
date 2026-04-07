@@ -6,6 +6,35 @@
 
 namespace mlx::core::wgpu {
 
+#if defined(__wasi__)
+
+// WASI: synchronous — no background thread.
+Worker::Worker() {}
+Worker::~Worker() {}
+
+void Worker::add_task(std::function<void()> task) {
+  pending_tasks_.push_back(std::move(task));
+}
+
+void Worker::commit(WGPUQueue /*queue*/) {
+  // Run all pending tasks synchronously.
+  // On WASI the GPU work completion is managed by the JS bridge,
+  // so we just run the cleanup tasks inline.
+  Tasks tasks;
+  tasks.swap(pending_tasks_);
+  for (auto& task : tasks) {
+    try {
+      task();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "[WebGPU] Exception in completion handler: %s\n", e.what());
+    } catch (...) {
+      fprintf(stderr, "[WebGPU] Unknown exception in completion handler\n");
+    }
+  }
+}
+
+#else // !__wasi__
+
 Worker::Worker() : worker_(&Worker::thread_fn, this) {}
 
 Worker::~Worker() {
@@ -104,5 +133,7 @@ void Worker::thread_fn() {
     }
   }
 }
+
+#endif // __wasi__
 
 } // namespace mlx::core::wgpu
