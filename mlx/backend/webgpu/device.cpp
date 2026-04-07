@@ -95,21 +95,9 @@ Device::Device() {
   };
   DeviceUserData device_ud;
 
-  // Query adapter limits so we can clamp our requests to what's supported.
-  WGPUSupportedLimits adapter_limits = {};
-  wgpuAdapterGetLimits(adapter_, &adapter_limits);
-
-  auto clamp = [](uint64_t desired, uint64_t supported) -> uint64_t {
-    return desired < supported ? desired : supported;
-  };
-
   // Set required limits - start with all zeros and set only what we need
   WGPURequiredLimits required_limits = {};
   required_limits.limits.maxStorageBuffersPerShaderStage = 16;
-  required_limits.limits.maxBufferSize =
-      clamp(1ULL << 30, adapter_limits.limits.maxBufferSize);
-  required_limits.limits.maxStorageBufferBindingSize =
-      clamp(1ULL << 30, adapter_limits.limits.maxStorageBufferBindingSize);
   required_limits.limits.maxComputeWorkgroupSizeX = 256;
   required_limits.limits.maxComputeWorkgroupSizeY = 256;
   required_limits.limits.maxComputeWorkgroupSizeZ = 64;
@@ -118,8 +106,28 @@ Device::Device() {
   required_limits.limits.maxBindGroups = 4;
   required_limits.limits.maxBindingsPerBindGroup = 16;
 
+#if defined(__wasm__)
+  // WASI: adapter query APIs may not be available in the JS bridge.
+  // Use conservative buffer limits (256 MB, the WebGPU spec minimum).
+  required_limits.limits.maxBufferSize = 1ULL << 28;
+  required_limits.limits.maxStorageBufferBindingSize = 1ULL << 28;
+  bool has_f16 = false;
+#else
+  // Query adapter limits so we can clamp our requests to what's supported.
+  WGPUSupportedLimits adapter_limits = {};
+  wgpuAdapterGetLimits(adapter_, &adapter_limits);
+  auto clamp = [](uint64_t desired, uint64_t supported) -> uint64_t {
+    return desired < supported ? desired : supported;
+  };
+  required_limits.limits.maxBufferSize =
+      clamp(1ULL << 30, adapter_limits.limits.maxBufferSize);
+  required_limits.limits.maxStorageBufferBindingSize =
+      clamp(1ULL << 30, adapter_limits.limits.maxStorageBufferBindingSize);
+
   // Check if adapter supports shader-f16 and request it if available.
   bool has_f16 = wgpuAdapterHasFeature(adapter_, WGPUFeatureName_ShaderF16);
+#endif
+
   WGPUFeatureName optional_features[] = {WGPUFeatureName_ShaderF16};
 
   WGPUDeviceDescriptor device_desc = {};

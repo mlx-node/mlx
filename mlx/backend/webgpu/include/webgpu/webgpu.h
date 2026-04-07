@@ -314,7 +314,6 @@ WGPUInstance wgpuCreateInstance(WGPUInstanceDescriptor const* descriptor);
 void wgpuInstanceRequestAdapter(WGPUInstance instance,
     WGPURequestAdapterOptions const* options,
     WGPUInstanceRequestAdapterCallback callback, void* userdata);
-void wgpuInstanceProcessEvents(WGPUInstance instance);
 void wgpuInstanceRelease(WGPUInstance instance);
 
 // Adapter

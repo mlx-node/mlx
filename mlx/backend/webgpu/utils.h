@@ -26,7 +26,10 @@ constexpr uint32_t N_READS = 4;
 
 // Poll the WebGPU instance to process pending async operations.
 inline void poll_instance(WGPUInstance instance) {
-#if defined(WEBGPU_BACKEND_WGPU)
+#if defined(__wasm__)
+  // WASI_IMPORT: JS bridge handles polling; this is a no-op.
+  (void)instance;
+#elif defined(WEBGPU_BACKEND_WGPU)
   wgpuInstancePoll(instance, false, nullptr);
 #else
   wgpuInstanceProcessEvents(instance);
