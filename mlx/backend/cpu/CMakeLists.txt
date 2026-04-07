@@ -88,7 +88,7 @@ else()
                              ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_bf16.cpp)
 endif()
 
-if(IOS)
+if(IOS OR CMAKE_SYSTEM_NAME STREQUAL "WASI")
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../no_cpu/compiled.cpp)
 else()
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
