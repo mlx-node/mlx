@@ -56,7 +56,8 @@ std::string make_binary_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = 256u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = 256u;\n";
+  s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
 
   // Params struct (same layout for all variants; only .x/.y used for simple)
   s << "struct BinaryParams {\n"
@@ -119,9 +120,10 @@ std::string make_binary_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let idx = gid.x;\n"
     << "  let size = params.size_ndim.x;\n"
-    << "  if (idx >= size) { return; }\n";
+    << "  let base = gid.x * N_READS;\n"
+    << "  if (base >= size) { return; }\n"
+    << "  let end = min(base + N_READS, size);\n";
 
   s << "  let a_off = params.offsets.x;\n"
     << "  let b_off = params.offsets.y;\n"
@@ -129,26 +131,42 @@ std::string make_binary_kernel(
 
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let a_idx = u32(elem_to_loc_a(idx, ndim) + i32(a_off));\n"
-      << "  let b_idx = u32(elem_to_loc_b(idx, ndim) + i32(b_off));\n"
-      << "  let a_val = a[a_idx];\n"
-      << "  let b_val = b[b_idx];\n";
+      << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let a_idx = u32(elem_to_loc_a(i, ndim) + i32(a_off));\n"
+      << "    let b_idx = u32(elem_to_loc_b(i, ndim) + i32(b_off));\n"
+      << "    let a_val = a[a_idx];\n"
+      << "    let b_val = b[b_idx];\n"
+      << "    out[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   } else if (variant == "ss") {
+    // ss: both scalars, loop just writes same result N_READS times
     s << "  let a_val = a[a_off];\n"
-      << "  let b_val = b[b_off];\n";
+      << "  let b_val = b[b_off];\n"
+      << "  let result = " << op_expr << ";\n"
+      << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    out[i + out_off] = result;\n"
+      << "  }\n";
   } else if (variant == "sv") {
     s << "  let a_val = a[a_off];\n"
-      << "  let b_val = b[idx + b_off];\n";
+      << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let b_val = b[i + b_off];\n"
+      << "    out[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   } else if (variant == "vs") {
-    s << "  let a_val = a[idx + a_off];\n"
-      << "  let b_val = b[b_off];\n";
+    s << "  let b_val = b[b_off];\n"
+      << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let a_val = a[i + a_off];\n"
+      << "    out[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   } else { // vv
-    s << "  let a_val = a[idx + a_off];\n"
-      << "  let b_val = b[idx + b_off];\n";
+    s << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let a_val = a[i + a_off];\n"
+      << "    let b_val = b[i + b_off];\n"
+      << "    out[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   }
 
-  s << "  out[idx + out_off] = " << op_expr << ";\n"
-    << "}\n";
+  s << "}\n";
 
   return s.str();
 }
@@ -305,8 +323,8 @@ void binary_op_gpu_dispatch(
     return;
   }
 
-  const char* in_type = wgpu::dtype_to_wgsl(a.dtype());
-  const char* out_wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
+  const char* in_type = wgpu::dtype_to_wgsl_safe(a.dtype());
+  const char* out_wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const char* variant = binary_op_type_to_variant(bopt);
   const char* short_name = get_op_short_name(op_name);
 
@@ -387,8 +405,9 @@ void binary_op_gpu_dispatch(
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(BinaryParams)}});
 
+  uint32_t total_threads = (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
-      (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+      (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
