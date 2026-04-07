@@ -214,7 +214,9 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
       pe.pipeline, bg, static_cast<uint32_t>(n_rows));
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 } // namespace mlx::core

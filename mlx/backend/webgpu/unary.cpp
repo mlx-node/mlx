@@ -458,7 +458,9 @@ void unary_op_gpu_dispatch(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 } // namespace

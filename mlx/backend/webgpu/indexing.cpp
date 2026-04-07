@@ -725,7 +725,9 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -833,7 +835,9 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -930,7 +934,9 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -1048,7 +1054,9 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }

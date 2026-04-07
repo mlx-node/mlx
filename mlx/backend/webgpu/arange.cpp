@@ -150,7 +150,9 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 } // namespace mlx::core

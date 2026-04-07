@@ -677,7 +677,9 @@ void gpu_init_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +758,9 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
     wgpuBindGroupRelease(bg);
-    pool.release(uniform_buf);
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
 
     // Second pass: reduce intermediate -> output (single workgroup)
     // Re-generate kernel for the output type (in case intermediate is different
@@ -791,7 +795,9 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe2.pipeline, bg2, 1);
     wgpuBindGroupRelease(bg2);
-    pool.release(uniform_buf2);
+    encoder.add_completed_handler([uniform_buf2]() {
+      wgpu::device().uniform_pool().release(uniform_buf2);
+    });
   } else {
     // Single-pass: all elements fit in one workgroup
     encoder.set_output_array(out);
@@ -814,7 +820,9 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe.pipeline, bg, 1);
     wgpuBindGroupRelease(bg);
-    pool.release(uniform_buf);
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
   }
 }
 
@@ -935,7 +943,9 @@ void gpu_row_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1066,9 @@ void gpu_col_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 } // namespace

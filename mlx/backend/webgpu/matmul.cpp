@@ -360,7 +360,9 @@ static void dispatch_matmul(
   }
 
   wgpuBindGroupRelease(bg);
-  pool.release(uniform_buf);
+  encoder.add_completed_handler([uniform_buf]() {
+    wgpu::device().uniform_pool().release(uniform_buf);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +560,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     ep.alpha = alpha_;
     ep.beta = beta_;
 
-    auto& pool2 = wgpu::device().uniform_pool();
+    auto& pool = wgpu::device().uniform_pool();
     WGPUBuffer uniform_buf =
-        pool2.acquire(wgpu::device().gpu_queue(), &ep, sizeof(EpilogueParams));
+        pool.acquire(wgpu::device().gpu_queue(), &ep, sizeof(EpilogueParams));
 
     WGPUBuffer c_buf = wgpu::wgpu_buffer(c_contig);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -576,7 +578,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
     wgpuBindGroupRelease(bg);
-    pool2.release(uniform_buf);
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
   }
 }
 
