@@ -111,6 +111,8 @@ class Device {
   WGPUAdapter gpu_adapter() const {
     return adapter_;
   }
+  bool has_shader_f16() const { return has_shader_f16_; }
+  bool has_subgroups() const { return has_subgroups_; }
 
   CommandEncoder& get_command_encoder(Stream s);
 
@@ -136,6 +138,8 @@ class Device {
   WGPUAdapter adapter_{nullptr};
   WGPUDevice device_{nullptr};
   WGPUQueue queue_{nullptr};
+  bool has_shader_f16_{false};
+  bool has_subgroups_{false};
 
   std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;
   std::mutex encoder_mutex_;

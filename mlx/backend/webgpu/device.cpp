@@ -100,14 +100,7 @@ Device::Device() {
   required_limits.limits.maxBindGroups = 4;
   required_limits.limits.maxBindingsPerBindGroup = 16;
 
-#if defined(__wasm__)
-  // WASI: adapter query APIs may not be available in the JS bridge.
-  // Use conservative buffer limits (256 MB, the WebGPU spec minimum).
-  required_limits.limits.maxBufferSize = 1ULL << 28;
-  required_limits.limits.maxStorageBufferBindingSize = 1ULL << 28;
-  bool has_f16 = false;
-#else
-  // Query adapter limits so we can clamp our requests to what's supported.
+  // Query adapter limits (bridge stub handles this for WASM builds)
   WGPUSupportedLimits adapter_limits = {};
   wgpuAdapterGetLimits(adapter_, &adapter_limits);
   auto clamp = [](uint64_t desired, uint64_t supported) -> uint64_t {
@@ -118,19 +111,20 @@ Device::Device() {
   required_limits.limits.maxStorageBufferBindingSize =
       clamp(1ULL << 30, adapter_limits.limits.maxStorageBufferBindingSize);
 
-  // Check if adapter supports shader-f16 and request it if available.
+  // Check optional features (bridge stub resolves locally for WASM)
   bool has_f16 = wgpuAdapterHasFeature(adapter_, WGPUFeatureName_ShaderF16);
-#endif
+  bool has_sg = wgpuAdapterHasFeature(adapter_, WGPUFeatureName_Subgroups);
 
-  WGPUFeatureName optional_features[] = {WGPUFeatureName_ShaderF16};
+  WGPUFeatureName optional_features[2] = {};
+  size_t feature_count = 0;
+  if (has_f16) optional_features[feature_count++] = WGPUFeatureName_ShaderF16;
+  if (has_sg) optional_features[feature_count++] = WGPUFeatureName_Subgroups;
 
   WGPUDeviceDescriptor device_desc = {};
   device_desc.requiredLimits = &required_limits;
   device_desc.defaultQueue.label = "MLX Default Queue";
-  if (has_f16) {
-    device_desc.requiredFeatureCount = 1;
-    device_desc.requiredFeatures = optional_features;
-  }
+  device_desc.requiredFeatureCount = feature_count;
+  device_desc.requiredFeatures = optional_features;
 
   wgpuAdapterRequestDevice(
       adapter_,
@@ -174,6 +168,9 @@ Device::Device() {
     instance_ = nullptr;
     return;
   }
+
+  has_shader_f16_ = has_f16;
+  has_subgroups_ = has_sg;
 
   // Set error callback on device
   wgpuDeviceSetUncapturedErrorCallback(
