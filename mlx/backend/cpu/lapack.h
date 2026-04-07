@@ -13,7 +13,7 @@
 
 #ifdef MLX_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
-#else
+#elif !defined(MLX_NO_BLAS)
 #include <cblas.h>
 #include <lapack.h>
 #endif
