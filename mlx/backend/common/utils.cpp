@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#if !defined(__wasi__)
 #include <dlfcn.h>
+#endif
 
 #include "mlx/backend/common/utils.h"
 
@@ -8,11 +10,15 @@ namespace mlx::core {
 
 std::filesystem::path current_binary_dir() {
   static std::filesystem::path binary_dir = []() {
+#if defined(__wasi__)
+    return std::filesystem::path(".");
+#else
     Dl_info info;
     if (!dladdr(reinterpret_cast<void*>(&current_binary_dir), &info)) {
       throw std::runtime_error("Unable to get current binary dir.");
     }
     return std::filesystem::path(info.dli_fname).parent_path();
+#endif
   }();
   return binary_dir;
 }
