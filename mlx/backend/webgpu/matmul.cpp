@@ -293,7 +293,7 @@ static void dispatch_matmul(
     uint32_t batch_stride_b,
     uint32_t batch_stride_c,
     const Stream& s) {
-  const char* wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
+  const char* wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
 
   // Build transpose suffix for pipeline key
   std::string trans_suffix;
@@ -505,7 +505,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
 
     // Build the epilogue kernel
-    const char* wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
+    const char* wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
     std::string entry_name =
         std::string("addmm_epilogue_") + wgsl_type;
 

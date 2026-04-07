@@ -171,6 +171,20 @@ std::string get_out_type(
   return in_type;
 }
 
+// Get the WGSL subgroup builtin for a reduce type, or empty string if none.
+const char* get_subgroup_builtin(Reduce::ReduceType rtype) {
+  switch (rtype) {
+    case Reduce::Sum:
+      return "subgroupAdd";
+    case Reduce::Max:
+      return "subgroupMax";
+    case Reduce::Min:
+      return "subgroupMin";
+    default:
+      return ""; // Prod, And, Or have no subgroup builtin
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WGSL kernel generation: all_reduce
 // ---------------------------------------------------------------------------
@@ -185,12 +199,18 @@ std::string make_all_reduce_kernel(
     const std::string& in_type,
     const std::string& acc_type,
     const std::string& out_type,
-    const ReduceOpInfo& info) {
+    const ReduceOpInfo& info,
+    bool use_subgroups = false,
+    const std::string& subgroup_builtin = "") {
   std::ostringstream s;
 
-  if (in_type == "f16" || out_type == "f16") {
-    s << "enable f16;\n\n";
+  if (use_subgroups) {
+    s << "enable subgroups;\n";
   }
+  if (in_type == "f16" || out_type == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
   s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
@@ -233,19 +253,20 @@ std::string make_all_reduce_kernel(
     << "    acc = reduce_op(acc, " << acc_type << "(input[idx]));\n"
     << "    idx = idx + total_threads;\n"
     << "  }\n"
-    << "\n"
-    << "  // Store to shared memory\n"
-    << "  shared_data[tid] = acc;\n"
-    << "  workgroupBarrier();\n"
-    << "\n"
-    << "  // Tree reduction in shared memory\n"
-    << "  for (var stride: u32 = WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {\n"
-    << "    if (tid < stride) {\n"
-    << "      shared_data[tid] = reduce_op(shared_data[tid], shared_data[tid + stride]);\n"
-    << "    }\n"
-    << "    workgroupBarrier();\n"
-    << "  }\n"
-    << "\n"
+    << "\n";
+
+  if (use_subgroups && !subgroup_builtin.empty()) {
+    wgpu::emit_subgroup_reduction(s, "acc", "shared_data", subgroup_builtin, "reduce_op");
+  } else {
+    s << "  // Store to shared memory\n"
+      << "  shared_data[tid] = acc;\n"
+      << "  workgroupBarrier();\n"
+      << "\n"
+      << "  // Tree reduction in shared memory\n";
+    wgpu::emit_unrolled_reduction(s, "shared_data", "reduce_op");
+  }
+
+  s << "\n"
     << "  // Thread 0 writes the workgroup result\n"
     << "  if (tid == 0u) {\n"
     << "    output[wg_id.x] = " << out_type << "(shared_data[0]);\n"
@@ -280,12 +301,18 @@ std::string make_row_reduce_kernel(
     const std::string& acc_type,
     const std::string& out_type,
     const ReduceOpInfo& info,
-    bool general) {
+    bool general,
+    bool use_subgroups = false,
+    const std::string& subgroup_builtin = "") {
   std::ostringstream s;
 
-  if (in_type == "f16" || out_type == "f16") {
-    s << "enable f16;\n\n";
+  if (use_subgroups) {
+    s << "enable subgroups;\n";
   }
+  if (in_type == "f16" || out_type == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
   s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
@@ -397,19 +424,20 @@ std::string make_row_reduce_kernel(
       << "  }\n";
   }
 
+  s << "\n";
+
+  if (use_subgroups && !subgroup_builtin.empty()) {
+    wgpu::emit_subgroup_reduction(s, "acc", "shared_data", subgroup_builtin, "reduce_op");
+  } else {
+    s << "  // Store to shared memory\n"
+      << "  shared_data[tid] = acc;\n"
+      << "  workgroupBarrier();\n"
+      << "\n"
+      << "  // Tree reduction in shared memory\n";
+    wgpu::emit_unrolled_reduction(s, "shared_data", "reduce_op");
+  }
+
   s << "\n"
-    << "  // Store to shared memory\n"
-    << "  shared_data[tid] = acc;\n"
-    << "  workgroupBarrier();\n"
-    << "\n"
-    << "  // Tree reduction in shared memory\n"
-    << "  for (var stride: u32 = WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {\n"
-    << "    if (tid < stride) {\n"
-    << "      shared_data[tid] = reduce_op(shared_data[tid], shared_data[tid + stride]);\n"
-    << "    }\n"
-    << "    workgroupBarrier();\n"
-    << "  }\n"
-    << "\n"
     << "  // Thread 0 writes the output\n"
     << "  if (tid == 0u) {\n"
     << "    output[out_idx] = " << out_type << "(shared_data[0]);\n"
@@ -612,7 +640,7 @@ void gpu_init_reduce(
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
 
-  const char* in_wgsl = wgpu::dtype_to_wgsl(in.dtype());
+  const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   // WGSL storage buffers don't support bool; use u32 instead
   std::string in_type_str = (std::string(in_wgsl) == "bool") ? "u32" : in_wgsl;
   std::string out_type = get_out_type(reduce_type, in_type_str);
@@ -666,12 +694,17 @@ void gpu_all_reduce(
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
 
-  const char* in_wgsl = wgpu::dtype_to_wgsl(in.dtype());
+  const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   // WGSL storage buffers don't support bool; use u32 instead
   std::string in_type = (std::string(in_wgsl) == "bool") ? "u32" : in_wgsl;
   std::string acc_type = get_acc_type(in_type);
   std::string out_type = get_out_type(reduce_type, in_type);
   auto info = get_reduce_op_info(reduce_type);
+
+  // Check subgroup support
+  const char* sg_builtin = get_subgroup_builtin(reduce_type);
+  bool use_sg = dev.has_subgroups() && sg_builtin[0] != '\0';
+  std::string sg_suffix = use_sg ? "_sg" : "";
 
   // ContiguousAllReduce guarantees size() == data_size()
   uint32_t input_size = static_cast<uint32_t>(in.size());
@@ -684,12 +717,12 @@ void gpu_all_reduce(
   }
 
   std::string entry_name =
-      std::string("all_reduce_") + info.short_name + "_" + in_type;
+      std::string("all_reduce_") + info.short_name + "_" + in_type + sg_suffix;
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
         return make_all_reduce_kernel(
-            entry_name, in_type, acc_type, out_type, info);
+            entry_name, in_type, acc_type, out_type, info, use_sg, sg_builtin);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -728,12 +761,12 @@ void gpu_all_reduce(
     // Re-generate kernel for the output type (in case intermediate is different
     // from input)
     std::string entry2 =
-        std::string("all_reduce_") + info.short_name + "_" + out_type;
+        std::string("all_reduce_") + info.short_name + "_" + out_type + sg_suffix;
     WGPUShaderModule shader2 = dev.get_or_create_shader_module(
         entry2,
         [&]() {
           return make_all_reduce_kernel(
-              entry2, out_type, acc_type, out_type, info);
+              entry2, out_type, acc_type, out_type, info, use_sg, sg_builtin);
         });
     auto pe2 =
         dev.get_or_create_pipeline(entry2, shader2, entry2.c_str());
@@ -802,12 +835,17 @@ void gpu_row_reduce(
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
 
-  const char* in_wgsl = wgpu::dtype_to_wgsl(in.dtype());
+  const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   // WGSL storage buffers don't support bool; use u32 instead
   std::string in_type = (std::string(in_wgsl) == "bool") ? "u32" : in_wgsl;
   std::string acc_type = get_acc_type(in_type);
   std::string out_type = get_out_type(reduce_type, in_type);
   auto info = get_reduce_op_info(reduce_type);
+
+  // Check subgroup support
+  const char* sg_builtin = get_subgroup_builtin(reduce_type);
+  bool use_sg = dev.has_subgroups() && sg_builtin[0] != '\0';
+  std::string sg_suffix = use_sg ? "_sg" : "";
 
   assert(!plan.shape.empty());
   uint32_t row_size = static_cast<uint32_t>(plan.shape.back());
@@ -817,13 +855,14 @@ void gpu_row_reduce(
 
   std::string variant_str = general ? "general" : "simple";
   std::string entry_name = std::string("row_reduce_") + variant_str + "_" +
-      info.short_name + "_" + in_type;
+      info.short_name + "_" + in_type + sg_suffix;
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
         return make_row_reduce_kernel(
-            entry_name, in_type, acc_type, out_type, info, general);
+            entry_name, in_type, acc_type, out_type, info, general,
+            use_sg, sg_builtin);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -916,7 +955,7 @@ void gpu_col_reduce(
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
 
-  const char* in_wgsl = wgpu::dtype_to_wgsl(in.dtype());
+  const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   // WGSL storage buffers don't support bool; use u32 instead
   std::string in_type = (std::string(in_wgsl) == "bool") ? "u32" : in_wgsl;
   std::string acc_type = get_acc_type(in_type);

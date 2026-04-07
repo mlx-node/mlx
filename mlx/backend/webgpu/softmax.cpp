@@ -39,12 +39,17 @@ struct SoftmaxParams {
 std::string make_softmax_kernel(
     const std::string& entry_name,
     const std::string& in_type,
-    const std::string& acc_type) {
+    const std::string& acc_type,
+    bool use_subgroups = false) {
   std::ostringstream s;
 
-  if (in_type == "f16") {
-    s << "enable f16;\n\n";
+  if (use_subgroups) {
+    s << "enable subgroups;\n";
   }
+  if (in_type == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
 
@@ -62,6 +67,10 @@ std::string make_softmax_kernel(
     << ", WORKGROUP_SIZE>;\n";
   s << "var<workgroup> shared_sum: array<" << acc_type
     << ", WORKGROUP_SIZE>;\n\n";
+
+  // Helper functions for unrolled reduction
+  s << "fn sum_op(a: " << acc_type << ", b: " << acc_type << ") -> "
+    << acc_type << " { return a + b; }\n\n";
 
   // Generate the kernel
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
@@ -81,17 +90,18 @@ std::string make_softmax_kernel(
     << "    thread_max = max(thread_max, val);\n"
     << "  }\n"
     << "\n"
-    << "  // Store to shared memory and reduce\n"
-    << "  shared_max[tid] = thread_max;\n"
-    << "  workgroupBarrier();\n"
-    << "\n"
-    << "  for (var stride: u32 = WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {\n"
-    << "    if (tid < stride) {\n"
-    << "      shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);\n"
-    << "    }\n"
-    << "    workgroupBarrier();\n"
-    << "  }\n"
-    << "  let row_max = shared_max[0];\n"
+    ;
+
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(s, "thread_max", "shared_max", "subgroupMax", "max");
+  } else {
+    s << "  // Store to shared memory and reduce\n"
+      << "  shared_max[tid] = thread_max;\n"
+      << "  workgroupBarrier();\n\n";
+    wgpu::emit_unrolled_reduction(s, "shared_max", "max");
+  }
+
+  s << "  let row_max = shared_max[0];\n"
     << "\n"
     << "  // Phase 2: Compute sum of exp(x - max)\n"
     << "  var thread_sum: " << acc_type << " = " << acc_type << "(0.0);\n"
@@ -99,17 +109,17 @@ std::string make_softmax_kernel(
     << "    let val = " << acc_type << "(input[row_start + i]);\n"
     << "    thread_sum = thread_sum + exp(val - row_max);\n"
     << "  }\n"
-    << "\n"
-    << "  shared_sum[tid] = thread_sum;\n"
-    << "  workgroupBarrier();\n"
-    << "\n"
-    << "  for (var stride: u32 = WORKGROUP_SIZE / 2u; stride > 0u; stride = stride / 2u) {\n"
-    << "    if (tid < stride) {\n"
-    << "      shared_sum[tid] = shared_sum[tid] + shared_sum[tid + stride];\n"
-    << "    }\n"
-    << "    workgroupBarrier();\n"
-    << "  }\n"
-    << "  let inv_sum = " << acc_type << "(1.0) / shared_sum[0];\n"
+    << "\n";
+
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op");
+  } else {
+    s << "  shared_sum[tid] = thread_sum;\n"
+      << "  workgroupBarrier();\n\n";
+    wgpu::emit_unrolled_reduction(s, "shared_sum", "sum_op");
+  }
+
+  s << "  let inv_sum = " << acc_type << "(1.0) / shared_sum[0];\n"
     << "\n"
     << "  // Phase 3: Write output = exp(x - max) / sum\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
@@ -164,15 +174,18 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
 
-  const char* in_wgsl = wgpu::dtype_to_wgsl(in.dtype());
+  const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   std::string in_type(in_wgsl);
   // Always accumulate in f32 for precision
   std::string acc_type = "f32";
 
-  std::string entry_name = std::string("softmax_") + in_type;
+  bool use_sg = dev.has_subgroups();
+  std::string sg_suffix = use_sg ? "_sg" : "";
+
+  std::string entry_name = std::string("softmax_") + in_type + sg_suffix;
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
-      [&]() { return make_softmax_kernel(entry_name, in_type, acc_type); });
+      [&]() { return make_softmax_kernel(entry_name, in_type, acc_type, use_sg); });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);

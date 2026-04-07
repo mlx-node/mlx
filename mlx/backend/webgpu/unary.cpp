@@ -54,7 +54,8 @@ std::string make_unary_kernel(
     s << "enable f16;\n\n";
   }
 
-  s << "const WORKGROUP_SIZE: u32 = 256u;\n\n";
+  s << "const WORKGROUP_SIZE: u32 = 256u;\n";
+  s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
 
   s << "struct UnaryParams {\n"
     << "  size_ndim: vec4<u32>,\n"
@@ -97,23 +98,29 @@ std::string make_unary_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let idx = gid.x;\n"
     << "  let size = params.size_ndim.x;\n"
-    << "  if (idx >= size) { return; }\n";
+    << "  let base = gid.x * N_READS;\n"
+    << "  if (base >= size) { return; }\n"
+    << "  let end = min(base + N_READS, size);\n";
 
   s << "  let in_off = params.offsets.x;\n"
     << "  let out_off = params.offsets.y;\n";
 
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let in_idx = u32(elem_to_loc(idx, ndim) + i32(in_off));\n"
-      << "  let in_val = input[in_idx];\n";
+      << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let in_idx = u32(elem_to_loc(i, ndim) + i32(in_off));\n"
+      << "    let in_val = input[in_idx];\n"
+      << "    output[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   } else {
-    s << "  let in_val = input[idx + in_off];\n";
+    s << "  for (var i: u32 = base; i < end; i = i + 1u) {\n"
+      << "    let in_val = input[i + in_off];\n"
+      << "    output[i + out_off] = " << op_expr << ";\n"
+      << "  }\n";
   }
 
-  s << "  output[idx + out_off] = " << op_expr << ";\n"
-    << "}\n";
+  s << "}\n";
 
   return s.str();
 }
@@ -371,8 +378,8 @@ void unary_op_gpu_dispatch(
   bool contiguous = in.flags().contiguous;
   const char* variant = contiguous ? "v" : "g";
 
-  const char* in_type = wgpu::dtype_to_wgsl(in.dtype());
-  const char* out_wgsl_type = wgpu::dtype_to_wgsl(out.dtype());
+  const char* in_type = wgpu::dtype_to_wgsl_safe(in.dtype());
+  const char* out_wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const char* short_name = get_unary_short_name(op_name);
 
   std::string op_expr = get_unary_op_expr(op_name, in_type, out_wgsl_type);
@@ -444,8 +451,9 @@ void unary_op_gpu_dispatch(
        {out_buf, out_buf_size},
        {uniform_buf, sizeof(UnaryParams)}});
 
+  uint32_t total_threads = (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
-      (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+      (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);

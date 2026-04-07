@@ -162,6 +162,14 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
   }
 }
 
+// Device-aware dtype helper: falls back to f32 when shader-f16 is unavailable.
+inline const char* dtype_to_wgsl_safe(Dtype dtype) {
+  if (dtype.val() == Dtype::Val::float16 && !device().has_shader_f16()) {
+    return "f32";
+  }
+  return dtype_to_wgsl(dtype);
+}
+
 // Emit "enable f16;\n\n" if any of the given types is "f16"
 inline void emit_f16_enable(std::ostringstream& s, std::initializer_list<std::string_view> types) {
   for (auto t : types) {
@@ -206,6 +214,55 @@ inline void fill_vec4_params(
       shape_1[i - 4] = static_cast<uint32_t>(shape[i]);
       strides_1[i - 4] = static_cast<int32_t>(strides[i]);
     }
+  }
+}
+
+// Emit an unrolled tree reduction over a shared-memory array.
+// The reduce_op should be a WGSL binary function name, e.g. "reduce_op", "max".
+inline void emit_unrolled_reduction(
+    std::ostringstream& s,
+    const std::string& shared_name,
+    const std::string& reduce_op,
+    uint32_t workgroup_size = WORKGROUP_SIZE) {
+  for (uint32_t stride = workgroup_size / 2; stride >= 1; stride /= 2) {
+    s << "  if (tid < " << stride << "u) {\n"
+      << "    " << shared_name << "[tid] = " << reduce_op << "("
+      << shared_name << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
+      << "  }\n  workgroupBarrier();\n";
+  }
+}
+
+// Emit a subgroup-accelerated reduction.
+// Uses subgroup intrinsics for the bottom levels, then a small tree
+// reduction across subgroup results in shared memory.
+// subgroup_builtin: e.g. "subgroupAdd", "subgroupMax", "subgroupMin"
+// acc_var: the per-thread accumulator variable name
+// shared_name: the workgroup shared array
+// reduce_op: WGSL binary function name for the tree phase
+// subgroup_size: assumed subgroup size (typically 32)
+inline void emit_subgroup_reduction(
+    std::ostringstream& s,
+    const std::string& acc_var,
+    const std::string& shared_name,
+    const std::string& subgroup_builtin,
+    const std::string& reduce_op,
+    uint32_t workgroup_size = WORKGROUP_SIZE,
+    uint32_t subgroup_size = 32) {
+  uint32_t num_subgroups = workgroup_size / subgroup_size;
+
+  // Step 1: subgroup-level reduction
+  s << "  // Subgroup reduction\n"
+    << "  var sg_result = " << subgroup_builtin << "(" << acc_var << ");\n"
+    << "  let subgroup_id = tid / " << subgroup_size << "u;\n"
+    << "  if (subgroupElect()) { " << shared_name << "[subgroup_id] = sg_result; }\n"
+    << "  workgroupBarrier();\n";
+
+  // Step 2: tree-reduce across subgroup results (only num_subgroups values)
+  for (uint32_t stride = num_subgroups / 2; stride >= 1; stride /= 2) {
+    s << "  if (tid < " << stride << "u) {\n"
+      << "    " << shared_name << "[tid] = " << reduce_op << "("
+      << shared_name << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
+      << "  }\n  workgroupBarrier();\n";
   }
 }
 
