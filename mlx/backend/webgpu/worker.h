@@ -16,8 +16,6 @@
 
 namespace mlx::core::wgpu {
 
-// Run tasks in a worker thread, synchronized with WebGPU queue completion.
-// On WASI, tasks run synchronously during commit (no background thread).
 class Worker {
  public:
   Worker();
@@ -26,10 +24,7 @@ class Worker {
   Worker(const Worker&) = delete;
   Worker& operator=(const Worker&) = delete;
 
-  // Add a pending task that will run when committed and GPU work finishes.
   void add_task(std::function<void()> task);
-
-  // Batch pending tasks and register a wgpuQueueOnSubmittedWorkDone callback.
   void commit(WGPUQueue queue);
 
  private:

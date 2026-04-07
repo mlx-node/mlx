@@ -112,3 +112,4 @@ string(APPEND WGSL_HEADER_CONTENT "} // namespace mlx::core::wgpu::kernels\n")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/gen")
 file(WRITE ${WGSL_HEADER} "${WGSL_HEADER_CONTENT}")
 target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
