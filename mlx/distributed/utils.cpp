@@ -1,7 +1,9 @@
 // Copyright © 2025 Apple Inc.
 
+#if !defined(__wasi__)
 #include <netdb.h>
 #include <unistd.h>
+#endif
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -9,6 +11,46 @@
 #include "mlx/distributed/utils.h"
 
 namespace mlx::core::distributed::detail {
+
+#if defined(__wasi__)
+
+// Networking is not available on WASI — all functions throw.
+address_t parse_address(const std::string&, const std::string&) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+address_t parse_address(const std::string&) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+TCPSocket::TCPSocket(const char*) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+TCPSocket::TCPSocket(TCPSocket&& s) : sock_(s.sock_) { s.sock_ = -1; }
+TCPSocket& TCPSocket::operator=(TCPSocket&& s) {
+  sock_ = s.sock_;
+  s.sock_ = -1;
+  return *this;
+}
+TCPSocket::TCPSocket(int s) : sock_(s) {}
+TCPSocket::~TCPSocket() {}
+int TCPSocket::detach() { return -1; }
+void TCPSocket::listen(const char*, const address_t&) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+TCPSocket TCPSocket::accept(const char*) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+void TCPSocket::send(const char*, const void*, size_t) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+void TCPSocket::recv(const char*, void*, size_t) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+TCPSocket TCPSocket::connect(
+    const char*, const address_t&, int, int, std::function<void(int, int)>) {
+  throw std::runtime_error("Distributed networking not supported on WASI");
+}
+
+#else // !__wasi__
 
 /**
  * Parse a sockaddr from an ip and port provided as strings.
@@ -202,5 +244,7 @@ TCPSocket TCPSocket::connect(
 
   return TCPSocket(sock);
 }
+
+#endif // __wasi__
 
 } // namespace mlx::core::distributed::detail
