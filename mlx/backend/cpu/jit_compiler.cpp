@@ -279,6 +279,9 @@ std::string JitCompiler::build_command(
 }
 
 std::string JitCompiler::exec(const std::string& cmd) {
+#if defined(__wasi__)
+  throw std::runtime_error("JIT compilation is not supported on WASI");
+#else
 #ifdef _MSC_VER
   FILE* pipe = _popen(cmd.c_str(), "r");
 #else
@@ -324,6 +327,7 @@ std::string JitCompiler::exec(const std::string& cmd) {
             ret));
   }
   return ret;
+#endif // __wasi__
 }
 
 } // namespace mlx::core
