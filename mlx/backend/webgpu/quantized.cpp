@@ -249,8 +249,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.batch_stride_out = M * N;
   params.transpose = transpose_ ? 1 : 0;
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(QuantizedMatmulParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(QuantizedMatmulParams));
 
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
@@ -274,8 +275,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups_x, 1, batch_size);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {

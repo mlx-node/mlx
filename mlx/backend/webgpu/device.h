@@ -87,6 +87,27 @@ class CommandEncoder {
   WGPUBindGroup last_bind_group_{nullptr};
 };
 
+class UniformBufferPool {
+ public:
+  // Get a buffer of at least `size` bytes, write `data` into it
+  WGPUBuffer acquire(WGPUQueue queue, const void* data, size_t size);
+  // Return buffer to pool for reuse
+  void release(WGPUBuffer buf);
+  // Clean up all buffers
+  ~UniformBufferPool();
+
+ private:
+  static constexpr size_t ALIGNMENT = 256;
+  size_t align_size(size_t s) const {
+    return (s + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+  }
+  // Map from aligned_size -> free list of buffers
+  std::unordered_map<size_t, std::vector<WGPUBuffer>> free_lists_;
+  // Track allocated size for each buffer (for reuse lookup)
+  std::unordered_map<WGPUBuffer, size_t> buf_sizes_;
+  std::mutex mutex_;
+};
+
 class Device {
  public:
   Device();
@@ -115,6 +136,10 @@ class Device {
   bool has_subgroups() const { return has_subgroups_; }
 
   CommandEncoder& get_command_encoder(Stream s);
+
+  UniformBufferPool& uniform_pool() {
+    return uniform_pool_;
+  }
 
   struct PipelineEntry {
     WGPUComputePipeline pipeline;
@@ -149,6 +174,8 @@ class Device {
 
   std::unordered_map<std::string, WGPUShaderModule> shader_cache_;
   std::mutex shader_mutex_;
+
+  UniformBufferPool uniform_pool_;
 };
 
 // Get the singleton device

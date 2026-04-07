@@ -688,8 +688,9 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.nidx = static_cast<uint32_t>(nidx);
   params.idx_ndim = static_cast<uint32_t>(idx_ndim);
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(GatherParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(GatherParams));
 
   // Build metadata
   auto meta = build_gather_metadata(
@@ -724,8 +725,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -786,8 +786,9 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.ndim_no_axis = static_cast<uint32_t>(src.ndim() - 1);
   params.total_size = static_cast<uint32_t>(idx.size());
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(GatherAxisParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(GatherAxisParams));
 
   // Build metadata: shape_no_axis, src_strides_no_axis, idx_strides_no_axis
   std::vector<int32_t> meta;
@@ -832,8 +833,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -895,8 +895,9 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.idx_ndim = static_cast<uint32_t>(idx_ndim);
   params.upd_ndim = static_cast<uint32_t>(upd.ndim());
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(ScatterParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ScatterParams));
 
   auto meta = build_scatter_metadata(
       upd, out, inputs, axes_, nidx, idx_ndim);
@@ -929,8 +930,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }
@@ -995,8 +995,9 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.ndim_no_axis = static_cast<uint32_t>(idx.ndim() - 1);
   params.total_size = static_cast<uint32_t>(idx.size());
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(ScatterAxisParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ScatterAxisParams));
 
   // Build metadata: shape_no_axis, upd_strides_no_axis,
   //                 idx_strides_no_axis, out_strides_no_axis
@@ -1047,8 +1048,7 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
   wgpuBufferDestroy(meta_buf);
   wgpuBufferRelease(meta_buf);
 }

@@ -16,6 +16,65 @@
 namespace mlx::core::wgpu {
 
 ///////////////////////////////////////////////////////////////////////////////
+// UniformBufferPool implementation
+///////////////////////////////////////////////////////////////////////////////
+
+WGPUBuffer UniformBufferPool::acquire(
+    WGPUQueue queue,
+    const void* data,
+    size_t size) {
+  size_t aligned = align_size(size);
+  WGPUBuffer buf = nullptr;
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = free_lists_.find(aligned);
+    if (it != free_lists_.end() && !it->second.empty()) {
+      buf = it->second.back();
+      it->second.pop_back();
+    }
+  }
+
+  if (!buf) {
+    // Create a new buffer with Uniform | CopyDst usage
+    WGPUBufferDescriptor desc = {};
+    desc.size = aligned;
+    desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    desc.mappedAtCreation = false;
+    buf = wgpuDeviceCreateBuffer(device().gpu_device(), &desc);
+    if (!buf) {
+      throw std::runtime_error(
+          "[WebGPU] Failed to create uniform buffer for pool");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    buf_sizes_[buf] = aligned;
+  }
+
+  // Write data into the buffer
+  wgpuQueueWriteBuffer(queue, buf, 0, data, size);
+  return buf;
+}
+
+void UniformBufferPool::release(WGPUBuffer buf) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = buf_sizes_.find(buf);
+  if (it != buf_sizes_.end()) {
+    free_lists_[it->second].push_back(buf);
+  }
+}
+
+UniformBufferPool::~UniformBufferPool() {
+  for (auto& [size, bufs] : free_lists_) {
+    for (auto buf : bufs) {
+      wgpuBufferDestroy(buf);
+      wgpuBufferRelease(buf);
+    }
+  }
+  free_lists_.clear();
+  buf_sizes_.clear();
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Device implementation
 ///////////////////////////////////////////////////////////////////////////////
 

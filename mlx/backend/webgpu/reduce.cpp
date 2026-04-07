@@ -657,10 +657,11 @@ void gpu_init_reduce(
   encoder.set_output_array(out);
 
   // Fill uniform
+  auto& pool = wgpu::device().uniform_pool();
   AllReduceParams params{};
   params.data[0] = static_cast<uint32_t>(out.size());
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
@@ -676,8 +677,7 @@ void gpu_init_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +729,8 @@ void gpu_all_reduce(
 
   encoder.set_input_array(in);
 
+  auto& pool = wgpu::device().uniform_pool();
+
   if (num_workgroups > 1) {
     // Two-pass approach: first pass reduces to intermediate array
     array intermediate({static_cast<int>(num_workgroups)}, out.dtype(), nullptr, {});
@@ -739,7 +741,7 @@ void gpu_all_reduce(
     AllReduceParams params{};
     params.data[0] = input_size;
     WGPUBuffer uniform_buf =
-        wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
+        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer inter_buf = wgpu::wgpu_buffer(intermediate);
@@ -754,8 +756,7 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
     wgpuBindGroupRelease(bg);
-    wgpuBufferDestroy(uniform_buf);
-    wgpuBufferRelease(uniform_buf);
+    pool.release(uniform_buf);
 
     // Second pass: reduce intermediate -> output (single workgroup)
     // Re-generate kernel for the output type (in case intermediate is different
@@ -777,7 +778,7 @@ void gpu_all_reduce(
     AllReduceParams params2{};
     params2.data[0] = num_workgroups;
     WGPUBuffer uniform_buf2 =
-        wgpu::create_uniform_buffer(&params2, sizeof(AllReduceParams));
+        pool.acquire(wgpu::device().gpu_queue(), &params2, sizeof(AllReduceParams));
 
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
     uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
@@ -790,8 +791,7 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe2.pipeline, bg2, 1);
     wgpuBindGroupRelease(bg2);
-    wgpuBufferDestroy(uniform_buf2);
-    wgpuBufferRelease(uniform_buf2);
+    pool.release(uniform_buf2);
   } else {
     // Single-pass: all elements fit in one workgroup
     encoder.set_output_array(out);
@@ -799,7 +799,7 @@ void gpu_all_reduce(
     AllReduceParams params{};
     params.data[0] = input_size;
     WGPUBuffer uniform_buf =
-        wgpu::create_uniform_buffer(&params, sizeof(AllReduceParams));
+        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -814,8 +814,7 @@ void gpu_all_reduce(
 
     encoder.dispatch_compute(pe.pipeline, bg, 1);
     wgpuBindGroupRelease(bg);
-    wgpuBufferDestroy(uniform_buf);
-    wgpuBufferRelease(uniform_buf);
+    pool.release(uniform_buf);
   }
 }
 
@@ -916,8 +915,9 @@ void gpu_row_reduce(
     params.non_row_reductions[0] = non_row_reductions;
   }
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(RowReduceParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(RowReduceParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -935,8 +935,7 @@ void gpu_row_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,8 +1034,9 @@ void gpu_col_reduce(
   params.extra[0] = non_col_reductions;
   params.extra[1] = static_cast<uint32_t>(out.size());
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(ColReduceParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ColReduceParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -1056,8 +1056,7 @@ void gpu_col_reduce(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 } // namespace
