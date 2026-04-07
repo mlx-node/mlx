@@ -8,6 +8,8 @@
 
 namespace mlx::core::gpu {
 
+void init() {}
+
 void new_stream(Stream s) {
   // Force initialization of the WebGPU device.
   wgpu::device();
