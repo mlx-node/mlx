@@ -13,6 +13,12 @@
 #include <sstream>
 #include <stdexcept>
 
+#if defined(__wasm__)
+extern "C" void mlx_wgpu_fused_dispatch(
+    WGPUComputePassEncoder, WGPUComputePipeline, WGPUBindGroup,
+    uint32_t, uint32_t, uint32_t);
+#endif
+
 namespace mlx::core::wgpu {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -405,9 +411,6 @@ void CommandEncoder::dispatch_compute(
 
 #if defined(__wasm__)
   // Fused dispatch: single RPC roundtrip instead of 3 separate calls
-  extern "C" void mlx_wgpu_fused_dispatch(
-      WGPUComputePassEncoder, WGPUComputePipeline, WGPUBindGroup,
-      uint32_t, uint32_t, uint32_t);
   mlx_wgpu_fused_dispatch(compute_pass_, pipeline, bind_group, x, y, z);
   last_pipeline_ = pipeline;
   last_bind_group_ = bind_group;

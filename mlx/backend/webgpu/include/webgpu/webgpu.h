@@ -80,6 +80,11 @@ typedef enum WGPUBufferMapState {
     WGPUBufferMapState_Mapped = 2,
 } WGPUBufferMapState;
 
+typedef enum WGPUFeatureName {
+    WGPUFeatureName_Undefined = 0,
+    WGPUFeatureName_ShaderF16 = 14,
+} WGPUFeatureName;
+
 typedef enum WGPUPowerPreference {
     WGPUPowerPreference_Undefined = 0,
     WGPUPowerPreference_LowPower = 1,
@@ -198,7 +203,7 @@ typedef struct WGPUDeviceDescriptor {
     WGPUChainedStruct const* nextInChain;
     char const* label;
     size_t requiredFeatureCount;
-    void const* requiredFeatures;
+    WGPUFeatureName const* requiredFeatures;
     WGPURequiredLimits const* requiredLimits;
     WGPUQueueDescriptor defaultQueue; // Dawn compat
 } WGPUDeviceDescriptor;
@@ -309,6 +314,7 @@ WGPUInstance wgpuCreateInstance(WGPUInstanceDescriptor const* descriptor);
 void wgpuInstanceRequestAdapter(WGPUInstance instance,
     WGPURequestAdapterOptions const* options,
     WGPUInstanceRequestAdapterCallback callback, void* userdata);
+void wgpuInstanceProcessEvents(WGPUInstance instance);
 void wgpuInstanceRelease(WGPUInstance instance);
 
 // Adapter
@@ -316,6 +322,8 @@ void wgpuAdapterRequestDevice(WGPUAdapter adapter,
     WGPUDeviceDescriptor const* descriptor,
     WGPUAdapterRequestDeviceCallback callback, void* userdata);
 void wgpuAdapterGetProperties(WGPUAdapter adapter, WGPUAdapterProperties* properties);
+WGPUBool wgpuAdapterGetLimits(WGPUAdapter adapter, WGPUSupportedLimits* limits);
+WGPUBool wgpuAdapterHasFeature(WGPUAdapter adapter, WGPUFeatureName feature);
 void wgpuAdapterRelease(WGPUAdapter adapter);
 
 // Device
