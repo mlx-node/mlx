@@ -122,8 +122,7 @@ inline uint64_t wgpu_data_size(const array& arr) {
 inline const char* dtype_to_wgsl(Dtype dtype) {
   switch (dtype.val()) {
     case Dtype::Val::bool_:
-      throw std::runtime_error(
-          "[WebGPU] bool is not supported (no storable bool arrays in WGSL)");
+      return "u32"; // Bool stored as u32 in WebGPU
     case Dtype::Val::uint8:
       throw std::runtime_error(
           "[WebGPU] uint8 is not supported (no 8-bit storage in WGSL)");
@@ -149,8 +148,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::float16:
       return "f16";
     case Dtype::Val::bfloat16:
-      throw std::runtime_error(
-          "[WebGPU] bfloat16 is not supported (no native bfloat16 in WGSL)");
+      return "f32"; // Interpreted as f32; caller must ensure data is promoted
     case Dtype::Val::float32:
       return "f32";
     case Dtype::Val::float64:
