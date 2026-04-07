@@ -67,23 +67,31 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 // Reduce — implemented in reduce.cpp
 // Softmax — implemented in softmax.cpp
 
-// These ops are implemented in backend/gpu/primitives.cpp (shared GPU infra):
-//   AsStrided, AsType, Broadcast, BroadcastAxes, Concatenate, Contiguous,
-//   Copy, CustomTransforms, Depends, DynamicSlice, DynamicSliceUpdate,
-//   ExpandDims, Flatten, Full, NumberOfElements, Pad, Reshape, Slice,
-//   Split, Squeeze, StopGradient, Transpose, Unflatten, View
-// Do NOT redefine them here — the linker will use gpu/primitives.cpp.
-
 NO_GPU(ArgPartition)
 NO_GPU(ArgReduce)
 NO_GPU(ArgSort)
+NO_GPU(AsType)
+NO_GPU(AsStrided)
 NO_GPU(BitwiseBinary)
 NO_GPU(BlockMaskedMM)
+NO_GPU(Broadcast)
+NO_GPU(BroadcastAxes)
 NO_GPU_MULTI(Compiled)
+NO_GPU(Concatenate)
 NO_GPU(Conjugate)
+NO_GPU(Contiguous)
 NO_GPU(Convolution)
+NO_GPU(Copy)
+NO_GPU_MULTI(CustomTransforms)
+NO_GPU_MULTI(Depends)
 NO_GPU_MULTI(DivMod)
+NO_GPU(DynamicSlice)
+NO_GPU(DynamicSliceUpdate)
+NO_GPU(NumberOfElements)
+NO_GPU(ExpandDims)
 NO_GPU(FFT)
+NO_GPU(Flatten)
+NO_GPU(Full)
 NO_GPU(GatherMM)
 NO_GPU(GatherQMM)
 NO_GPU(Hadamard)
@@ -91,19 +99,28 @@ NO_GPU(Imag)
 NO_GPU(Load)
 NO_GPU(LogSumExp)
 NO_GPU_MULTI(LUF)
+NO_GPU(Pad)
 NO_GPU(Partition)
 NO_GPU_MULTI(QRF)
 NO_GPU(RandomBits)
 NO_GPU(Real)
+NO_GPU(Reshape)
 NO_GPU(Scan)
 NO_GPU(SegmentedMM)
+NO_GPU(Slice)
 NO_GPU(SliceUpdate)
 NO_GPU(Sort)
+NO_GPU_MULTI(Split)
+NO_GPU(Squeeze)
+NO_GPU(StopGradient)
 NO_GPU_MULTI(SVD)
+NO_GPU(Transpose)
+NO_GPU(Unflatten)
 NO_GPU(Inverse)
 NO_GPU(Cholesky)
 NO_GPU_MULTI(Eigh)
 NO_GPU_MULTI(Eig)
+NO_GPU(View)
 NO_GPU(MaskedScatter)
 
 namespace fast {
