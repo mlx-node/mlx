@@ -96,7 +96,7 @@ std::string make_select_kernel(
       << "  if (i < 4u) { return params.c_strides_0[i]; }\n"
       << "  return params.c_strides_1[i - 4u];\n"
       << "}\n\n"
-      << "fn elem_to_loc_a(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc_a(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -104,9 +104,9 @@ std::string make_select_kernel(
       << "    loc += i32(dim_idx) * get_a_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n"
-      << "fn elem_to_loc_b(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc_b(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -114,9 +114,9 @@ std::string make_select_kernel(
       << "    loc += i32(dim_idx) * get_b_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n"
-      << "fn elem_to_loc_c(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc_c(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -124,7 +124,7 @@ std::string make_select_kernel(
       << "    loc += i32(dim_idx) * get_c_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n";
   }
 
@@ -143,9 +143,9 @@ std::string make_select_kernel(
 
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let a_idx = elem_to_loc_a(idx, ndim) + cond_off;\n"
-      << "  let b_idx = elem_to_loc_b(idx, ndim) + true_off;\n"
-      << "  let c_idx = elem_to_loc_c(idx, ndim) + false_off;\n"
+      << "  let a_idx = u32(elem_to_loc_a(idx, ndim) + i32(cond_off));\n"
+      << "  let b_idx = u32(elem_to_loc_b(idx, ndim) + i32(true_off));\n"
+      << "  let c_idx = u32(elem_to_loc_c(idx, ndim) + i32(false_off));\n"
       << "  let condition = cond[a_idx] != 0u;\n"
       << "  let t_val = true_vals[b_idx];\n"
       << "  let f_val = false_vals[c_idx];\n";
@@ -208,11 +208,11 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
   TernaryParams params{};
   uint32_t elem_count;
 
-  // Compute element offsets for each array
-  params.offsets[0] = static_cast<uint32_t>(cond.offset());
-  params.offsets[1] = static_cast<uint32_t>(b.offset());
-  params.offsets[2] = static_cast<uint32_t>(c.offset());
-  params.offsets[3] = static_cast<uint32_t>(out.offset());
+  // Convert byte offsets to element offsets (offset() returns bytes)
+  params.offsets[0] = static_cast<uint32_t>(cond.offset() / cond.itemsize());
+  params.offsets[1] = static_cast<uint32_t>(b.offset() / b.itemsize());
+  params.offsets[2] = static_cast<uint32_t>(c.offset() / c.itemsize());
+  params.offsets[3] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   if (variant == "g") {
     auto [shape_collapsed, strides_vec] =

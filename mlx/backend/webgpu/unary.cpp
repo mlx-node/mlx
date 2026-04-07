@@ -81,7 +81,7 @@ std::string make_unary_kernel(
       << "  if (i < 4u) { return params.strides_0[i]; }\n"
       << "  return params.strides_1[i - 4u];\n"
       << "}\n\n"
-      << "fn elem_to_loc(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -89,7 +89,7 @@ std::string make_unary_kernel(
       << "    loc += i32(dim_idx) * get_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n";
   }
 
@@ -106,7 +106,7 @@ std::string make_unary_kernel(
 
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let in_idx = elem_to_loc(idx, ndim) + in_off;\n"
+      << "  let in_idx = u32(elem_to_loc(idx, ndim) + i32(in_off));\n"
       << "  let in_val = input[in_idx];\n";
   } else {
     s << "  let in_val = input[idx + in_off];\n";
@@ -390,9 +390,9 @@ void unary_op_gpu_dispatch(
   UnaryParams params{};
   uint32_t elem_count;
 
-  // Compute element offsets for each array
-  params.offsets[0] = static_cast<uint32_t>(in.offset());
-  params.offsets[1] = static_cast<uint32_t>(out.offset());
+  // Convert byte offsets to element offsets (offset() returns bytes)
+  params.offsets[0] = static_cast<uint32_t>(in.offset() / in.itemsize());
+  params.offsets[1] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   if (!contiguous) {
     // General: collapse contiguous dims for efficiency

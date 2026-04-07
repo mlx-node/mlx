@@ -119,33 +119,43 @@ inline uint64_t wgpu_data_size(const array& arr) {
 inline const char* dtype_to_wgsl(Dtype dtype) {
   switch (dtype.val()) {
     case Dtype::Val::bool_:
-      return "bool";
+      throw std::runtime_error(
+          "[WebGPU] bool is not supported (no storable bool arrays in WGSL)");
     case Dtype::Val::uint8:
-      return "u32"; // WebGPU lacks 8-bit; pack into u32
+      throw std::runtime_error(
+          "[WebGPU] uint8 is not supported (no 8-bit storage in WGSL)");
     case Dtype::Val::uint16:
-      return "u32"; // WebGPU lacks 16-bit; pack into u32
+      throw std::runtime_error(
+          "[WebGPU] uint16 is not supported (no 16-bit integer storage in WGSL)");
     case Dtype::Val::uint32:
       return "u32";
     case Dtype::Val::uint64:
-      throw std::runtime_error("[WebGPU] uint64 is not supported on WebGPU backend");
+      throw std::runtime_error(
+          "[WebGPU] uint64 is not supported on WebGPU backend");
     case Dtype::Val::int8:
-      return "i32"; // WebGPU lacks 8-bit
+      throw std::runtime_error(
+          "[WebGPU] int8 is not supported (no 8-bit storage in WGSL)");
     case Dtype::Val::int16:
-      return "i32"; // WebGPU lacks 16-bit
+      throw std::runtime_error(
+          "[WebGPU] int16 is not supported (no 16-bit integer storage in WGSL)");
     case Dtype::Val::int32:
       return "i32";
     case Dtype::Val::int64:
-      throw std::runtime_error("[WebGPU] int64 is not supported on WebGPU backend");
+      throw std::runtime_error(
+          "[WebGPU] int64 is not supported on WebGPU backend");
     case Dtype::Val::float16:
       return "f16";
     case Dtype::Val::bfloat16:
-      return "f32"; // bfloat16 needs software emulation
+      throw std::runtime_error(
+          "[WebGPU] bfloat16 is not supported (no native bfloat16 in WGSL)");
     case Dtype::Val::float32:
       return "f32";
     case Dtype::Val::float64:
-      throw std::runtime_error("[WebGPU] float64 is not supported on WebGPU backend");
+      throw std::runtime_error(
+          "[WebGPU] float64 is not supported on WebGPU backend");
     case Dtype::Val::complex64:
-      return "f32"; // complex needs custom struct
+      throw std::runtime_error(
+          "[WebGPU] complex64 is not supported (needs custom struct in WGSL)");
     default:
       throw std::runtime_error("[wgpu] Unsupported dtype for WGSL");
   }
@@ -167,13 +177,13 @@ inline void emit_elem_to_loc(
     const std::string& func_name,
     const std::string& shape_accessor,
     const std::string& stride_accessor) {
-  s << "fn " << func_name << "(idx: u32, ndim: u32) -> u32 {\n"
-    << "  var loc: u32 = 0u;\n"
+  s << "fn " << func_name << "(idx: u32, ndim: u32) -> i32 {\n"
+    << "  var loc: i32 = 0;\n"
     << "  var idx_rem = idx;\n"
     << "  for (var d: u32 = ndim - 1u; d < ndim; d = d - 1u) {\n"
     << "    let s = " << shape_accessor << "(d);\n"
     << "    let st = " << stride_accessor << "(d);\n"
-    << "    loc += (idx_rem % s) * u32(st);\n"
+    << "    loc += i32(idx_rem % s) * st;\n"
     << "    idx_rem /= s;\n"
     << "  }\n"
     << "  return loc;\n"

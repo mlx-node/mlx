@@ -93,7 +93,7 @@ std::string make_binary_kernel(
       << "  if (i < 4u) { return params.b_strides_0[i]; }\n"
       << "  return params.b_strides_1[i - 4u];\n"
       << "}\n\n"
-      << "fn elem_to_loc_a(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc_a(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -101,9 +101,9 @@ std::string make_binary_kernel(
       << "    loc += i32(dim_idx) * get_a_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n"
-      << "fn elem_to_loc_b(idx: u32, ndim: u32) -> u32 {\n"
+      << "fn elem_to_loc_b(idx: u32, ndim: u32) -> i32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var idx_rem: u32 = idx;\n"
       << "  for (var i: u32 = ndim - 1u; i < ndim; i = i - 1u) {\n"
@@ -111,7 +111,7 @@ std::string make_binary_kernel(
       << "    loc += i32(dim_idx) * get_b_stride(i);\n"
       << "    idx_rem = idx_rem / get_shape(i);\n"
       << "  }\n"
-      << "  return u32(loc);\n"
+      << "  return loc;\n"
       << "}\n\n";
   }
 
@@ -129,8 +129,8 @@ std::string make_binary_kernel(
 
   if (variant == "g") {
     s << "  let ndim = params.size_ndim.y;\n"
-      << "  let a_idx = elem_to_loc_a(idx, ndim) + a_off;\n"
-      << "  let b_idx = elem_to_loc_b(idx, ndim) + b_off;\n"
+      << "  let a_idx = u32(elem_to_loc_a(idx, ndim) + i32(a_off));\n"
+      << "  let b_idx = u32(elem_to_loc_b(idx, ndim) + i32(b_off));\n"
       << "  let a_val = a[a_idx];\n"
       << "  let b_val = b[b_idx];\n";
   } else if (variant == "ss") {
@@ -334,10 +334,10 @@ void binary_op_gpu_dispatch(
   BinaryParams params{};
   uint32_t elem_count;
 
-  // Compute element offsets for each array
-  params.offsets[0] = static_cast<uint32_t>(a.offset());
-  params.offsets[1] = static_cast<uint32_t>(b.offset());
-  params.offsets[2] = static_cast<uint32_t>(out.offset());
+  // Convert byte offsets to element offsets (offset() returns bytes)
+  params.offsets[0] = static_cast<uint32_t>(a.offset() / a.itemsize());
+  params.offsets[1] = static_cast<uint32_t>(b.offset() / b.itemsize());
+  params.offsets[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   if (bopt == BinaryOpType::General) {
     auto [shape_collapsed, strides_vec] =
