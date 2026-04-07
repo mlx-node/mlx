@@ -83,6 +83,7 @@ typedef enum WGPUBufferMapState {
 typedef enum WGPUFeatureName {
     WGPUFeatureName_Undefined = 0,
     WGPUFeatureName_ShaderF16 = 14,
+    WGPUFeatureName_Subgroups = 0x3F1,
 } WGPUFeatureName;
 
 typedef enum WGPUPowerPreference {
