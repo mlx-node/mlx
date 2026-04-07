@@ -332,8 +332,9 @@ static void dispatch_matmul(
   params.batch_stride_b = batch_stride_b;
   params.batch_stride_c = batch_stride_c;
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(MatmulParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(MatmulParams));
 
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
@@ -359,8 +360,7 @@ static void dispatch_matmul(
   }
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,8 +558,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     ep.alpha = alpha_;
     ep.beta = beta_;
 
+    auto& pool2 = wgpu::device().uniform_pool();
     WGPUBuffer uniform_buf =
-        wgpu::create_uniform_buffer(&ep, sizeof(EpilogueParams));
+        pool2.acquire(wgpu::device().gpu_queue(), &ep, sizeof(EpilogueParams));
 
     WGPUBuffer c_buf = wgpu::wgpu_buffer(c_contig);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -575,8 +576,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
     wgpuBindGroupRelease(bg);
-    wgpuBufferDestroy(uniform_buf);
-    wgpuBufferRelease(uniform_buf);
+    pool2.release(uniform_buf);
   }
 }
 

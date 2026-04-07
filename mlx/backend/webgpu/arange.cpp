@@ -114,6 +114,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // Fill params -- use the appropriate type to avoid precision loss
   uint32_t data_size = static_cast<uint32_t>(out.data_size());
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf;
 
   if (is_integer) {
@@ -122,14 +123,14 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
     params.start = static_cast<int32_t>(start_);
     params.step = static_cast<int32_t>(step_);
     uniform_buf =
-        wgpu::create_uniform_buffer(&params, sizeof(ArangeParamsInt));
+        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsInt));
   } else {
     ArangeParamsFloat params{};
     params.size = data_size;
     params.start = static_cast<float>(start_);
     params.step = static_cast<float>(step_);
     uniform_buf =
-        wgpu::create_uniform_buffer(&params, sizeof(ArangeParamsFloat));
+        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsFloat));
   }
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -149,8 +150,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 } // namespace mlx::core

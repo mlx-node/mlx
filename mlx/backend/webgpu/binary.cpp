@@ -388,8 +388,9 @@ void binary_op_gpu_dispatch(
     params.size_ndim[0] = elem_count;
   }
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(BinaryParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(BinaryParams));
 
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
@@ -411,8 +412,7 @@ void binary_op_gpu_dispatch(
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 } // namespace

@@ -194,8 +194,9 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   SoftmaxParams params{};
   params.data[0] = static_cast<uint32_t>(axis_size);
 
+  auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
-      wgpu::create_uniform_buffer(&params, sizeof(SoftmaxParams));
+      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(SoftmaxParams));
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -213,8 +214,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
       pe.pipeline, bg, static_cast<uint32_t>(n_rows));
 
   wgpuBindGroupRelease(bg);
-  wgpuBufferDestroy(uniform_buf);
-  wgpuBufferRelease(uniform_buf);
+  pool.release(uniform_buf);
 }
 
 } // namespace mlx::core
