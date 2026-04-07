@@ -11,17 +11,9 @@
 
 namespace mlx::core {
 
-void slice_gpu(
-    const array& in,
-    array& out,
-    const Shape& start_indices,
-    const Shape& strides,
-    const Stream&) {
-  // Delegate to the common CPU-side slice logic which computes the
-  // data offset and adjusted strides, then shares the input buffer.
-  // This is a zero-copy operation.
-  slice(in, out, start_indices, strides);
-}
+// slice_gpu and pad_gpu are provided by gpu/slicing.cpp (identical logic).
+// Only WebGPU-specific functions (concatenate_gpu, compute_dynamic_offset)
+// are defined here to avoid duplicate symbol errors.
 
 void concatenate_gpu(
     const std::vector<array>& inputs,
@@ -51,32 +43,6 @@ void concatenate_gpu(
         out, strides, flags, out_slice.size(), data_offset);
     copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
   }
-}
-
-void pad_gpu(
-    const array& in,
-    const array& val,
-    array& out,
-    const std::vector<int>& axes,
-    const Shape& low_pad_size,
-    const Stream& s) {
-  // Fill the entire output with the pad value.
-  fill_gpu(val, out, s);
-
-  // Compute the offset in the output where the input data begins.
-  size_t data_offset = 0;
-  for (int i = 0; i < static_cast<int>(axes.size()); i++) {
-    auto ax = axes[i] < 0 ? out.ndim() + axes[i] : axes[i];
-    data_offset += out.strides()[ax] * low_pad_size[i];
-  }
-
-  // Create a virtual slice of the output at the correct offset.
-  array out_slice(in.shape(), out.dtype(), nullptr, {});
-  out_slice.copy_shared_buffer(
-      out, out.strides(), out.flags(), out_slice.size(), data_offset);
-
-  // Copy input data into the padded region.
-  copy_gpu_inplace(in, out_slice, CopyType::GeneralGeneral, s);
 }
 
 array compute_dynamic_offset(
