@@ -96,6 +96,15 @@ else()
                  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal/no_metal.cpp)
 endif()
 
+# Shared GPU infra (copy, slicing, primitives) — must come before
+# backend-specific dirs so its eval_gpu definitions take priority
+# over NO_GPU stubs in backend-specific primitives.cpp files.
+if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_WEBGPU)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/gpu)
+else()
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/no_gpu)
+endif()
+
 if(MLX_BUILD_CUDA)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/cuda)
 else()
@@ -108,10 +117,4 @@ if(MLX_BUILD_WEBGPU)
 else()
   target_sources(mlx
                  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu/no_webgpu.cpp)
-endif()
-
-if(MLX_BUILD_METAL OR MLX_BUILD_CUDA OR MLX_BUILD_WEBGPU)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/gpu)
-else()
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/no_gpu)
 endif()
