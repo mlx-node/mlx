@@ -145,6 +145,7 @@ const char* get_unary_short_name(const char* name) {
   if (n == "ArcSinh") return "asinh_";
   if (n == "ArcCosh") return "acosh_";
   if (n == "ArcTanh") return "atanh_";
+  if (n == "Rsqrt") return "rsqrt";
   if (n == "Sqrt") return "sqrt_";
   if (n == "Square") return "square";
   if (n == "Ceil") return "ceil_";
@@ -277,6 +278,13 @@ std::string get_unary_op_expr(
   if (n == "ArcTanh") {
     if (is_float) return "atanh(in_val)";
     return out_type + "(atanh(f32(in_val)))";
+  }
+
+  if (n == "Rsqrt") {
+    if (!is_float) {
+      return out_type + "(inverseSqrt(f32(in_val)))";
+    }
+    return "inverseSqrt(in_val)";
   }
 
   if (n == "Sqrt") {
