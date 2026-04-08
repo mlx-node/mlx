@@ -137,6 +137,9 @@ class Device {
 
   CommandEncoder& get_command_encoder(Stream s);
 
+  // Commit all pending command encoders (flush GPU work before readback)
+  void flush_all_encoders();
+
   UniformBufferPool& uniform_pool() {
     return uniform_pool_;
   }
@@ -183,5 +186,8 @@ Device& device();
 
 // Get the command encoder for a stream
 CommandEncoder& get_command_encoder(Stream s);
+
+// Flush all pending command encoders
+void flush_all_encoders();
 
 } // namespace mlx::core::wgpu
