@@ -646,7 +646,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() > 0);
   const auto& src = inputs[0];
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   if (out.size() == 0) {
     return;
   }
@@ -744,7 +744,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& src = inputs[0];
   const auto& idx = inputs[1];
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   if (out.size() == 0) {
     return;
   }

@@ -94,7 +94,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   const char* out_type = wgpu::dtype_to_wgsl(out.dtype());
 

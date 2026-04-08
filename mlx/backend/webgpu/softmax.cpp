@@ -159,7 +159,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   // binds input as read-only and output as read-write, and WebGPU does not
   // allow the same buffer in both roles simultaneously.
   out.set_data(
-      allocator::malloc(in.data_size() * in.itemsize()),
+      allocator::malloc(wgpu::wgpu_alloc_size(in)),
       in.data_size(),
       in.strides(),
       in.flags());

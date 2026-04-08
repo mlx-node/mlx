@@ -64,6 +64,23 @@ fn get_out_stride(i: u32) -> i32 {
   return params.out_strides_1[i - 4u];
 }
 
+// Type conversion modes (packed in upper 16 bits of size_ndim_offsets.y):
+// 0 = raw copy (no conversion)
+// 1 = bool→float (u32 0/1 → f32 0.0/1.0 bit pattern)
+// 2 = float/int→bool (nonzero → u32(1), zero → u32(0))
+// 3 = int→float (i32 reinterpret → f32 convert)
+// 4 = float→int (f32 reinterpret → i32 convert)
+// 5 = uint→float (u32 → f32 convert)
+fn apply_conversion(val: u32, mode: u32) -> u32 {
+  if (mode == 0u) { return val; }
+  if (mode == 1u) { return select(0u, 0x3F800000u, val != 0u); }
+  if (mode == 2u) { return select(0u, 1u, val != 0u); }
+  if (mode == 3u) { return bitcast<u32>(f32(bitcast<i32>(val))); }
+  if (mode == 4u) { return bitcast<u32>(i32(bitcast<f32>(val))); }
+  if (mode == 5u) { return bitcast<u32>(f32(val)); }
+  return val;
+}
+
 // ============================================================================
 // elem_to_loc: maps a flat element index to a buffer offset using
 // shape and strides. Walks dimensions innermost to outermost.
@@ -100,7 +117,8 @@ fn copy_s(@builtin(global_invocation_id) gid: vec3u) {
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
   let out_off = params.size_ndim_offsets.w;
-  let val = src[in_off];
+  let mode = (params.size_ndim_offsets.y >> 16u) & 0xFFFFu;
+  let val = apply_conversion(src[in_off], mode);
   let end = min(base + N_READS, size);
   for (var i = base; i < end; i = i + 1u) {
     dst[out_off + i] = val;
@@ -117,9 +135,10 @@ fn copy_v(@builtin(global_invocation_id) gid: vec3u) {
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
   let out_off = params.size_ndim_offsets.w;
+  let mode = (params.size_ndim_offsets.y >> 16u) & 0xFFFFu;
   let end = min(base + N_READS, size);
   for (var i = base; i < end; i = i + 1u) {
-    dst[out_off + i] = src[in_off + i];
+    dst[out_off + i] = apply_conversion(src[in_off + i], mode);
   }
 }
 
@@ -133,11 +152,12 @@ fn copy_g(@builtin(global_invocation_id) gid: vec3u) {
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
   let out_off = params.size_ndim_offsets.w;
-  let ndim = params.size_ndim_offsets.y;
+  let ndim = params.size_ndim_offsets.y & 0xFFFFu;
+  let mode = (params.size_ndim_offsets.y >> 16u) & 0xFFFFu;
   let end = min(base + N_READS, size);
   for (var i = base; i < end; i = i + 1u) {
     let in_idx = elem_to_loc_in(i, ndim);
-    dst[out_off + i] = src[in_off + in_idx];
+    dst[out_off + i] = apply_conversion(src[in_off + in_idx], mode);
   }
 }
 
@@ -151,11 +171,12 @@ fn copy_gg(@builtin(global_invocation_id) gid: vec3u) {
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
   let out_off = params.size_ndim_offsets.w;
-  let ndim = params.size_ndim_offsets.y;
+  let ndim = params.size_ndim_offsets.y & 0xFFFFu;
+  let mode = (params.size_ndim_offsets.y >> 16u) & 0xFFFFu;
   let end = min(base + N_READS, size);
   for (var i = base; i < end; i = i + 1u) {
     let in_idx = elem_to_loc_in(i, ndim);
     let out_idx = elem_to_loc_out(i, ndim);
-    dst[out_off + out_idx] = src[in_off + in_idx];
+    dst[out_off + out_idx] = apply_conversion(src[in_off + in_idx], mode);
   }
 }

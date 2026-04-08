@@ -8,6 +8,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -395,28 +396,106 @@ void flush_all_encoders() {
   device().flush_all_encoders();
 }
 
+// Upload CPU data to GPU with format conversion for types where
+// GPU element size differs from CPU (bf16→f32, bool→u32).
+static void upload_with_conversion(
+    WebGPUBuffer* buf,
+    Dtype::Val dtype_val,
+    size_t data_size) {
+  auto queue = device().gpu_queue();
+
+  if (dtype_val == Dtype::Val::bfloat16) {
+    // Expand bf16 (2 bytes) → f32 (4 bytes)
+    std::vector<float> tmp(data_size);
+    auto* src = static_cast<const bfloat16_t*>(buf->cpu_ptr);
+    for (size_t i = 0; i < data_size; i++) {
+      tmp[i] = static_cast<float>(src[i]);
+    }
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), data_size * 4);
+  } else if (dtype_val == Dtype::Val::bool_) {
+    // Expand bool (1 byte) → u32 (4 bytes)
+    std::vector<uint32_t> tmp(data_size);
+    auto* src = static_cast<const uint8_t*>(buf->cpu_ptr);
+    for (size_t i = 0; i < data_size; i++) {
+      tmp[i] = src[i] ? 1u : 0u;
+    }
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), data_size * 4);
+  } else {
+    // Direct copy for types where CPU and GPU sizes match
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, buf->cpu_ptr, buf->size);
+  }
+}
+
 WGPUBuffer wgpu_buffer(const array& arr) {
   auto* buf = const_cast<WebGPUBuffer*>(
       static_cast<const WebGPUBuffer*>(arr.buffer().ptr()));
   if (!buf || !buf->buffer) {
     throw std::runtime_error("[WebGPU] wgpu_buffer: null buffer");
   }
+
+  // Track dtype for download conversion in raw_ptr()
+  buf->dtype_val = arr.dtype().val();
+
+  // Ensure GPU buffer is large enough for GPU-side element sizes.
+  // Input arrays allocated for CPU types (bf16=2B, bool=1B) may be too small
+  // for GPU types (f32=4B, u32=4B). Recreate the buffer if needed.
+  size_t needed = arr.data_size() * wgpu_itemsize(arr.dtype());
+  if (needed > buf->size) {
+    if (buf->buffer) {
+      wgpuBufferDestroy(buf->buffer);
+      wgpuBufferRelease(buf->buffer);
+    }
+    // Round up the same way as WebGPUAllocator::malloc
+    size_t new_size = needed;
+    constexpr size_t page = 16384;
+    if (new_size <= 8) {
+      new_size = 8;
+    } else if (new_size < page) {
+      // next power of 2
+      new_size--;
+      new_size |= new_size >> 1;
+      new_size |= new_size >> 2;
+      new_size |= new_size >> 4;
+      new_size |= new_size >> 8;
+      new_size |= new_size >> 16;
+      new_size++;
+    } else {
+      new_size = page * ((new_size + page - 1) / page);
+    }
+    WGPUBufferDescriptor desc = {};
+    desc.size = new_size;
+    desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst |
+        WGPUBufferUsage_CopySrc;
+    desc.mappedAtCreation = false;
+    buf->buffer = wgpuDeviceCreateBuffer(device().gpu_device(), &desc);
+    if (!buf->buffer) {
+      throw std::runtime_error("[WebGPU] Failed to resize buffer for GPU type");
+    }
+    buf->size = new_size;
+    buf->gpu_has_data = false;
+  }
+
   // If CPU data was written (e.g. by array::init) but never uploaded to GPU,
-  // upload it now via wgpuQueueWriteBuffer.
+  // upload it now with format conversion for wider GPU types.
   if (buf->cpu_dirty && buf->cpu_ptr && buf->buffer) {
-    wgpuQueueWriteBuffer(
-        device().gpu_queue(), buf->buffer, 0, buf->cpu_ptr, buf->size);
+    upload_with_conversion(buf, arr.dtype().val(), arr.data_size());
     buf->cpu_dirty = false;
     buf->gpu_has_data = true;
+    // Free the CPU copy after upload — it's now redundant, and keeping it
+    // risks returning stale data from raw_ptr() if the buffer is later
+    // used as a GPU compute output.
+    std::free(buf->cpu_ptr);
+    buf->cpu_ptr = nullptr;
   }
   // Safety: if cpu_ptr exists with data but gpu_has_data is false,
   // ensure the data gets uploaded. This handles cases where
   // eval() wrote to CPU memory (e.g. NumberOfElements) but the
   // dirty flag was somehow missed.
   if (!buf->gpu_has_data && buf->cpu_ptr && !buf->cpu_dirty) {
-    wgpuQueueWriteBuffer(
-        device().gpu_queue(), buf->buffer, 0, buf->cpu_ptr, buf->size);
+    upload_with_conversion(buf, arr.dtype().val(), arr.data_size());
     buf->gpu_has_data = true;
+    std::free(buf->cpu_ptr);
+    buf->cpu_ptr = nullptr;
   }
   return buf->buffer;
 }
@@ -445,11 +524,18 @@ void CommandEncoder::set_input_array(const array& arr) {
 
 void CommandEncoder::set_output_array(const array& arr) {
   bytes_tracked_ += arr.data_size() * arr.itemsize();
-  // Mark that this buffer will have meaningful GPU data after compute
+  // Mark that this buffer will have meaningful GPU data after compute.
+  // Invalidate any cached CPU pointer — the GPU is about to overwrite
+  // the buffer contents, so the old CPU copy would be stale.
   auto* buf = const_cast<WebGPUBuffer*>(
       static_cast<const WebGPUBuffer*>(arr.buffer().ptr()));
   if (buf) {
     buf->gpu_has_data = true;
+    if (buf->cpu_ptr) {
+      std::free(buf->cpu_ptr);
+      buf->cpu_ptr = nullptr;
+    }
+    buf->cpu_dirty = false;
   }
 }
 

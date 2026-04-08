@@ -13,6 +13,7 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -318,6 +319,11 @@ void binary_op_gpu_dispatch(
 
   auto bopt = get_binary_op_type(a, b);
   set_binary_op_output_data(a, b, out, bopt);
+  // WebGPU: prevent buffer aliasing between input and output bindings
+  wgpu::ensure_no_alias(out, a);
+  wgpu::ensure_no_alias(out, b);
+  // Ensure buffer is large enough for GPU-side element sizes (bool->u32, bf16->f32)
+  wgpu::ensure_wgpu_size(out);
 
   if (out.size() == 0) {
     return;

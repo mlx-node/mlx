@@ -8,6 +8,7 @@
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/buffer_cache.h"
+#include "mlx/dtype.h"
 
 namespace mlx::core::wgpu {
 
@@ -16,12 +17,15 @@ class CommandEncoder;
 using allocator::Buffer;
 
 // Stores a WebGPU buffer with optional CPU-resident data for readback.
+// The dtype_val field tracks the array's dtype for upload/download format
+// conversion between CPU types (bool=1B, bf16=2B) and GPU types (u32=4B, f32=4B).
 struct WebGPUBuffer {
   WGPUBuffer buffer;
   size_t size;
-  void* cpu_ptr{nullptr}; // Non-null after raw_ptr() readback
-  bool cpu_dirty{false};   // True when cpu_ptr has data not yet uploaded to GPU
-  bool gpu_has_data{false}; // True when GPU buffer has meaningful data
+  void* cpu_ptr{nullptr};  // Non-null after raw_ptr() readback
+  bool cpu_dirty{false};    // True when cpu_ptr has data not yet uploaded to GPU
+  bool gpu_has_data{false};  // True when GPU buffer has meaningful data
+  Dtype::Val dtype_val{Dtype::Val::float32}; // For upload/download conversion
 };
 
 class WebGPUAllocator : public allocator::Allocator {

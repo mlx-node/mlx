@@ -24,6 +24,56 @@ constexpr uint32_t WORKGROUP_SIZE = 256;
 constexpr uint32_t MAX_NDIM = 8;
 constexpr uint32_t N_READS = 4;
 
+// Return the GPU-side element size for a dtype.
+// WGSL has no 8-bit or 16-bit integer storage, so:
+//   bool    -> u32 (4 bytes)
+//   bfloat16 -> f32 (4 bytes)
+//   everything else -> same as CPU itemsize
+inline size_t wgpu_itemsize(Dtype dtype) {
+  switch (dtype.val()) {
+    case Dtype::Val::bool_: return 4;     // bool stored as u32
+    case Dtype::Val::bfloat16: return 4;  // bf16 promoted to f32
+    default: return dtype.size();
+  }
+}
+
+// Return the GPU buffer allocation size needed for an array.
+// Uses size() (logical element count from shape) not data_size() (memory span),
+// matching the semantics of nbytes() = size() * itemsize().
+inline size_t wgpu_alloc_size(const array& arr) {
+  return arr.size() * wgpu_itemsize(arr.dtype());
+}
+
+// Ensure the output array's buffer is large enough for GPU-side element sizes.
+// Call after set_*_output_data() which allocates based on CPU itemsize.
+// For types where GPU elements are larger (bool, bfloat16), this reallocates.
+inline void ensure_wgpu_size(array& out) {
+  size_t gpu_is = wgpu_itemsize(out.dtype());
+  if (gpu_is > out.itemsize()) {
+    out.set_data(
+        allocator::malloc(out.data_size() * gpu_is),
+        out.data_size(),
+        out.strides(),
+        out.flags());
+  }
+}
+
+// WebGPU forbids the same buffer appearing as both read-only and read-write
+// storage in the same compute pass (synchronization scope). This happens when
+// the framework "donates" an input buffer to the output (in-place reuse).
+// Metal/CUDA allow this, but WebGPU does not. Call this after
+// set_binary_op_output_data / set_unary_output_data to force a fresh
+// allocation when aliasing would occur.
+inline void ensure_no_alias(array& out, const array& in) {
+  if (out.data_shared_ptr() == in.data_shared_ptr()) {
+    out.set_data(
+        allocator::malloc(out.data_size() * wgpu_itemsize(out.dtype())),
+        out.data_size(),
+        out.strides(),
+        out.flags());
+  }
+}
+
 // Poll the WebGPU instance to process pending async operations.
 inline void poll_instance(WGPUInstance instance) {
 #if defined(__wasm__)
@@ -114,7 +164,7 @@ inline uint64_t wgpu_offset(const array& arr) {
 
 // Compute the data size in bytes for an array.
 inline uint64_t wgpu_data_size(const array& arr) {
-  return static_cast<uint64_t>(arr.data_size()) * arr.itemsize();
+  return static_cast<uint64_t>(arr.data_size()) * wgpu_itemsize(arr.dtype());
 }
 
 // Map MLX dtype to WGSL type name string.

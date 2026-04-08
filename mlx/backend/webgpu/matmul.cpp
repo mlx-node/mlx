@@ -435,12 +435,12 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     array zero(0, a_pre.dtype());
     auto& encoder = wgpu::get_command_encoder(s);
     encoder.add_temporary(zero);
-    out.set_data(allocator::malloc(out.nbytes()));
+    out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
     fill_gpu(zero, out, s);
     return;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   matmul_dispatch(a_pre, b_pre, out, s);
 }
 
@@ -457,7 +457,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& c = inputs[2];
 
   // Allocate output
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   // First compute the matmul part: alpha * A @ B
   // We'll create a temporary for the matmul result, then combine with C.
