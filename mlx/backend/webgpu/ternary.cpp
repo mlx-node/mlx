@@ -174,6 +174,11 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto topt = get_ternary_op_type(cond, b, c);
   set_ternary_op_output_data(cond, b, c, out, topt);
+  // WebGPU: prevent buffer aliasing between input and output bindings
+  wgpu::ensure_no_alias(out, cond);
+  wgpu::ensure_no_alias(out, b);
+  wgpu::ensure_no_alias(out, c);
+  wgpu::ensure_wgpu_size(out);
 
   if (out.size() == 0) {
     return;

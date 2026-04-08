@@ -104,7 +104,38 @@ void dispatch_copy(
   params.size_ndim_offsets[2] = effective_in_offset;
   params.size_ndim_offsets[3] = effective_out_offset;
 
-  uint32_t ndim = params.size_ndim_offsets[1];
+  // Compute type conversion mode for cross-type copies
+  uint32_t conversion_mode = 0;
+  if (in.dtype() != out.dtype()) {
+    auto in_val = in.dtype().val();
+    auto out_val = out.dtype().val();
+    if (in_val == Dtype::Val::bool_) {
+      // bool (u32 0/1) → float types: 0→0.0, 1→1.0
+      if (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
+          out_val == Dtype::Val::bfloat16) {
+        conversion_mode = 1;
+      }
+    } else if (out_val == Dtype::Val::bool_) {
+      // any type → bool: nonzero → 1, zero → 0
+      conversion_mode = 2;
+    } else if (in_val == Dtype::Val::int32 &&
+               (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
+                out_val == Dtype::Val::bfloat16)) {
+      conversion_mode = 3;
+    } else if ((in_val == Dtype::Val::float32 || in_val == Dtype::Val::float16 ||
+                in_val == Dtype::Val::bfloat16) &&
+               out_val == Dtype::Val::int32) {
+      conversion_mode = 4;
+    } else if (in_val == Dtype::Val::uint32 &&
+               (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
+                out_val == Dtype::Val::bfloat16)) {
+      conversion_mode = 5;
+    }
+  }
+  // Pack mode into upper 16 bits of ndim field
+  params.size_ndim_offsets[1] |= (conversion_mode << 16);
+
+  uint32_t ndim = params.size_ndim_offsets[1] & 0xFFFFu;
   for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
     if (i < 4) {
       params.shape_0[i] = static_cast<uint32_t>(shape[i]);
@@ -158,6 +189,11 @@ void copy_gpu(const array& in, array& out, CopyType ctype, const Stream& s) {
   if (donated && in.dtype() == out.dtype()) {
     return;
   }
+  // WebGPU: prevent buffer aliasing between input and output bindings.
+  // This can happen when set_copy_output_data donates the input buffer to the
+  // output (e.g. AsType with same-sized types). The copy dispatch would then
+  // bind the same buffer as both read-only and read-write, which WebGPU forbids.
+  wgpu::ensure_no_alias(out, in);
   if (ctype == CopyType::GeneralGeneral) {
     ctype = CopyType::General;
   }
@@ -189,7 +225,7 @@ void copy_gpu_inplace(
     // For 4-byte types this equals data_size; for other sizes we adjust.
     uint32_t byte_count =
         static_cast<uint32_t>(out.data_size()) *
-        static_cast<uint32_t>(out.itemsize());
+        static_cast<uint32_t>(wgpu::wgpu_itemsize(out.dtype()));
     uint32_t elem_count = (byte_count + 3u) / 4u;
     dispatch_copy(
         encoder, ctype, in, out, elem_count, i_offset, o_offset, {}, {}, {});
@@ -229,7 +265,7 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
     return;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(val);
@@ -237,7 +273,7 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
 
   uint32_t byte_count =
       static_cast<uint32_t>(out.data_size()) *
-      static_cast<uint32_t>(out.itemsize());
+      static_cast<uint32_t>(wgpu::wgpu_itemsize(out.dtype()));
   uint32_t elem_count = (byte_count + 3u) / 4u;
   dispatch_copy(
       encoder, CopyType::Scalar, val, out, elem_count, 0, 0, {}, {}, {});
@@ -246,7 +282,7 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
 void reshape_gpu(const array& in, array& out, Stream s) {
   auto [copy_necessary, out_strides] = prepare_reshape(in, out);
   if (copy_necessary) {
-    out.set_data(allocator::malloc(out.nbytes()));
+    out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
     copy_gpu_inplace(
         in,
         out,

@@ -370,6 +370,9 @@ void unary_op_gpu_dispatch(
   const auto& in = inputs[0];
 
   set_unary_output_data(in, out);
+  // WebGPU: prevent buffer aliasing between input and output bindings
+  wgpu::ensure_no_alias(out, in);
+  wgpu::ensure_wgpu_size(out);
 
   if (out.size() == 0) {
     return;

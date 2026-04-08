@@ -630,7 +630,7 @@ void gpu_init_reduce(
     Reduce::ReduceType reduce_type,
     const Stream& s) {
   if (out.data_shared_ptr() == nullptr) {
-    out.set_data(allocator::malloc(out.nbytes()));
+    out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   }
 
   if (out.size() == 0) {
@@ -691,7 +691,7 @@ void gpu_all_reduce(
     array& out,
     Reduce::ReduceType reduce_type,
     const Stream& s) {
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
@@ -736,7 +736,7 @@ void gpu_all_reduce(
   if (num_workgroups > 1) {
     // Two-pass approach: first pass reduces to intermediate array
     array intermediate({static_cast<int>(num_workgroups)}, out.dtype(), nullptr, {});
-    intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+    intermediate.set_data(allocator::malloc(wgpu::wgpu_alloc_size(intermediate)));
     encoder.add_temporary(intermediate);
     encoder.set_output_array(intermediate);
 
@@ -837,7 +837,7 @@ void gpu_row_reduce(
     const std::vector<int>& axes,
     const ReductionPlan& plan,
     const Stream& s) {
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);
@@ -959,7 +959,7 @@ void gpu_col_reduce(
     const std::vector<int>& axes,
     const ReductionPlan& plan,
     const Stream& s) {
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   auto& dev = wgpu::device();
   auto& encoder = wgpu::get_command_encoder(s);

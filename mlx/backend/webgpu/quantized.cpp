@@ -186,7 +186,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& scales = inputs[2];
   const auto& biases = inputs[3];
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   if (out.size() == 0) {
     return;

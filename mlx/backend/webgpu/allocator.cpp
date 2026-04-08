@@ -330,6 +330,25 @@ void* Buffer::raw_ptr() {
   }
   std::memcpy(cpu_data, mapped, wbuf.size);
 
+  // Convert from GPU format to CPU format for types with wider GPU representation
+  if (wbuf.dtype_val == Dtype::Val::bfloat16) {
+    // Contract f32 (4 bytes) -> bf16 (2 bytes) in-place (forward safe: 4B->2B)
+    size_t n = wbuf.size / 4;
+    auto* src = static_cast<const float*>(cpu_data);
+    auto* dst = static_cast<bfloat16_t*>(cpu_data);
+    for (size_t i = 0; i < n; i++) {
+      dst[i] = static_cast<bfloat16_t>(src[i]);
+    }
+  } else if (wbuf.dtype_val == Dtype::Val::bool_) {
+    // Contract u32 (4 bytes) -> bool (1 byte) in-place (forward safe: 4B->1B)
+    size_t n = wbuf.size / 4;
+    auto* src = static_cast<const uint32_t*>(cpu_data);
+    auto* dst = static_cast<uint8_t*>(cpu_data);
+    for (size_t i = 0; i < n; i++) {
+      dst[i] = src[i] ? 1 : 0;
+    }
+  }
+
   // Clean up staging buffer
   wgpuBufferUnmap(staging);
   wgpuBufferDestroy(staging);
