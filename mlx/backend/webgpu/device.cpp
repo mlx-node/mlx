@@ -488,6 +488,11 @@ void CommandEncoder::dispatch_compute(
   }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
+  // End compute pass after each dispatch to avoid WebGPU buffer aliasing
+  // violations. WebGPU disallows a buffer being both read-only and read-write
+  // storage within a single compute pass. Ending the pass after each dispatch
+  // ensures each operation gets its own synchronization scope.
+  end_compute_pass();
 }
 
 void CommandEncoder::dispatch_compute(
@@ -498,19 +503,13 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
-  // Skip redundant setPipeline if same as last dispatch
-  if (pipeline != last_pipeline_) {
-    wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
-    last_pipeline_ = pipeline;
-  }
-  // Skip redundant setBindGroup if same as last dispatch
-  if (bind_group != last_bind_group_) {
-    wgpuComputePassEncoderSetBindGroup(
-        compute_pass_, 0, bind_group, 0, nullptr);
-    last_bind_group_ = bind_group;
-  }
+  wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+  wgpuComputePassEncoderSetBindGroup(
+      compute_pass_, 0, bind_group, 0, nullptr);
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
+  // End compute pass after each dispatch (same reason as above)
+  end_compute_pass();
 }
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
