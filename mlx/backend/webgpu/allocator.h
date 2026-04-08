@@ -20,6 +20,8 @@ struct WebGPUBuffer {
   WGPUBuffer buffer;
   size_t size;
   void* cpu_ptr{nullptr}; // Non-null after raw_ptr() readback
+  bool cpu_dirty{false};   // True when cpu_ptr has data not yet uploaded to GPU
+  bool gpu_has_data{false}; // True when GPU buffer has meaningful data
 };
 
 class WebGPUAllocator : public allocator::Allocator {

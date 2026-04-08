@@ -384,6 +384,31 @@ CommandEncoder& get_command_encoder(Stream s) {
   return device().get_command_encoder(s);
 }
 
+void Device::flush_all_encoders() {
+  std::lock_guard<std::mutex> lock(encoder_mutex_);
+  for (auto& [_, enc] : encoders_) {
+    enc->commit();
+  }
+}
+
+void flush_all_encoders() {
+  device().flush_all_encoders();
+}
+
+WGPUBuffer wgpu_buffer(const array& arr) {
+  auto* buf = const_cast<WebGPUBuffer*>(
+      static_cast<const WebGPUBuffer*>(arr.buffer().ptr()));
+  // If CPU data was written (e.g. by array::init) but never uploaded to GPU,
+  // upload it now via wgpuQueueWriteBuffer.
+  if (buf->cpu_dirty && buf->cpu_ptr && buf->buffer) {
+    wgpuQueueWriteBuffer(
+        device().gpu_queue(), buf->buffer, 0, buf->cpu_ptr, buf->size);
+    buf->cpu_dirty = false;
+    buf->gpu_has_data = true;
+  }
+  return buf->buffer;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // CommandEncoder implementation
 ///////////////////////////////////////////////////////////////////////////////
@@ -408,6 +433,12 @@ void CommandEncoder::set_input_array(const array& arr) {
 
 void CommandEncoder::set_output_array(const array& arr) {
   bytes_tracked_ += arr.data_size() * arr.itemsize();
+  // Mark that this buffer will have meaningful GPU data after compute
+  auto* buf = const_cast<WebGPUBuffer*>(
+      static_cast<const WebGPUBuffer*>(arr.buffer().ptr()));
+  if (buf) {
+    buf->gpu_has_data = true;
+  }
 }
 
 void CommandEncoder::ensure_active() {

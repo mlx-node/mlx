@@ -103,10 +103,9 @@ inline WGPUBindGroup create_bind_group(
 }
 
 // Extract the WGPUBuffer from an array's allocator buffer.
-inline WGPUBuffer wgpu_buffer(const array& arr) {
-  auto* buf = static_cast<const WebGPUBuffer*>(arr.buffer().ptr());
-  return buf->buffer;
-}
+// If the buffer has dirty CPU data (written via raw_ptr() but never uploaded),
+// this uploads it to the GPU via wgpuQueueWriteBuffer before returning.
+WGPUBuffer wgpu_buffer(const array& arr);
 
 // Compute the byte offset into the array's buffer.
 inline uint64_t wgpu_offset(const array& arr) {

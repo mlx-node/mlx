@@ -24,8 +24,9 @@ WebGPUAllocator::WebGPUAllocator()
           page_size,
           [](WebGPUBuffer* buf) { return buf->size; },
           [this](WebGPUBuffer* buf) { free_wgpu_buffer(buf); }),
-      memory_limit_(1ULL << 33), // 8 GB default
-      max_pool_size_(1ULL << 33) {}
+      memory_limit_(1ULL << 30), // 1 GB (fits in WASM32 size_t)
+      max_pool_size_(1ULL << 29) // 512 MB
+{}
 
 Buffer WebGPUAllocator::malloc(size_t size) {
   if (size == 0) {
@@ -44,6 +45,15 @@ Buffer WebGPUAllocator::malloc(size_t size) {
   // Try to find a buffer in the cache
   std::unique_lock lock(mutex_);
   WebGPUBuffer* buf = buffer_cache_.reuse_from_cache(size);
+  if (buf) {
+    // Reset state for reused buffer
+    if (buf->cpu_ptr) {
+      std::free(buf->cpu_ptr);
+      buf->cpu_ptr = nullptr;
+    }
+    buf->cpu_dirty = false;
+    buf->gpu_has_data = false;
+  }
   if (!buf) {
     // Release cached buffers under memory pressure
     int64_t mem_to_free =
@@ -74,7 +84,7 @@ Buffer WebGPUAllocator::malloc(size_t size) {
       throw std::runtime_error(msg.str());
     }
 
-    buf = new WebGPUBuffer{gpu_buf, size, nullptr};
+    buf = new WebGPUBuffer{gpu_buf, size, nullptr, false, false};
     lock.lock();
   }
 
@@ -208,6 +218,28 @@ void* Buffer::raw_ptr() {
     return nullptr;
   }
 
+  // If the GPU buffer has no meaningful data (freshly allocated, never
+  // computed on), skip the expensive GPU readback and just allocate
+  // CPU memory. The caller (array::init) will write data into this
+  // pointer, and we mark it dirty so it gets uploaded to GPU before
+  // any GPU compute reads from it.
+  if (!wbuf.gpu_has_data) {
+    void* cpu_data = std::malloc(wbuf.size);
+    if (!cpu_data) {
+      throw std::runtime_error("[WebGPU] Failed to allocate CPU memory");
+    }
+    std::memset(cpu_data, 0, wbuf.size);
+    wbuf.cpu_ptr = cpu_data;
+    wbuf.cpu_dirty = true;
+    return cpu_data;
+  }
+
+  // Flush all pending command encoders to ensure GPU compute work
+  // has been submitted to the queue before we issue the copy.
+  // Without this, the readback copy can execute before the compute
+  // that produced the data.
+  wgpu::flush_all_encoders();
+
   auto& dev = wgpu::device();
 
   // Create staging buffer with MapRead usage
@@ -305,6 +337,7 @@ void* Buffer::raw_ptr() {
 
   // Store CPU pointer; GPU buffer remains valid for potential future GPU use
   wbuf.cpu_ptr = cpu_data;
+  wbuf.cpu_dirty = false; // Just read from GPU, so CPU is in sync
 
   return cpu_data;
 }
