@@ -5,6 +5,7 @@
 // Uses dynamic WGSL code generation. Each unique configuration produces
 // a distinct shader module and compute pipeline, cached for reuse.
 
+#include "mlx/backend/common/slicing.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/webgpu/device.h"
