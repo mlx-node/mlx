@@ -80,7 +80,7 @@ NO_GPU(BitwiseBinary)
 NO_GPU(BlockMaskedMM)
 NO_GPU_MULTI(Compiled)
 NO_GPU(Conjugate)
-NO_GPU(Convolution)
+// Convolution — implemented in conv.cpp
 NO_GPU_MULTI(DivMod)
 NO_GPU(FFT)
 NO_GPU(GatherMM)
