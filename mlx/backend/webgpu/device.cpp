@@ -398,12 +398,24 @@ void flush_all_encoders() {
 WGPUBuffer wgpu_buffer(const array& arr) {
   auto* buf = const_cast<WebGPUBuffer*>(
       static_cast<const WebGPUBuffer*>(arr.buffer().ptr()));
+  if (!buf || !buf->buffer) {
+    throw std::runtime_error("[WebGPU] wgpu_buffer: null buffer");
+  }
   // If CPU data was written (e.g. by array::init) but never uploaded to GPU,
   // upload it now via wgpuQueueWriteBuffer.
   if (buf->cpu_dirty && buf->cpu_ptr && buf->buffer) {
     wgpuQueueWriteBuffer(
         device().gpu_queue(), buf->buffer, 0, buf->cpu_ptr, buf->size);
     buf->cpu_dirty = false;
+    buf->gpu_has_data = true;
+  }
+  // Safety: if cpu_ptr exists with data but gpu_has_data is false,
+  // ensure the data gets uploaded. This handles cases where
+  // eval() wrote to CPU memory (e.g. NumberOfElements) but the
+  // dirty flag was somehow missed.
+  if (!buf->gpu_has_data && buf->cpu_ptr && !buf->cpu_dirty) {
+    wgpuQueueWriteBuffer(
+        device().gpu_queue(), buf->buffer, 0, buf->cpu_ptr, buf->size);
     buf->gpu_has_data = true;
   }
   return buf->buffer;
