@@ -79,6 +79,10 @@ if(NOT MLX_NO_BLAS)
             ${CMAKE_CURRENT_SOURCE_DIR}/svd.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/inverse.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp)
+else()
+  # Stub eval_cpu so vtables are emitted (key function = eval_cpu).
+  # Without this, wasm-ld leaves vtables undefined → call_indirect trap.
+  target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/no_blas.cpp)
 endif()
 
 if(MLX_BUILD_ACCELERATE)
