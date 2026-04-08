@@ -88,7 +88,7 @@ NO_GPU(GatherQMM)
 NO_GPU(Hadamard)
 NO_GPU(Imag)
 NO_GPU(Load)
-NO_GPU(LogSumExp)
+// LogSumExp — implemented in logsumexp.cpp
 NO_GPU_MULTI(LUF)
 NO_GPU(Partition)
 NO_GPU_MULTI(QRF)
