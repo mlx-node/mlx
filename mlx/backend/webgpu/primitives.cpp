@@ -96,7 +96,7 @@ NO_GPU(RandomBits)
 NO_GPU(Real)
 NO_GPU(Scan)
 NO_GPU(SegmentedMM)
-NO_GPU(SliceUpdate)
+// SliceUpdate — implemented in indexing.cpp
 NO_GPU(Sort)
 NO_GPU_MULTI(SVD)
 NO_GPU(Inverse)
