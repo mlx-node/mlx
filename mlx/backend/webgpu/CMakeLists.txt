@@ -25,6 +25,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_WEBGPU)
