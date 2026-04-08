@@ -74,7 +74,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 //   Split, Squeeze, StopGradient, Transpose, Unflatten, View
 
 NO_GPU(ArgPartition)
-NO_GPU(ArgReduce)
+// ArgReduce — implemented in arg_reduce.cpp
 NO_GPU(ArgSort)
 NO_GPU(BitwiseBinary)
 NO_GPU(BlockMaskedMM)
