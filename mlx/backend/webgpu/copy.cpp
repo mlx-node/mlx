@@ -81,20 +81,20 @@ void dispatch_copy(
       dev.get_or_create_pipeline(pipeline_key, shader, entry_point);
 
   // Compute the effective element offsets into array<u32> buffers.
-  // arr.offset() is in elements of the array's dtype, and is first converted
-  // to bytes by multiplying by itemsize. The shader indexes array<u32>
-  // (4 bytes each), so we divide by 4 to get the u32 element offset.
-  // The explicit in_offset/out_offset from function parameters are also in
-  // elements of the array's dtype, so we convert to u32 element offsets.
-  constexpr uint32_t U32_SIZE = 4;
-  uint32_t in_byte_offset =
-      static_cast<uint32_t>(in.offset()) +
-      static_cast<uint32_t>(in_offset) * static_cast<uint32_t>(in.itemsize());
-  uint32_t out_byte_offset =
-      static_cast<uint32_t>(out.offset()) +
-      static_cast<uint32_t>(out_offset) * static_cast<uint32_t>(out.itemsize());
-  uint32_t effective_in_offset = in_byte_offset / U32_SIZE;
-  uint32_t effective_out_offset = out_byte_offset / U32_SIZE;
+  // arr.offset() returns a byte offset from the buffer base pointer.
+  // The shader indexes array<u32>, so we need u32 element indices.
+  // On GPU, all types occupy one u32 slot (bf16→f32, bool→u32), so
+  // element offset = u32 index. Convert byte offset → element offset
+  // by dividing by CPU itemsize, then add the parameter element offset.
+  uint32_t in_elem =
+      static_cast<uint32_t>(in.offset()) / static_cast<uint32_t>(in.itemsize())
+      + static_cast<uint32_t>(in_offset);
+  uint32_t out_elem =
+      static_cast<uint32_t>(out.offset()) / static_cast<uint32_t>(out.itemsize())
+      + static_cast<uint32_t>(out_offset);
+  // Each element maps to one u32 on GPU (wgpu_itemsize is always 4 currently).
+  uint32_t effective_in_offset = in_elem;
+  uint32_t effective_out_offset = out_elem;
 
   // Fill the uniform buffer. For scalar/vector kernels, only size and offsets
   // matter, but we always upload the full CopyParams struct.
