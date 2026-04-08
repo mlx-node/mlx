@@ -1061,4 +1061,53 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   wgpuBufferRelease(meta_buf);
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// SliceUpdate::eval_gpu
+///////////////////////////////////////////////////////////////////////////////
+
+void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 2);
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+
+  if (upd.size() == 0) {
+    out.copy_shared_buffer(in);
+    return;
+  }
+
+  // Step 1: Copy input to output
+  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+      ? CopyType::Vector
+      : CopyType::General;
+  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+
+  // Step 2: Calculate slice offset and strides
+  auto [data_offset, out_strides] =
+      prepare_slice(out, start_indices_, strides_);
+
+  // Step 3: Copy update into slice
+  if (reduce_type_ == SliceUpdate::None) {
+    copy_gpu_inplace(
+        upd,
+        out,
+        upd.shape(),
+        upd.strides(),
+        out_strides,
+        0,
+        data_offset,
+        CopyType::GeneralGeneral,
+        stream());
+    return;
+  }
+
+  // Reduction modes not yet implemented for WebGPU
+  throw std::runtime_error(
+      "SliceUpdate with reduction has no WebGPU implementation.");
+}
+
 } // namespace mlx::core
