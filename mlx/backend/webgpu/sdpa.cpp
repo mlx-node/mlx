@@ -3,19 +3,25 @@
 // WebGPU fused ScaledDotProductAttention — VECTOR path only (Tq == 1, i.e.
 // decode step). The prompt path (Tq > 1) is left on the decomposed fallback.
 //
-// Algorithm (two-phase, FlashAttention-style but simpler):
+// Algorithm (single-pass chunked FlashAttention-style):
 //   For each (batch, query_head), one workgroup of WG threads:
 //
 //     Phase A — parallel reduction over L (sequence length):
 //         m = max_l (score_l)          where score_l = dot(Q, K[l]) * scale (+ mask[l])
-//         s = sum_l exp(score_l - m)
 //
-//     Phase B — each thread owns one output lane d = tid (D <= 128):
-//         O[d] = sum_l (exp(score_l - m) / s) * V[l, d]
+//     Phase B — process L in chunks of WG threads. For each chunk:
+//         Step 1: each thread computes weight_l = exp(score_l - m) for one l,
+//                 writes it to shared_red[tid], and accumulates thread_sum.
+//         Step 2: threads with tid < D read shared_red and accumulate
+//                 o_acc[tid] = sum over l in chunk of (weight_l * V[l, tid]).
 //
-// The two-phase variant reads Q, K twice (once in Phase A for scores, once in
-// Phase B) but is much easier to reason about than the online single-pass
-// variant which would require per-step workgroup broadcasts. Correctness first.
+//     Final: reduce thread_sum to row_sum, normalize O[d] = o_acc[d] / row_sum.
+//
+// This eliminates the redundant K reads from the old two-phase variant. The
+// old Phase B recomputed scores (D threads × L iterations × D K reads =
+// L·D² K reads per workgroup); the single-pass variant caches weights in
+// shared memory and each K column is read exactly twice (once in Phase A,
+// once in Phase B weight compute), dropping K traffic to 2·L·D.
 //
 // - Workgroup size: 128 threads (matches max supported head dim).
 // - One workgroup per (batch * n_heads). Dispatch grid = (B*H, 1, 1).
@@ -227,23 +233,60 @@ std::string make_sdpa_vector_kernel(
     << "  let row_max = shared_m;\n"
     << "\n";
 
-  // Phase A-2: compute sum of exp(score - max) over L.
-  s << "  // Phase A-2: compute per-thread partial sum of exp(score - max).\n"
+  // Phase B: single-pass chunked weight compute + V accumulation.
+  //
+  // Process L in chunks of WORKGROUP_SIZE. For each chunk:
+  //   1. All threads compute weight_l = exp(score_l - row_max) for
+  //      l = chunk_start + tid (if in range); otherwise weight = 0.
+  //      Cache weights in shared_red[tid] AND add to thread-local
+  //      partial sum (thread_sum).
+  //   2. Threads with tid < D read the cached weights and accumulate
+  //      weighted V contributions into o_acc (one output lane per thread).
+  //
+  // After the loop, reduce thread_sum across the workgroup to get row_sum,
+  // then normalize and write O[d] = o_acc[d] / row_sum.
+  //
+  // Eliminates Phase A-2 (second full K traversal) and the Phase B score
+  // recomputation from the old two-phase variant; total K bandwidth drops
+  // from ~L·D² to ~2·L·D reads per workgroup.
+  s << "  // Phase B: single-pass chunked weight cache + V accumulation.\n"
+    << "  var o_acc: f32 = 0.0;\n"
     << "  var thread_sum: f32 = 0.0;\n"
-    << "  for (var l: u32 = tid; l < L; l = l + WORKGROUP_SIZE) {\n"
-    << "    var acc: f32 = 0.0;\n"
-    << "    let k_row = kv_base + l * D;\n"
-    << "    for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
-    << "      acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
-    << "    }\n"
-    << "    var score = acc * scale;\n";
+    << "  for (var chunk_start: u32 = 0u; chunk_start < L;\n"
+    << "       chunk_start = chunk_start + WORKGROUP_SIZE) {\n"
+    << "    let l = chunk_start + tid;\n"
+    << "    var weight: f32 = 0.0;\n"
+    << "    if (l < L) {\n"
+    << "      var acc: f32 = 0.0;\n"
+    << "      let k_row = kv_base + l * D;\n"
+    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
+    << "      }\n"
+    << "      var score = acc * scale;\n";
   if (has_mask) {
-    s << "    score = score + f32(mask[mask_base + l]);\n";
+    s << "      score = score + f32(mask[mask_base + l]);\n";
   }
-  s << "    thread_sum = thread_sum + exp(score - row_max);\n"
+  s << "      weight = exp(score - row_max);\n"
+    << "    }\n"
+    << "    shared_red[tid] = weight;\n"
+    << "    thread_sum = thread_sum + weight;\n"
+    << "    workgroupBarrier();\n"
+    << "\n"
+    << "    // Step 2: V accumulation for output lanes 0..D-1.\n"
+    << "    if (tid < D) {\n"
+    << "      var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
+    << "      if (chunk_end > L) { chunk_end = L; }\n"
+    << "      for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
+    << "           l_inner = l_inner + 1u) {\n"
+    << "        let w_val = shared_red[l_inner - chunk_start];\n"
+    << "        o_acc = o_acc + w_val * f32(v[kv_base + l_inner * D + tid]);\n"
+    << "      }\n"
+    << "    }\n"
+    << "    workgroupBarrier();\n"
     << "  }\n"
     << "\n";
 
+  // Reduce thread_sum across the workgroup -> row_sum.
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s,
@@ -261,33 +304,15 @@ std::string make_sdpa_vector_kernel(
         s, "shared_red", "sum_op", SDPA_WORKGROUP_SIZE);
   }
 
-  // Broadcast 1/sum via shared memory.
+  // Broadcast 1/row_sum via shared memory.
   s << "  if (tid == 0u) { shared_inv_s = 1.0 / shared_red[0]; }\n"
     << "  workgroupBarrier();\n"
     << "  let inv_s = shared_inv_s;\n"
     << "\n";
 
-  // Phase B: each thread d = tid (if tid < D) accumulates one output lane.
-  s << "  // Phase B: each thread owns output lane d = tid.\n"
-    << "  // Recompute scores + weighted V accumulation over L.\n"
-    << "  if (tid < D) {\n"
-    << "    var o_acc: f32 = 0.0;\n"
-    << "    for (var l: u32 = 0u; l < L; l = l + 1u) {\n"
-    << "      // Recompute score (could be cached, but L >> WG typically).\n"
-    << "      var acc: f32 = 0.0;\n"
-    << "      let k_row = kv_base + l * D;\n"
-    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
-    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
-    << "      }\n"
-    << "      var score = acc * scale;\n";
-  if (has_mask) {
-    s << "      score = score + f32(mask[mask_base + l]);\n";
-  }
-  s << "      let w = exp(score - row_max) * inv_s;\n"
-    << "      let v_row = kv_base + l * D;\n"
-    << "      o_acc = o_acc + w * f32(v[v_row + tid]);\n"
-    << "    }\n"
-    << "    output[o_base + tid] = " << dtype << "(o_acc);\n"
+  // Normalize and write the output.
+  s << "  if (tid < D) {\n"
+    << "    output[o_base + tid] = " << dtype << "(o_acc * inv_s);\n"
     << "  }\n"
     << "}\n";
 
