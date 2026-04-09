@@ -202,7 +202,8 @@ std::string make_gemv_multi_col_kernel(
     bool a_transposed,
     bool b_transposed,
     bool use_sg,
-    uint32_t cols_per_wg) {
+    uint32_t cols_per_wg,
+    bool n_aligned) {
   std::ostringstream s;
 
   if (use_sg) {
@@ -258,9 +259,12 @@ std::string make_gemv_multi_col_kernel(
   for (uint32_t i = 0; i < cols_per_wg; ++i) {
     s << "  let col" << i << " = col_base + " << i << "u;\n";
   }
-  // has1..hasN-1 (col0 always in-bounds because tile_idx guard covers it)
-  for (uint32_t i = 1; i < cols_per_wg; ++i) {
-    s << "  let has" << i << " = col" << i << " < N;\n";
+  // has1..hasN-1 (col0 always in-bounds because tile_idx guard covers it).
+  // Aligned path (N % cols_per_wg == 0) skips guards entirely — all cols valid.
+  if (!n_aligned) {
+    for (uint32_t i = 1; i < cols_per_wg; ++i) {
+      s << "  let has" << i << " = col" << i << " < N;\n";
+    }
   }
 
   s << "  let tid = lid.x;\n"
@@ -286,15 +290,25 @@ std::string make_gemv_multi_col_kernel(
     s << "    let b_row = b_base + k * params.ldb;\n";
     s << "    acc0 = acc0 + a_val * f32(b[b_row + col0]);\n";
     for (uint32_t i = 1; i < cols_per_wg; ++i) {
-      s << "    if (has" << i << ") { acc" << i << " = acc" << i
-        << " + a_val * f32(b[b_row + col" << i << "]); }\n";
+      if (n_aligned) {
+        s << "    acc" << i << " = acc" << i << " + a_val * f32(b[b_row + col"
+          << i << "]);\n";
+      } else {
+        s << "    if (has" << i << ") { acc" << i << " = acc" << i
+          << " + a_val * f32(b[b_row + col" << i << "]); }\n";
+      }
     }
   } else {
     // B transposed (N, K) row-major → b[col*ldb + k]
     s << "    acc0 = acc0 + a_val * f32(b[b_base + col0 * params.ldb + k]);\n";
     for (uint32_t i = 1; i < cols_per_wg; ++i) {
-      s << "    if (has" << i << ") { acc" << i << " = acc" << i
-        << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]); }\n";
+      if (n_aligned) {
+        s << "    acc" << i << " = acc" << i
+          << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]);\n";
+      } else {
+        s << "    if (has" << i << ") { acc" << i << " = acc" << i
+          << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]); }\n";
+      }
     }
   }
 
@@ -348,8 +362,13 @@ std::string make_gemv_multi_col_kernel(
     << "    let out_row = c_base + row * params.ldc;\n"
     << "    out[out_row + col0] = " << dtype << "(shared_0[0]);\n";
   for (uint32_t i = 1; i < cols_per_wg; ++i) {
-    s << "    if (has" << i << ") { out[out_row + col" << i << "] = " << dtype
-      << "(shared_" << i << "[0]); }\n";
+    if (n_aligned) {
+      s << "    out[out_row + col" << i << "] = " << dtype << "(shared_" << i
+        << "[0]);\n";
+    } else {
+      s << "    if (has" << i << ") { out[out_row + col" << i
+        << "] = " << dtype << "(shared_" << i << "[0]); }\n";
+    }
   }
   s << "  }\n"
     << "}\n";
@@ -542,6 +561,10 @@ static void dispatch_matmul(
   const bool use_multi_col_8 =
       (kind == MatmulKind::GEMV) && N >= kMultiCol8Threshold;
   const uint32_t cols_per_wg = use_multi_col_8 ? 8u : 4u;
+  // Fast path when N is evenly divisible by cols_per_wg: skip all per-column
+  // bounds checks. True for every GEMV shape in Qwen3.5 (hidden=896,
+  // intermediate=4864, vocab=151936 — all divisible by 8).
+  const bool n_aligned = use_multi_col && (N % cols_per_wg == 0);
 
   // Build transpose suffix for pipeline key
   std::string trans_suffix;
@@ -549,7 +572,7 @@ static void dispatch_matmul(
   trans_suffix += (b_transposed ? "T" : "N");
 
   // Pipeline cache keys on entry_name, so distinguish 4-col vs 8-col variants
-  // to avoid collisions that would break correctness.
+  // (and aligned vs guarded) to avoid collisions that would break correctness.
   const char* prefix = (kind == MatmulKind::GEMV)
       ? (use_multi_col_8 ? "gemv_mc8_"
                          : (use_multi_col ? "gemv_mc4_" : "gemv_"))
@@ -558,6 +581,9 @@ static void dispatch_matmul(
       std::string(prefix) + trans_suffix + "_" + wgsl_type;
   if (use_sg) {
     entry_name += "_sg";
+  }
+  if (n_aligned) {
+    entry_name += "_al";
   }
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
@@ -571,7 +597,8 @@ static void dispatch_matmul(
                     a_transposed,
                     b_transposed,
                     use_sg,
-                    cols_per_wg)
+                    cols_per_wg,
+                    n_aligned)
               : make_gemv_kernel(
                     entry_name, wgsl_type, a_transposed, b_transposed, use_sg);
         }
