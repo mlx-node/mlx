@@ -78,7 +78,7 @@ NO_GPU(ArgPartition)
 // ArgSort — implemented in sort.cpp
 NO_GPU(BitwiseBinary)
 NO_GPU(BlockMaskedMM)
-NO_GPU_MULTI(Compiled)
+// Compiled — implemented in compiled.cpp
 NO_GPU(Conjugate)
 // Convolution — implemented in conv.cpp
 NO_GPU_MULTI(DivMod)

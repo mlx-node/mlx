@@ -9,6 +9,7 @@
 #include "mlx/backend/common/binary.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/webgpu/device.h"
+#include "mlx/backend/webgpu/op_exprs.h"
 #include "mlx/backend/webgpu/utils.h"
 #include "mlx/primitives.h"
 
@@ -217,92 +218,8 @@ const char* get_op_short_name(const char* name) {
   return "unknown";
 }
 
-// Get the WGSL expression for an operation.
-// References a_val and b_val as the two loaded input values.
-// The out_type is used for explicit casts where needed.
-std::string get_op_expr(
-    const char* name,
-    const std::string& in_type,
-    const std::string& out_type) {
-  std::string n(name);
-
-  // Arithmetic ops - input and output types match
-  if (n == "Add") return "a_val + b_val";
-  if (n == "Subtract") return "a_val - b_val";
-  if (n == "Multiply") return "a_val * b_val";
-  if (n == "Divide") return "a_val / b_val";
-
-  // Remainder: for float types use a - b*floor(a/b), for int just use %
-  if (n == "Remainder") {
-    if (in_type == "f32" || in_type == "f16") {
-      return "a_val - b_val * floor(a_val / b_val)";
-    }
-    return "a_val % b_val";
-  }
-
-  // Power: pow() only works on float types
-  if (n == "Power") {
-    if (in_type == "f32" || in_type == "f16") {
-      return "pow(a_val, b_val)";
-    }
-    // For integer power, we need a loop-based approach
-    // But MLX typically promotes to float for power, so this is a fallback
-    return out_type + "(pow(f32(a_val), f32(b_val)))";
-  }
-
-  // Comparison ops - output is u32 (bool stored as u32)
-  if (n == "Equal")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val == b_val)";
-  if (n == "NotEqual")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val != b_val)";
-  if (n == "Greater")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val > b_val)";
-  if (n == "GreaterEqual")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val >= b_val)";
-  if (n == "Less")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val < b_val)";
-  if (n == "LessEqual")
-    return "select(" + out_type + "(0), " + out_type + "(1), a_val <= b_val)";
-
-  // Logical ops - inputs and outputs are bool-as-u32
-  if (n == "LogicalAnd") {
-    // For bool (u32): true if both non-zero
-    if (in_type == "u32") {
-      return "select(" + out_type + "(0), " + out_type +
-          "(1), (a_val != 0u) && (b_val != 0u))";
-    }
-    // For other types, compare != 0
-    return "select(" + out_type + "(0), " + out_type +
-        "(1), (a_val != " + in_type + "(0)) && (b_val != " + in_type + "(0)))";
-  }
-  if (n == "LogicalOr") {
-    if (in_type == "u32") {
-      return "select(" + out_type + "(0), " + out_type +
-          "(1), (a_val != 0u) || (b_val != 0u))";
-    }
-    return "select(" + out_type + "(0), " + out_type +
-        "(1), (a_val != " + in_type + "(0)) || (b_val != " + in_type + "(0)))";
-  }
-
-  // Math ops
-  if (n == "Maximum") return "max(a_val, b_val)";
-  if (n == "Minimum") return "min(a_val, b_val)";
-
-  if (n == "LogAddExp") {
-    // logaddexp(a, b) = max(a,b) + log(1 + exp(-|a-b|))
-    // Always compute in f32 for precision, cast back to out_type.
-    return out_type +
-        "(max(f32(a_val), f32(b_val)) + log(1.0 + exp(-abs(f32(a_val) - f32(b_val)))))";
-  }
-
-  if (n == "ArcTan2") {
-    // atan2 only works on float types
-    return out_type + "(atan2(f32(a_val), f32(b_val)))";
-  }
-
-  throw std::runtime_error(
-      std::string("[WebGPU binary] Unknown op: ") + name);
-}
+// Binary op WGSL expression builder lives in op_exprs.h as
+// wgpu::get_binary_op_expr().
 
 // ---------------------------------------------------------------------------
 // Main dispatch
@@ -334,7 +251,8 @@ void binary_op_gpu_dispatch(
   const char* variant = binary_op_type_to_variant(bopt);
   const char* short_name = get_op_short_name(op_name);
 
-  std::string op_expr = get_op_expr(op_name, in_type, out_wgsl_type);
+  std::string op_expr =
+      wgpu::get_binary_op_expr(op_name, in_type, out_wgsl_type);
 
   // Build entry point name and pipeline key
   std::string entry_name = std::string("binary_") + short_name + "_" +

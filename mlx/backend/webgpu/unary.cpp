@@ -9,6 +9,7 @@
 #include "mlx/backend/common/unary.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/webgpu/device.h"
+#include "mlx/backend/webgpu/op_exprs.h"
 #include "mlx/backend/webgpu/utils.h"
 #include "mlx/primitives.h"
 
@@ -165,197 +166,9 @@ const char* get_unary_short_name(const char* name) {
   return "unknown";
 }
 
-// Helper: is the WGSL type a float type?
-bool is_float_type(const std::string& t) {
-  return t == "f32" || t == "f16";
-}
-
-// Get the WGSL expression for a unary operation.
-// References in_val as the loaded input value.
-std::string get_unary_op_expr(
-    const char* name,
-    const std::string& in_type,
-    const std::string& out_type) {
-  std::string n(name);
-  bool is_float = is_float_type(in_type);
-
-  // abs() works on i32 and float types in WGSL; for u32, it's identity
-  if (n == "Abs") {
-    if (in_type == "u32") {
-      return "in_val";
-    }
-    return "abs(in_val)";
-  }
-
-  if (n == "Negative") {
-    if (in_type == "u32") {
-      // Unsigned negation: reinterpret as bitwise (MLX shouldn't call this)
-      return "u32(-i32(in_val))";
-    }
-    return "-in_val";
-  }
-
-  if (n == "Exp") {
-    if (is_float) return "exp(in_val)";
-    return out_type + "(exp(f32(in_val)))";
-  }
-
-  if (n == "Expm1") {
-    // expm1(x) = exp(x) - 1
-    if (in_type == "f32") return "exp(in_val) - 1.0";
-    if (in_type == "f16") return "exp(in_val) - 1.0h";
-    return out_type + "(exp(f32(in_val)) - 1.0)";
-  }
-
-  if (n == "Log") {
-    if (is_float) return "log(in_val)";
-    return out_type + "(log(f32(in_val)))";
-  }
-
-  if (n == "Log1p") {
-    // log1p(x) = log(1 + x)
-    if (in_type == "f32") return "log(1.0 + in_val)";
-    if (in_type == "f16") return "log(1.0h + in_val)";
-    return out_type + "(log(1.0 + f32(in_val)))";
-  }
-
-  if (n == "Sigmoid") {
-    // sigmoid(x) = 1 / (1 + exp(-x))
-    if (in_type == "f32") return "1.0 / (1.0 + exp(-in_val))";
-    if (in_type == "f16") return "1.0h / (1.0h + exp(-in_val))";
-    return out_type + "(1.0 / (1.0 + exp(-f32(in_val))))";
-  }
-
-  if (n == "Sign") {
-    if (in_type == "u32") {
-      return "select(0u, 1u, in_val > 0u)";
-    }
-    if (in_type == "i32") {
-      return "select(select(-1, 1, in_val > 0), 0, in_val == 0)";
-    }
-    return "sign(in_val)";
-  }
-
-  // Trig and hyperbolic functions - work natively on float types.
-  // For non-float inputs, cast to f32, compute, cast back.
-  if (n == "Sin") {
-    if (is_float) return "sin(in_val)";
-    return out_type + "(sin(f32(in_val)))";
-  }
-  if (n == "Cos") {
-    if (is_float) return "cos(in_val)";
-    return out_type + "(cos(f32(in_val)))";
-  }
-  if (n == "Tan") {
-    if (is_float) return "tan(in_val)";
-    return out_type + "(tan(f32(in_val)))";
-  }
-  if (n == "ArcSin") {
-    if (is_float) return "asin(in_val)";
-    return out_type + "(asin(f32(in_val)))";
-  }
-  if (n == "ArcCos") {
-    if (is_float) return "acos(in_val)";
-    return out_type + "(acos(f32(in_val)))";
-  }
-  if (n == "ArcTan") {
-    if (is_float) return "atan(in_val)";
-    return out_type + "(atan(f32(in_val)))";
-  }
-  if (n == "Sinh") {
-    if (is_float) return "sinh(in_val)";
-    return out_type + "(sinh(f32(in_val)))";
-  }
-  if (n == "Cosh") {
-    if (is_float) return "cosh(in_val)";
-    return out_type + "(cosh(f32(in_val)))";
-  }
-  if (n == "Tanh") {
-    if (is_float) return "tanh(in_val)";
-    return out_type + "(tanh(f32(in_val)))";
-  }
-  if (n == "ArcSinh") {
-    if (is_float) return "asinh(in_val)";
-    return out_type + "(asinh(f32(in_val)))";
-  }
-  if (n == "ArcCosh") {
-    if (is_float) return "acosh(in_val)";
-    return out_type + "(acosh(f32(in_val)))";
-  }
-  if (n == "ArcTanh") {
-    if (is_float) return "atanh(in_val)";
-    return out_type + "(atanh(f32(in_val)))";
-  }
-
-  if (n == "Rsqrt") {
-    if (!is_float) {
-      return out_type + "(inverseSqrt(f32(in_val)))";
-    }
-    return "inverseSqrt(in_val)";
-  }
-
-  if (n == "Sqrt") {
-    if (!is_float) {
-      return out_type + "(sqrt(f32(in_val)))";
-    }
-    return "sqrt(in_val)";
-  }
-
-  if (n == "Square") return "in_val * in_val";
-
-  // ceil/floor/round: identity for integer types
-  if (n == "Ceil") {
-    if (!is_float) return "in_val";
-    return "ceil(in_val)";
-  }
-  if (n == "Floor") {
-    if (!is_float) return "in_val";
-    return "floor(in_val)";
-  }
-  if (n == "Round") {
-    if (!is_float) return "in_val";
-    return "round(in_val)";
-  }
-
-  if (n == "Erf") {
-    // Erf approximation using Abramowitz and Stegun formula 7.1.26
-    // erf(x) ~ 1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-x*x)
-    // where t = 1/(1 + 0.3275911*|x|)
-    // Always compute in f32 for precision, cast result to out_type.
-    return out_type +
-        "(sign(f32(in_val)) * (1.0 - "
-        "(0.254829592 * (1.0/(1.0+0.3275911*abs(f32(in_val)))) + "
-        "-0.284496736 * pow(1.0/(1.0+0.3275911*abs(f32(in_val))),2.0) + "
-        "1.421413741 * pow(1.0/(1.0+0.3275911*abs(f32(in_val))),3.0) + "
-        "-1.453152027 * pow(1.0/(1.0+0.3275911*abs(f32(in_val))),4.0) + "
-        "1.061405429 * pow(1.0/(1.0+0.3275911*abs(f32(in_val))),5.0)"
-        ") * exp(-f32(in_val)*f32(in_val))))";
-  }
-
-  if (n == "ErfInv") {
-    // ErfInv approximation using Winitzki's formula:
-    // erfinv(x) ~ sign(x) * sqrt(sqrt((c + ln(1-x^2)/2)^2 - ln(1-x^2)/a) - (c + ln(1-x^2)/2))
-    // where a = 0.147, c = 2/(pi*a)
-    // Always compute in f32 for precision.
-    return out_type +
-        "(sign(f32(in_val)) * sqrt(sqrt("
-        "pow(2.0/(3.14159265*0.147) + log(1.0 - f32(in_val)*f32(in_val))*0.5, 2.0)"
-        " - log(1.0 - f32(in_val)*f32(in_val))/0.147"
-        ") - (2.0/(3.14159265*0.147) + log(1.0 - f32(in_val)*f32(in_val))*0.5)))";
-  }
-
-  if (n == "LogicalNot") {
-    // bool is stored as u32: 0 or 1
-    return "select(" + out_type + "(1), " + out_type + "(0), in_val != 0u)";
-  }
-
-  if (n == "BitwiseInvert") {
-    return "~in_val";
-  }
-
-  throw std::runtime_error(
-      std::string("[WebGPU unary] Unknown op: ") + name);
-}
+// Unary op WGSL expression builder lives in op_exprs.h as
+// wgpu::get_unary_op_expr(). We alias it here for readability at the call
+// site below.
 
 // ---------------------------------------------------------------------------
 // Main dispatch
@@ -385,7 +198,8 @@ void unary_op_gpu_dispatch(
   const char* out_wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const char* short_name = get_unary_short_name(op_name);
 
-  std::string op_expr = get_unary_op_expr(op_name, in_type, out_wgsl_type);
+  std::string op_expr =
+      wgpu::get_unary_op_expr(op_name, in_type, out_wgsl_type);
 
   // Build entry point name and pipeline key
   std::string entry_name = std::string("unary_") + short_name + "_" +
