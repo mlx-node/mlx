@@ -41,9 +41,8 @@ struct MatmulParams {
   uint32_t batch_stride_a;
   uint32_t batch_stride_b;
   uint32_t batch_stride_c;
-  // Pad to 16-byte alignment (total 40 bytes -> pad to 48)
-  uint32_t _pad0;
-  uint32_t _pad1;
+  uint32_t offset_a;
+  uint32_t offset_b;
 };
 
 // ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ std::string make_gemv_kernel(
     << "  lda: u32, ldb: u32, ldc: u32,\n"
     << "  batch_size: u32,\n"
     << "  batch_stride_a: u32, batch_stride_b: u32, batch_stride_c: u32,\n"
-    << "  _pad0: u32, _pad1: u32,\n"
+    << "  offset_a: u32, offset_b: u32,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n"
@@ -91,8 +90,8 @@ std::string make_gemv_kernel(
     << "  if (output_idx >= output_size) { return; }\n"
     << "  let row = output_idx / N;\n"
     << "  let col = output_idx % N;\n"
-    << "  let a_base = batch * params.batch_stride_a;\n"
-    << "  let b_base = batch * params.batch_stride_b;\n"
+    << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
+    << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
     << "  var acc: f32 = 0.0;\n"
     << "  for (var k: u32 = 0u; k < K; k = k + 1u) {\n";
@@ -148,7 +147,7 @@ std::string make_gemm_kernel(
     << "  lda: u32, ldb: u32, ldc: u32,\n"
     << "  batch_size: u32,\n"
     << "  batch_stride_a: u32, batch_stride_b: u32, batch_stride_c: u32,\n"
-    << "  _pad0: u32, _pad1: u32,\n"
+    << "  offset_a: u32, offset_b: u32,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n"
@@ -175,8 +174,8 @@ std::string make_gemm_kernel(
     << "  let local_col = lid.x;\n"
     << "  let global_row = wid.y * TILE_SIZE + local_row;\n"
     << "  let global_col = wid.x * TILE_SIZE + local_col;\n"
-    << "  let a_base = batch * params.batch_stride_a;\n"
-    << "  let b_base = batch * params.batch_stride_b;\n"
+    << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
+    << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
     << "  var acc: f32 = 0.0;\n"
     << "  let num_tiles = (K + TILE_SIZE - 1u) / TILE_SIZE;\n"
@@ -331,6 +330,8 @@ static void dispatch_matmul(
   params.batch_stride_a = batch_stride_a;
   params.batch_stride_b = batch_stride_b;
   params.batch_stride_c = batch_stride_c;
+  params.offset_a = static_cast<uint32_t>(a.offset() / a.itemsize());
+  params.offset_b = static_cast<uint32_t>(b.offset() / b.itemsize());
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
