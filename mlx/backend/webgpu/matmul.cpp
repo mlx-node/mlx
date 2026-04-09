@@ -200,7 +200,8 @@ std::string make_gemv_multi_col_kernel(
     const std::string& dtype,
     bool a_transposed,
     bool b_transposed,
-    bool use_sg) {
+    bool use_sg,
+    uint32_t cols_per_wg) {
   std::ostringstream s;
 
   if (use_sg) {
@@ -212,7 +213,7 @@ std::string make_gemv_multi_col_kernel(
   s << "\n";
 
   s << "const WG_SIZE: u32 = 128u;\n"
-    << "const COLS_PER_WG: u32 = 4u;\n"
+    << "const COLS_PER_WG: u32 = " << cols_per_wg << "u;\n"
     << "const GRID_X: u32 = 65535u;\n\n";
 
   s << "struct MatmulParams {\n"
@@ -229,11 +230,11 @@ std::string make_gemv_multi_col_kernel(
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
 
-  // 4 parallel shared arrays so all 4 reductions run in the same barriers.
-  s << "var<workgroup> shared_0: array<f32, 128>;\n"
-    << "var<workgroup> shared_1: array<f32, 128>;\n"
-    << "var<workgroup> shared_2: array<f32, 128>;\n"
-    << "var<workgroup> shared_3: array<f32, 128>;\n\n";
+  // N parallel shared arrays so all N reductions run in the same barriers.
+  for (uint32_t i = 0; i < cols_per_wg; ++i) {
+    s << "var<workgroup> shared_" << i << ": array<f32, 128>;\n";
+  }
+  s << "\n";
 
   s << "@compute @workgroup_size(128)\n"
     << "fn " << entry_name
@@ -250,23 +251,28 @@ std::string make_gemv_multi_col_kernel(
     << "  if (tile_idx >= total_tiles) { return; }\n"
     << "  let row = tile_idx / num_col_tiles;\n"
     << "  let col_tile = tile_idx % num_col_tiles;\n"
-    << "  let col_base = col_tile * COLS_PER_WG;\n"
-    << "  let col0 = col_base;\n"
-    << "  let col1 = col_base + 1u;\n"
-    << "  let col2 = col_base + 2u;\n"
-    << "  let col3 = col_base + 3u;\n"
-    << "  let has1 = col1 < N;\n"
-    << "  let has2 = col2 < N;\n"
-    << "  let has3 = col3 < N;\n"
-    << "  let tid = lid.x;\n"
+    << "  let col_base = col_tile * COLS_PER_WG;\n";
+
+  // col0..colN-1
+  for (uint32_t i = 0; i < cols_per_wg; ++i) {
+    s << "  let col" << i << " = col_base + " << i << "u;\n";
+  }
+  // has1..hasN-1 (col0 always in-bounds because tile_idx guard covers it)
+  for (uint32_t i = 1; i < cols_per_wg; ++i) {
+    s << "  let has" << i << " = col" << i << " < N;\n";
+  }
+
+  s << "  let tid = lid.x;\n"
     << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
     << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
-    << "  let c_base = batch * params.batch_stride_c;\n"
-    << "  var acc0: f32 = 0.0;\n"
-    << "  var acc1: f32 = 0.0;\n"
-    << "  var acc2: f32 = 0.0;\n"
-    << "  var acc3: f32 = 0.0;\n"
-    << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
+    << "  let c_base = batch * params.batch_stride_c;\n";
+
+  // Accumulators
+  for (uint32_t i = 0; i < cols_per_wg; ++i) {
+    s << "  var acc" << i << ": f32 = 0.0;\n";
+  }
+
+  s << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
 
   if (!a_transposed) {
     s << "    let a_val = f32(a[a_base + row * params.lda + k]);\n";
@@ -276,77 +282,75 @@ std::string make_gemv_multi_col_kernel(
 
   if (!b_transposed) {
     // B row-major (K, N) → b[k*ldb + col]
-    s << "    let b_row = b_base + k * params.ldb;\n"
-      << "    acc0 = acc0 + a_val * f32(b[b_row + col0]);\n"
-      << "    if (has1) { acc1 = acc1 + a_val * f32(b[b_row + col1]); }\n"
-      << "    if (has2) { acc2 = acc2 + a_val * f32(b[b_row + col2]); }\n"
-      << "    if (has3) { acc3 = acc3 + a_val * f32(b[b_row + col3]); }\n";
+    s << "    let b_row = b_base + k * params.ldb;\n";
+    s << "    acc0 = acc0 + a_val * f32(b[b_row + col0]);\n";
+    for (uint32_t i = 1; i < cols_per_wg; ++i) {
+      s << "    if (has" << i << ") { acc" << i << " = acc" << i
+        << " + a_val * f32(b[b_row + col" << i << "]); }\n";
+    }
   } else {
     // B transposed (N, K) row-major → b[col*ldb + k]
-    s << "    acc0 = acc0 + a_val * f32(b[b_base + col0 * params.ldb + k]);\n"
-      << "    if (has1) { acc1 = acc1 + a_val * f32(b[b_base + col1 * params.ldb + k]); }\n"
-      << "    if (has2) { acc2 = acc2 + a_val * f32(b[b_base + col2 * params.ldb + k]); }\n"
-      << "    if (has3) { acc3 = acc3 + a_val * f32(b[b_base + col3 * params.ldb + k]); }\n";
+    s << "    acc0 = acc0 + a_val * f32(b[b_base + col0 * params.ldb + k]);\n";
+    for (uint32_t i = 1; i < cols_per_wg; ++i) {
+      s << "    if (has" << i << ") { acc" << i << " = acc" << i
+        << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]); }\n";
+    }
   }
 
   s << "  }\n";
 
-  // Four parallel workgroup reductions, fused into the same barriers.
+  // N parallel workgroup reductions, fused into the same barriers.
   if (use_sg) {
-    s << "  var sg0 = subgroupAdd(acc0);\n"
-      << "  var sg1 = subgroupAdd(acc1);\n"
-      << "  var sg2 = subgroupAdd(acc2);\n"
-      << "  var sg3 = subgroupAdd(acc3);\n"
-      << "  let sg_id = tid / 32u;\n"
-      << "  if (subgroupElect()) {\n"
-      << "    shared_0[sg_id] = sg0;\n"
-      << "    shared_1[sg_id] = sg1;\n"
-      << "    shared_2[sg_id] = sg2;\n"
-      << "    shared_3[sg_id] = sg3;\n"
-      << "  }\n"
+    for (uint32_t i = 0; i < cols_per_wg; ++i) {
+      s << "  var sg" << i << " = subgroupAdd(acc" << i << ");\n";
+    }
+    s << "  let sg_id = tid / 32u;\n"
+      << "  if (subgroupElect()) {\n";
+    for (uint32_t i = 0; i < cols_per_wg; ++i) {
+      s << "    shared_" << i << "[sg_id] = sg" << i << ";\n";
+    }
+    s << "  }\n"
       << "  workgroupBarrier();\n";
-    // 128 threads / 32 subgroup = 4 subgroups. Reduce 4 values per shared array.
-    s << "  if (tid < 2u) {\n"
-      << "    shared_0[tid] = shared_0[tid] + shared_0[tid + 2u];\n"
-      << "    shared_1[tid] = shared_1[tid] + shared_1[tid + 2u];\n"
-      << "    shared_2[tid] = shared_2[tid] + shared_2[tid + 2u];\n"
-      << "    shared_3[tid] = shared_3[tid] + shared_3[tid + 2u];\n"
-      << "  }\n"
+    // 128 threads / 32 subgroup = 4 subgroups. Reduce 4 values per shared
+    // array.
+    s << "  if (tid < 2u) {\n";
+    for (uint32_t i = 0; i < cols_per_wg; ++i) {
+      s << "    shared_" << i << "[tid] = shared_" << i << "[tid] + shared_"
+        << i << "[tid + 2u];\n";
+    }
+    s << "  }\n"
       << "  workgroupBarrier();\n"
-      << "  if (tid < 1u) {\n"
-      << "    shared_0[tid] = shared_0[tid] + shared_0[tid + 1u];\n"
-      << "    shared_1[tid] = shared_1[tid] + shared_1[tid + 1u];\n"
-      << "    shared_2[tid] = shared_2[tid] + shared_2[tid + 1u];\n"
-      << "    shared_3[tid] = shared_3[tid] + shared_3[tid + 1u];\n"
-      << "  }\n"
+      << "  if (tid < 1u) {\n";
+    for (uint32_t i = 0; i < cols_per_wg; ++i) {
+      s << "    shared_" << i << "[tid] = shared_" << i << "[tid] + shared_"
+        << i << "[tid + 1u];\n";
+    }
+    s << "  }\n"
       << "  workgroupBarrier();\n";
   } else {
-    s << "  shared_0[tid] = acc0;\n"
-      << "  shared_1[tid] = acc1;\n"
-      << "  shared_2[tid] = acc2;\n"
-      << "  shared_3[tid] = acc3;\n"
-      << "  workgroupBarrier();\n";
-    // Unrolled 128-way reduction on 4 arrays in parallel (shared barriers).
+    for (uint32_t i = 0; i < cols_per_wg; ++i) {
+      s << "  shared_" << i << "[tid] = acc" << i << ";\n";
+    }
+    s << "  workgroupBarrier();\n";
+    // Unrolled 128-way reduction on N arrays in parallel (shared barriers).
     for (uint32_t stride = 64; stride >= 1; stride /= 2) {
-      s << "  if (tid < " << stride << "u) {\n"
-        << "    shared_0[tid] = shared_0[tid] + shared_0[tid + " << stride << "u];\n"
-        << "    shared_1[tid] = shared_1[tid] + shared_1[tid + " << stride << "u];\n"
-        << "    shared_2[tid] = shared_2[tid] + shared_2[tid + " << stride << "u];\n"
-        << "    shared_3[tid] = shared_3[tid] + shared_3[tid + " << stride << "u];\n"
-        << "  }\n  workgroupBarrier();\n";
+      s << "  if (tid < " << stride << "u) {\n";
+      for (uint32_t i = 0; i < cols_per_wg; ++i) {
+        s << "    shared_" << i << "[tid] = shared_" << i << "[tid] + shared_"
+          << i << "[tid + " << stride << "u];\n";
+      }
+      s << "  }\n  workgroupBarrier();\n";
     }
   }
 
   s << "  if (tid == 0u) {\n"
     << "    let out_row = c_base + row * params.ldc;\n"
-    << "    out[out_row + col0] = " << dtype << "(shared_0[0]);\n"
-    << "    if (has1) { out[out_row + col1] = " << dtype
-    << "(shared_1[0]); }\n"
-    << "    if (has2) { out[out_row + col2] = " << dtype
-    << "(shared_2[0]); }\n"
-    << "    if (has3) { out[out_row + col3] = " << dtype
-    << "(shared_3[0]); }\n"
-    << "  }\n"
+    << "    out[out_row + col0] = " << dtype << "(shared_0[0]);\n";
+  for (uint32_t i = 1; i < cols_per_wg; ++i) {
+    s << "    if (has" << i << ") { out[out_row + col" << i << "] = " << dtype
+      << "(shared_" << i << "[0]); }\n";
+  }
+  s << "  }\n"
     << "}\n";
 
   return s.str();
@@ -526,21 +530,28 @@ static void dispatch_matmul(
   const char* wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const bool use_sg = (kind == MatmulKind::GEMV) && dev.has_subgroups();
 
-  // Use the multi-col GEMV kernel (COLS_PER_WG=4) when N is large enough to
-  // produce enough workgroups for GPU saturation. For very small N we use the
-  // single-col split-K kernel so parallelism doesn't collapse to a handful of
-  // workgroups.
+  // Use the multi-col GEMV kernel when N is large enough to produce enough
+  // workgroups for GPU saturation. For very small N we use the single-col
+  // split-K kernel so parallelism doesn't collapse to a handful of workgroups.
+  // For very large N we use COLS_PER_WG=8 to further amortize A-row reads.
   constexpr uint32_t kMultiColThreshold = 16;
+  constexpr uint32_t kMultiCol8Threshold = 512;
   const bool use_multi_col =
       (kind == MatmulKind::GEMV) && N >= kMultiColThreshold;
+  const bool use_multi_col_8 =
+      (kind == MatmulKind::GEMV) && N >= kMultiCol8Threshold;
+  const uint32_t cols_per_wg = use_multi_col_8 ? 8u : 4u;
 
   // Build transpose suffix for pipeline key
   std::string trans_suffix;
   trans_suffix += (a_transposed ? "T" : "N");
   trans_suffix += (b_transposed ? "T" : "N");
 
+  // Pipeline cache keys on entry_name, so distinguish 4-col vs 8-col variants
+  // to avoid collisions that would break correctness.
   const char* prefix = (kind == MatmulKind::GEMV)
-      ? (use_multi_col ? "gemv_mc_" : "gemv_")
+      ? (use_multi_col_8 ? "gemv_mc8_"
+                         : (use_multi_col ? "gemv_mc4_" : "gemv_"))
       : "gemm_";
   std::string entry_name =
       std::string(prefix) + trans_suffix + "_" + wgsl_type;
@@ -554,7 +565,12 @@ static void dispatch_matmul(
         if (kind == MatmulKind::GEMV) {
           return use_multi_col
               ? make_gemv_multi_col_kernel(
-                    entry_name, wgsl_type, a_transposed, b_transposed, use_sg)
+                    entry_name,
+                    wgsl_type,
+                    a_transposed,
+                    b_transposed,
+                    use_sg,
+                    cols_per_wg)
               : make_gemv_kernel(
                     entry_name, wgsl_type, a_transposed, b_transposed, use_sg);
         }
@@ -601,9 +617,8 @@ static void dispatch_matmul(
     // Split-K (single or multi-col): fan out across (x, y) with GRID_X=65535
     // (the WebGPU minimum for maxComputeWorkgroupsPerDim) so lm_head-sized
     // outputs (vocab > 65535) still fit.
-    constexpr uint32_t kColsPerWg = 4u;
     uint32_t tiles_per_row = use_multi_col
-        ? ((N + kColsPerWg - 1) / kColsPerWg)
+        ? ((N + cols_per_wg - 1) / cols_per_wg)
         : N;
     uint32_t total_tiles = M * tiles_per_row;
     constexpr uint32_t kGridX = 65535u;
