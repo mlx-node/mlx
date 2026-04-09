@@ -46,22 +46,49 @@ struct MatmulParams {
 };
 
 // ---------------------------------------------------------------------------
-// WGSL GEMV kernel generation
+// WGSL GEMV kernel generation (split-K)
 // ---------------------------------------------------------------------------
 
-// GEMV: each thread computes one output element by looping over K.
-// Workgroup size: 256, one workgroup per 256 output elements.
-// Handles all transpose combinations for A and B.
+// Split-K GEMV: one workgroup per output element, 256 threads cooperatively
+// reduce the K dimension. This pattern delivers two big wins over the naive
+// "one thread per output" GEMV that this replaces:
+//
+//   1. Coalesced B reads in the common b_transposed case
+//      (weight matrix stored as (N, K) row-major). All 256 threads in a
+//      workgroup share the same col and iterate k → they read 256 adjacent
+//      K elements each iteration → perfect coalescing. The naive kernel had
+//      adjacent threads striding by ldb (= K), totally uncoalesced.
+//
+//   2. ~100× more active threads for typical decode GEMV sizes
+//      (e.g. N=3072 → 3072 workgroups × 256 threads = 786k threads, vs
+//      the old 12 workgroups × 256 = 3k threads). This is critical for
+//      hiding memory latency on GPUs, which want 100k+ active threads.
+//
+// Workgroup reduction uses subgroup intrinsics when available, with an
+// unrolled tree-reduction fallback.
+//
+// Dispatch: one workgroup per output element with 2D fanout using a fixed
+// GRID_X (65535 — the WebGPU minimum workgroups-per-dim) so large outputs
+// like lm_head (vocab = 151k) fit. The shader decodes output_idx from
+// (wid.x, wid.y) uniformly for both small and large outputs.
 std::string make_gemv_kernel(
     const std::string& entry_name,
     const std::string& dtype,
     bool a_transposed,
-    bool b_transposed) {
+    bool b_transposed,
+    bool use_sg) {
   std::ostringstream s;
 
-  if (dtype == "f16") {
-    s << "enable f16;\n\n";
+  if (use_sg) {
+    s << "enable subgroups;\n";
   }
+  if (dtype == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
+
+  s << "const WG_SIZE: u32 = 256u;\n"
+    << "const GRID_X: u32 = 65535u;\n\n";
 
   s << "struct MatmulParams {\n"
     << "  M: u32, N: u32, K: u32,\n"
@@ -77,11 +104,18 @@ std::string make_gemv_kernel(
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
 
+  // Helper for unrolled / subgroup tree-reduce phase.
+  s << "fn sum_op(x: f32, y: f32) -> f32 { return x + y; }\n\n";
+
+  // Shared memory for reduction (f32 accumulator regardless of dtype).
+  s << "var<workgroup> shared_acc: array<f32, 256>;\n\n";
+
   s << "@compute @workgroup_size(256)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let output_idx = gid.x;\n"
-    << "  let batch = gid.z;\n"
+    << "(@builtin(workgroup_id) wid: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u) {\n"
+    << "  let output_idx = wid.x + wid.y * GRID_X;\n"
+    << "  let batch = wid.z;\n"
     << "  if (batch >= params.batch_size) { return; }\n"
     << "  let M = params.M;\n"
     << "  let N = params.N;\n"
@@ -90,33 +124,50 @@ std::string make_gemv_kernel(
     << "  if (output_idx >= output_size) { return; }\n"
     << "  let row = output_idx / N;\n"
     << "  let col = output_idx % N;\n"
+    << "  let tid = lid.x;\n"
     << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
     << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
     << "  var acc: f32 = 0.0;\n"
-    << "  for (var k: u32 = 0u; k < K; k = k + 1u) {\n";
+    << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
 
   // A indexing: row=m, col=k
   if (!a_transposed) {
-    // A is row-major: A[m,k] = A[a_base + m * lda + k]
     s << "    let a_val = a[a_base + row * params.lda + k];\n";
   } else {
-    // A is transposed (column-major): A^T[m,k] = A[k,m] = A[a_base + k * lda + m]
     s << "    let a_val = a[a_base + k * params.lda + row];\n";
   }
 
   // B indexing: row=k, col=n
   if (!b_transposed) {
-    // B is row-major: B[k,n] = B[b_base + k * ldb + n]
     s << "    let b_val = b[b_base + k * params.ldb + col];\n";
   } else {
-    // B is transposed (column-major): B^T[k,n] = B[n,k] = B[b_base + n * ldb + k]
     s << "    let b_val = b[b_base + col * params.ldb + k];\n";
   }
 
   s << "    acc = acc + f32(a_val) * f32(b_val);\n"
+    << "  }\n";
+
+  // Workgroup reduction: subgroup-accelerated or fully unrolled tree.
+  if (use_sg) {
+    wgpu::emit_subgroup_reduction(
+        s,
+        /*acc_var=*/"acc",
+        /*shared_name=*/"shared_acc",
+        /*subgroup_builtin=*/"subgroupAdd",
+        /*reduce_op=*/"sum_op",
+        /*workgroup_size=*/256,
+        /*subgroup_size=*/32);
+  } else {
+    s << "  shared_acc[tid] = acc;\n"
+      << "  workgroupBarrier();\n";
+    wgpu::emit_unrolled_reduction(s, "shared_acc", "sum_op", 256);
+  }
+
+  s << "  if (tid == 0u) {\n"
+    << "    out[c_base + row * params.ldc + col] = " << dtype
+    << "(shared_acc[0]);\n"
     << "  }\n"
-    << "  out[c_base + row * params.ldc + col] = " << dtype << "(acc);\n"
     << "}\n";
 
   return s.str();
@@ -292,7 +343,9 @@ static void dispatch_matmul(
     uint32_t batch_stride_b,
     uint32_t batch_stride_c,
     const Stream& s) {
+  auto& dev = wgpu::device();
   const char* wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
+  const bool use_sg = (kind == MatmulKind::GEMV) && dev.has_subgroups();
 
   // Build transpose suffix for pipeline key
   std::string trans_suffix;
@@ -302,13 +355,16 @@ static void dispatch_matmul(
   const char* prefix = (kind == MatmulKind::GEMV) ? "gemv_" : "gemm_";
   std::string entry_name =
       std::string(prefix) + trans_suffix + "_" + wgsl_type;
+  if (use_sg) {
+    entry_name += "_sg";
+  }
 
-  auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
         return (kind == MatmulKind::GEMV)
-            ? make_gemv_kernel(entry_name, wgsl_type, a_transposed, b_transposed)
+            ? make_gemv_kernel(
+                  entry_name, wgsl_type, a_transposed, b_transposed, use_sg)
             : make_gemm_kernel(entry_name, wgsl_type, a_transposed, b_transposed);
       });
 
@@ -349,10 +405,14 @@ static void dispatch_matmul(
        {uniform_buf, sizeof(MatmulParams)}});
 
   if (kind == MatmulKind::GEMV) {
+    // Split-K: one workgroup per output element. Fan out across (x, y) with
+    // a GRID_X of 65535 (the WebGPU minimum for maxComputeWorkgroupsPerDim)
+    // so lm_head-sized outputs (vocab > 65535) still fit.
     uint32_t output_size = M * N;
-    uint32_t num_workgroups_x =
-        (output_size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
-    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups_x, 1, batch_count);
+    constexpr uint32_t kGridX = 65535u;
+    uint32_t wg_x = output_size < kGridX ? output_size : kGridX;
+    uint32_t wg_y = (output_size + kGridX - 1) / kGridX;
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y, batch_count);
   } else {
     // Grid: (ceil(N/16), ceil(M/16), batch_size)
     uint32_t wg_x = (N + TILE_SIZE - 1) / TILE_SIZE;
