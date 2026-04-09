@@ -29,6 +29,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rope.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/sdpa.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp

@@ -23,22 +23,8 @@
 
 namespace mlx::core {
 
-bool fast::ScaledDotProductAttention::use_fallback(
-    const array& q,
-    const array& k,
-    const array& v,
-    bool has_mask,
-    bool has_arr_mask,
-    bool do_causal,
-    bool is_training,
-    bool output_logsumexp,
-    Stream s) {
-  return true;
-}
-
-bool fast::ScaledDotProductAttention::supports_bool_mask() {
-  return false;
-}
+// fast::ScaledDotProductAttention — use_fallback, supports_bool_mask, and
+// eval_gpu are implemented in sdpa.cpp (fused vector kernel for decode).
 
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
@@ -111,7 +97,7 @@ NO_GPU_MULTI(LayerNormVJP)
 // RMSNorm — implemented in normalization.cpp
 NO_GPU_MULTI(RMSNormVJP)
 // RoPE — implemented in rope.cpp
-NO_GPU_MULTI(ScaledDotProductAttention)
+// ScaledDotProductAttention — implemented in sdpa.cpp
 NO_GPU_MULTI(ScaledDotProductAttentionVJP)
 NO_GPU_MULTI(ConvertFP8)
 NO_GPU_MULTI(Quantize)
