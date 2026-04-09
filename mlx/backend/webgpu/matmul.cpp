@@ -177,24 +177,25 @@ std::string make_gemv_kernel(
 // WGSL multi-col GEMV kernel generation
 // ---------------------------------------------------------------------------
 
-// Multi-col GEMV: each workgroup computes COLS_PER_WG=4 consecutive output
-// columns cooperatively, sharing one A load per iteration across 4 B loads
-// and 4 FMAs. Amortizes A reads by 4x.
+// Multi-col GEMV: each workgroup computes cols_per_wg consecutive output
+// columns cooperatively, sharing one A load per iteration across cols_per_wg
+// B loads and cols_per_wg FMAs. Amortizes A reads by cols_per_wg×.
 //
 // Memory traffic per output element:
-//   - Single-col split-K GEMV: K A loads + K B loads = 2K  (per col)
-//   - Multi-col (COLS_PER_WG=4): (K/4 A loads) + K B loads = 1.25K per col
-// → 37.5% total memory traffic reduction. GEMV is memory-bound, so this
-//   translates directly into speedup.
+//   - Single-col split-K GEMV:    K A loads + K B loads = 2K per col
+//   - Multi-col (cols_per_wg=4):  K/4 A loads + K B loads = 1.25K per col
+//   - Multi-col (cols_per_wg=8):  K/8 A loads + K B loads = 1.125K per col
+// GEMV is memory-bound, so the A-read reduction translates into speedup.
 //
 // Layout:
-//   workgroup_size = 128 (4 subgroups of 32)
-//   COLS_PER_WG   = 4
-//   dispatch       = ceil(N / 4) workgroups per batch row
+//   workgroup_size = 128 (4 subgroups of 32 on Apple Silicon)
+//   cols_per_wg    = 4 or 8 (chosen at dispatch time based on N)
+//   dispatch       = ceil(N / cols_per_wg) workgroups per batch row
 //
-// Four parallel reductions at the end, one per column accumulator. Uses
-// subgroup intrinsics when available. Handles N not divisible by 4 via
-// has1/has2/has3 guards (loop-uniform → predicated, no divergence cost).
+// cols_per_wg parallel reductions at the end, one per column accumulator.
+// Uses subgroup intrinsics when available. Handles N not divisible by
+// cols_per_wg via has1..hasN-1 guards (loop-uniform → predicated, no
+// divergence cost). col0 is always in-bounds (tile_idx guard covers it).
 std::string make_gemv_multi_col_kernel(
     const std::string& entry_name,
     const std::string& dtype,
@@ -230,7 +231,7 @@ std::string make_gemv_multi_col_kernel(
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
 
-  // N parallel shared arrays so all N reductions run in the same barriers.
+  // cols_per_wg parallel shared arrays so all reductions run in fused barriers.
   for (uint32_t i = 0; i < cols_per_wg; ++i) {
     s << "var<workgroup> shared_" << i << ": array<f32, 128>;\n";
   }
@@ -299,7 +300,7 @@ std::string make_gemv_multi_col_kernel(
 
   s << "  }\n";
 
-  // N parallel workgroup reductions, fused into the same barriers.
+  // cols_per_wg parallel workgroup reductions, fused into the same barriers.
   if (use_sg) {
     for (uint32_t i = 0; i < cols_per_wg; ++i) {
       s << "  var sg" << i << " = subgroupAdd(acc" << i << ");\n";
