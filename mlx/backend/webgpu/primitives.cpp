@@ -75,7 +75,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 
 NO_GPU(ArgPartition)
 // ArgReduce — implemented in arg_reduce.cpp
-NO_GPU(ArgSort)
+// ArgSort — implemented in sort.cpp
 NO_GPU(BitwiseBinary)
 NO_GPU(BlockMaskedMM)
 NO_GPU_MULTI(Compiled)
@@ -92,12 +92,12 @@ NO_GPU(Load)
 NO_GPU_MULTI(LUF)
 NO_GPU(Partition)
 NO_GPU_MULTI(QRF)
-NO_GPU(RandomBits)
+// RandomBits — implemented in random.cpp
 NO_GPU(Real)
-NO_GPU(Scan)
+// Scan — implemented in scan.cpp
 NO_GPU(SegmentedMM)
 // SliceUpdate — implemented in indexing.cpp
-NO_GPU(Sort)
+// Sort — implemented in sort.cpp
 NO_GPU_MULTI(SVD)
 NO_GPU(Inverse)
 NO_GPU(Cholesky)
@@ -106,11 +106,11 @@ NO_GPU_MULTI(Eig)
 NO_GPU(MaskedScatter)
 
 namespace fast {
-NO_GPU_USE_FALLBACK(LayerNorm)
+// LayerNorm — implemented in normalization.cpp
 NO_GPU_MULTI(LayerNormVJP)
-NO_GPU_USE_FALLBACK(RMSNorm)
+// RMSNorm — implemented in normalization.cpp
 NO_GPU_MULTI(RMSNormVJP)
-NO_GPU_USE_FALLBACK(RoPE)
+// RoPE — implemented in rope.cpp
 NO_GPU_MULTI(ScaledDotProductAttention)
 NO_GPU_MULTI(ScaledDotProductAttentionVJP)
 NO_GPU_MULTI(ConvertFP8)
