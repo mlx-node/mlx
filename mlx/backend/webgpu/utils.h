@@ -296,14 +296,20 @@ inline void emit_subgroup_reduction(
     const std::string& subgroup_builtin,
     const std::string& reduce_op,
     uint32_t workgroup_size = WORKGROUP_SIZE,
-    uint32_t subgroup_size = 32) {
+    uint32_t subgroup_size = 32,
+    const std::string& prefix = "") {
   uint32_t num_subgroups = workgroup_size / subgroup_size;
+
+  // Use prefix to avoid variable name collisions when called multiple times
+  // in the same shader (e.g., softmax has both max and sum reductions).
+  std::string sg_var = prefix.empty() ? "sg_result" : prefix + "_sg_result";
+  std::string sg_id = prefix.empty() ? "subgroup_id" : prefix + "_subgroup_id";
 
   // Step 1: subgroup-level reduction
   s << "  // Subgroup reduction\n"
-    << "  var sg_result = " << subgroup_builtin << "(" << acc_var << ");\n"
-    << "  let subgroup_id = tid / " << subgroup_size << "u;\n"
-    << "  if (subgroupElect()) { " << shared_name << "[subgroup_id] = sg_result; }\n"
+    << "  var " << sg_var << " = " << subgroup_builtin << "(" << acc_var << ");\n"
+    << "  let " << sg_id << " = tid / " << subgroup_size << "u;\n"
+    << "  if (subgroupElect()) { " << shared_name << "[" << sg_id << "] = " << sg_var << "; }\n"
     << "  workgroupBarrier();\n";
 
   // Step 2: tree-reduce across subgroup results (only num_subgroups values)

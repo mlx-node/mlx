@@ -93,7 +93,7 @@ std::string make_softmax_kernel(
     ;
 
   if (use_subgroups) {
-    wgpu::emit_subgroup_reduction(s, "thread_max", "shared_max", "subgroupMax", "max");
+    wgpu::emit_subgroup_reduction(s, "thread_max", "shared_max", "subgroupMax", "max", wgpu::WORKGROUP_SIZE, 32, "mx");
   } else {
     s << "  // Store to shared memory and reduce\n"
       << "  shared_max[tid] = thread_max;\n"
@@ -112,7 +112,7 @@ std::string make_softmax_kernel(
     << "\n";
 
   if (use_subgroups) {
-    wgpu::emit_subgroup_reduction(s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op");
+    wgpu::emit_subgroup_reduction(s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op", wgpu::WORKGROUP_SIZE, 32, "sm");
   } else {
     s << "  shared_sum[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n\n";
