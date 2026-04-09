@@ -16,6 +16,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/slicing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp
