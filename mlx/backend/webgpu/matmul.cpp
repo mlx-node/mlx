@@ -17,8 +17,6 @@
 
 #ifdef MLX_WGPU_LOG_KERNELS
 #include <iostream>
-#include <mutex>
-#include <unordered_set>
 #endif
 
 namespace mlx::core {
@@ -737,23 +735,15 @@ static void dispatch_matmul(
     entry_name += "_al";
   }
 
-#ifdef MLX_WGPU_LOG_KERNELS
-  // First-dispatch log — one line per unique entry_name. Guarded by a
-  // compile-time flag because the mutex + set lookup were measurable hot-path
-  // overhead on wasm (std::mutex is not free in wasi-pthreads).
-  {
-    static std::mutex s_log_mutex;
-    static std::unordered_set<std::string> s_logged;
-    std::lock_guard<std::mutex> g(s_log_mutex);
-    if (s_logged.insert(entry_name).second) {
-      std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
-    }
-  }
-#endif
-
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+        // First-dispatch log — the shader-module cache only invokes this
+        // lambda on a MISS, so each unique entry_name prints exactly once.
+        // Zero overhead on the hot path (no mutex, no set lookup).
+        std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
         if (kind == MatmulKind::GEMV) {
           return use_multi_col
               ? make_gemv_multi_col_kernel(
