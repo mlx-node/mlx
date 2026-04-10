@@ -53,6 +53,7 @@
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/webgpu/allocator.h"
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
 #include "mlx/fast_primitives.h"
@@ -62,6 +63,10 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+
+#ifdef MLX_WGPU_LOG_KERNELS
+#include <iostream>
+#endif
 
 namespace mlx::core::fast {
 
@@ -319,6 +324,336 @@ std::string make_sdpa_vector_kernel(
   return s.str();
 }
 
+// ---------------------------------------------------------------------------
+// Tile (prefill) SDPA params + kernel generator.
+//
+// Handles the Tq > 1 prompt path: one workgroup per (batch, q_head, q_tile),
+// each workgroup processing BQ rows of Q × the entire K/V sequence in BK-col
+// chunks using FlashAttention-2 online softmax. The result is a single fused
+// kernel that avoids the HBM round-trip of the decomposed matmul→softmax→
+// matmul fallback.
+//
+// Tile shape (fixed at BQ=16, BK=8, 128 threads = BQ * BK):
+//   Workgroup layout  : (BK, BQ, 1) = (8, 16, 1), local_id.x = tk, .y = tq.
+//   Q_smem            : array<f32, BQ * D>        (~16 KiB at D=256)
+//   KV_smem           : array<f32, BK * D>        (~8 KiB  at D=256)
+//   S_smem            : array<f32, BQ * BK>       (~0.5 KiB)
+//   m_i / l_i         : array<f32, BQ>            (per-row running max/sum)
+//   rescale           : array<f32, BQ>            (exp(m_old - m_new) per row)
+//
+// Total shared memory at D=256: ~25 KiB. Fits Chromium's 32 KiB default
+// maxComputeWorkgroupStorageSize. For devices with the WebGPU-minimum 16 KiB
+// budget we reject Tq > 1 in use_fallback() at D=256; D ≤ 128 still fits.
+//
+// The KV_smem buffer is re-used across the K load and the V load within one
+// KV-block iteration: we load K, compute S/P, then overwrite KV_smem with V
+// and do the V · P accumulation. P values live in S_smem across both halves.
+//
+// Each thread owns one (tq, tk) pair for the S computation and a strided
+// slice of the output: O[tq, d] for d ∈ {tk, tk+BK, ..., tk+(D/BK - 1)*BK}.
+// O accumulators live in thread-local registers (d_per_thread = D / BK).
+//
+// Subgroups are not used here — the per-row reductions span only BK=8 values
+// and run as a scalar loop inside each thread. Every thread in the row
+// computes the same row_max / row_sum independently from S_smem, so there's
+// no cross-lane communication to accelerate. (The BK=8 scalar loop turns out
+// to be cheaper than a subgroup dance anyway; run-34 footgun avoided.)
+
+constexpr uint32_t SDPA_TILE_BQ = 16;
+constexpr uint32_t SDPA_TILE_BK = 8;
+constexpr uint32_t SDPA_TILE_WG_SIZE = SDPA_TILE_BQ * SDPA_TILE_BK; // 128
+
+// Uniform struct laid out to match the WGSL struct below. 48 bytes.
+struct SdpaTileParams {
+  uint32_t B;          // batch
+  uint32_t H;          // query heads
+  uint32_t H_kv;       // kv heads
+  uint32_t L;          // kv sequence length
+  uint32_t Tq;         // query sequence length (> 1)
+  uint32_t D;          // head dim (also baked as WGSL const)
+  uint32_t has_mask;   // 0 or 1
+  uint32_t do_causal;  // 0 or 1
+  uint32_t gqa_factor; // H / H_kv
+  uint32_t q_offset;   // causal offset (== L - Tq for standard causal decode)
+  float    scale;      // attention scale (typically 1/sqrt(D))
+  uint32_t pad;        // 16-byte alignment
+};
+
+std::string make_sdpa_tile_kernel(
+    const std::string& entry_name,
+    const std::string& dtype,
+    uint32_t D,
+    bool has_mask,
+    bool do_causal) {
+  std::ostringstream s;
+
+  if (dtype == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
+
+  const uint32_t BQ = SDPA_TILE_BQ;
+  const uint32_t BK = SDPA_TILE_BK;
+  const uint32_t WG = SDPA_TILE_WG_SIZE;
+  // d_per_thread = D / BK. D is always a multiple of BK (BK=8 and D in
+  // {64, 96, 128, 256}) — enforced by use_fallback().
+  const uint32_t DPT = D / BK;
+
+  s << "const D: u32 = " << D << "u;\n"
+    << "const BQ: u32 = " << BQ << "u;\n"
+    << "const BK: u32 = " << BK << "u;\n"
+    << "const WG: u32 = " << WG << "u;\n"
+    << "const DPT: u32 = " << DPT << "u;\n"
+    << "const NEG_INF: f32 = -3.402823e+38;\n\n";
+
+  s << "struct SdpaTileParams {\n"
+    << "  B: u32,\n"
+    << "  H: u32,\n"
+    << "  H_kv: u32,\n"
+    << "  L: u32,\n"
+    << "  Tq: u32,\n"
+    << "  D: u32,\n"
+    << "  has_mask: u32,\n"
+    << "  do_causal: u32,\n"
+    << "  gqa_factor: u32,\n"
+    << "  q_offset: u32,\n"
+    << "  scale: f32,\n"
+    << "  pad: u32,\n"
+    << "}\n\n";
+
+  // Bindings: q, k, v, [mask], output, uniform
+  uint32_t binding = 0;
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> q: array<"
+    << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> k: array<"
+    << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> v: array<"
+    << dtype << ">;\n";
+  if (has_mask) {
+    s << "@group(0) @binding(" << binding++
+      << ") var<storage, read> mask: array<" << dtype << ">;\n";
+  }
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read_write> output: array<" << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<uniform> params: SdpaTileParams;\n\n";
+
+  // Shared memory: Q tile, K/V tile (ping-pong within a block), S tile,
+  // per-row running state.
+  s << "var<workgroup> Q_smem: array<f32, BQ * D>;\n";
+  s << "var<workgroup> KV_smem: array<f32, BK * D>;\n";
+  s << "var<workgroup> S_smem: array<f32, BQ * BK>;\n";
+  s << "var<workgroup> m_i: array<f32, BQ>;\n";
+  s << "var<workgroup> l_i: array<f32, BQ>;\n";
+  s << "var<workgroup> rescale_smem: array<f32, BQ>;\n\n";
+
+  // Entry point. Workgroup = (BK, BQ, 1), so local_id.x is the column lane
+  // (tk) and local_id.y is the row lane (tq). Dispatch grid: (qTiles, H, B).
+  s << "@compute @workgroup_size(" << BK << ", " << BQ << ", 1)\n"
+    << "fn " << entry_name
+    << "(@builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << "  let tk = lid.x;\n"
+    << "  let tq = lid.y;\n"
+    << "  let flat = tq * BK + tk;  // 0..WG-1\n"
+    << "  let q_tile = wg_id.x;     // 0..ceil(Tq/BQ)-1\n"
+    << "  let h = wg_id.y;          // 0..H-1\n"
+    << "  let b = wg_id.z;          // 0..B-1\n"
+    << "  let H_kv = params.H_kv;\n"
+    << "  let H = params.H;\n"
+    << "  let gqa = params.gqa_factor;\n"
+    << "  let h_kv = h / gqa;\n"
+    << "  let L = params.L;\n"
+    << "  let Tq = params.Tq;\n"
+    << "  let scale = params.scale;\n"
+    << "  let q_row_base = q_tile * BQ;\n"
+    << "  let q_row_abs_base = q_row_base + params.q_offset;  // for causal\n"
+    << "\n"
+    << "  // Element-indexed offsets into flat row-contiguous Q/K/V/O:\n"
+    << "  //   Q[b, h, tq_row, :]   = q[(b*H    + h   )*Tq*D + tq_row*D + d]\n"
+    << "  //   K[b, h_kv, k_row, :] = k[(b*H_kv + h_kv)*L *D + k_row*D  + d]\n"
+    << "  //   V[b, h_kv, k_row, :] = v[(b*H_kv + h_kv)*L *D + k_row*D  + d]\n"
+    << "  //   O[b, h, tq_row, :]   = output[(b*H + h)*Tq*D + tq_row*D + d]\n"
+    << "  let q_base = (b * H + h) * Tq * D;\n"
+    << "  let kv_base = (b * H_kv + h_kv) * L * D;\n"
+    << "  let o_base = q_base;\n";
+  if (has_mask) {
+    // Mask is broadcast by fast.cpp to [B, H, Tq, L] and made contiguous.
+    s << "  let mask_base = ((b * H + h) * Tq) * L;\n";
+  }
+  s << "\n";
+
+  // Phase 0: cooperatively cache Q[q_tile, :] into shared memory.
+  // Each thread loads Q_smem[q_row*D + d] for a strided set of (q_row, d).
+  // Out-of-range q_rows (tail tile) get zeroed — the final store guards on
+  // q_row < Tq so the bogus zero-Q contributions never leak into output.
+  s << "  // Phase 0: cooperatively load Q[q_tile*BQ .. q_tile*BQ+BQ, :] into\n"
+    << "  // Q_smem. Each thread loads (BQ*D)/WG = D*BQ/WG = D/BK elements.\n"
+    << "  for (var i: u32 = flat; i < BQ * D; i = i + WG) {\n"
+    << "    let row = i / D;\n"
+    << "    let col = i % D;\n"
+    << "    let q_row = q_row_base + row;\n"
+    << "    var qv: f32 = 0.0;\n"
+    << "    if (q_row < Tq) {\n"
+    << "      qv = f32(q[q_base + q_row * D + col]);\n"
+    << "    }\n"
+    << "    Q_smem[row * D + col] = qv;\n"
+    << "  }\n"
+    << "\n";
+
+  // Per-row init: m_i = -inf, l_i = 0.
+  s << "  // Initialize per-row softmax state.\n"
+    << "  if (flat < BQ) {\n"
+    << "    m_i[flat] = NEG_INF;\n"
+    << "    l_i[flat] = 0.0;\n"
+    << "  }\n"
+    << "\n"
+    << "  // Per-thread register accumulator: O_accum[d_slab] where\n"
+    << "  // d_slab ∈ {tk, tk+BK, ..., tk+(DPT-1)*BK}. All initialized to 0.\n"
+    << "  var o_acc: array<f32, DPT>;\n"
+    << "  for (var i: u32 = 0u; i < DPT; i = i + 1u) { o_acc[i] = 0.0; }\n"
+    << "\n"
+    << "  workgroupBarrier();\n"
+    << "\n";
+
+  // Main loop over KV blocks.
+  s << "  // Loop over KV blocks of size BK.\n"
+    << "  let num_kv_blocks = (L + BK - 1u) / BK;\n"
+    << "  for (var kb: u32 = 0u; kb < num_kv_blocks; kb = kb + 1u) {\n"
+    << "    let k_block_start = kb * BK;\n"
+    << "\n"
+    << "    // Cooperatively load K[k_block_start .. +BK, :] into KV_smem.\n"
+    << "    // (BK*D)/WG elements per thread = D/BK = DPT elements.\n"
+    << "    for (var i: u32 = flat; i < BK * D; i = i + WG) {\n"
+    << "      let row = i / D;\n"
+    << "      let col = i % D;\n"
+    << "      let k_row = k_block_start + row;\n"
+    << "      var kv: f32 = 0.0;\n"
+    << "      if (k_row < L) {\n"
+    << "        kv = f32(k[kv_base + k_row * D + col]);\n"
+    << "      }\n"
+    << "      KV_smem[row * D + col] = kv;\n"
+    << "    }\n"
+    << "    workgroupBarrier();\n"
+    << "\n";
+
+  // Step 2: compute S[tq, tk] = dot(Q_smem[tq, :], KV_smem[tk, :]) * scale.
+  // Each thread computes exactly one S value. Apply masks.
+  s << "    // S[tq, tk] = Q_smem[tq, :] dot KV_smem[tk, :] * scale.\n"
+    << "    var acc: f32 = 0.0;\n"
+    << "    for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "      acc = acc + Q_smem[tq * D + d] * KV_smem[tk * D + d];\n"
+    << "    }\n"
+    << "    var s_val = acc * scale;\n"
+    << "\n"
+    << "    // Per-element masks for (q_row, k_col).\n"
+    << "    let q_row = q_row_base + tq;\n"
+    << "    let k_col = k_block_start + tk;\n"
+    << "    let q_row_abs = q_row_abs_base + tq;\n";
+  if (do_causal) {
+    s << "    if (k_col > q_row_abs) { s_val = NEG_INF; }\n";
+  }
+  s << "    if (k_col >= L) { s_val = NEG_INF; }\n"
+    << "    if (q_row >= Tq) { s_val = NEG_INF; }\n";
+  if (has_mask) {
+    // Mask is [B, H, Tq, L] row-contiguous; bounds already checked by the
+    // k_col/q_row guards above — safe to index directly.
+    s << "    if (q_row < Tq && k_col < L) {\n"
+      << "      s_val = s_val + f32(mask[mask_base + q_row * L + k_col]);\n"
+      << "    }\n";
+  }
+  s << "    S_smem[tq * BK + tk] = s_val;\n"
+    << "    workgroupBarrier();\n"
+    << "\n";
+
+  // Step 3: per-row online softmax update.
+  // Each thread scans its own row once and computes row_max locally.
+  // The first lane of each row (tk == 0) updates the shared m_i/l_i/rescale.
+  // All threads then read the shared rescale to update their O_accum
+  // registers and read the updated m_i to compute P = exp(S - m_new).
+  s << "    // Per-row scalar reduction over BK=" << BK << " S values.\n"
+    << "    // All threads in a row compute the same row_max independently.\n"
+    << "    var row_max_block: f32 = NEG_INF;\n"
+    << "    for (var j: u32 = 0u; j < BK; j = j + 1u) {\n"
+    << "      row_max_block = max(row_max_block, S_smem[tq * BK + j]);\n"
+    << "    }\n"
+    << "    // FlashAttention online softmax rescale. Row lead (tk == 0)\n"
+    << "    // writes the shared running state so every thread in the row\n"
+    << "    // can read a consistent rescale factor and m_new below.\n"
+    << "    if (tk == 0u) {\n"
+    << "      let m_old = m_i[tq];\n"
+    << "      let m_new = max(m_old, row_max_block);\n"
+    << "      let rescale = exp(m_old - m_new);\n"
+    << "      // Compute new l_i from old l_i · rescale + sum(exp(S - m_new))\n"
+    << "      // of THIS block. The running l_i rescale happens here; the\n"
+    << "      // O_accum rescale is applied per-thread below.\n"
+    << "      var row_sum_block: f32 = 0.0;\n"
+    << "      for (var j: u32 = 0u; j < BK; j = j + 1u) {\n"
+    << "        row_sum_block = row_sum_block + exp(S_smem[tq * BK + j] - m_new);\n"
+    << "      }\n"
+    << "      m_i[tq] = m_new;\n"
+    << "      l_i[tq] = l_i[tq] * rescale + row_sum_block;\n"
+    << "      rescale_smem[tq] = rescale;\n"
+    << "    }\n"
+    << "    workgroupBarrier();\n"
+    << "\n"
+    << "    // All threads: rescale O_accum registers by the row's factor,\n"
+    << "    // then replace S with P = exp(S - m_new) in shared memory.\n"
+    << "    let m_new = m_i[tq];\n"
+    << "    let rescale = rescale_smem[tq];\n"
+    << "    for (var i: u32 = 0u; i < DPT; i = i + 1u) {\n"
+    << "      o_acc[i] = o_acc[i] * rescale;\n"
+    << "    }\n"
+    << "    S_smem[tq * BK + tk] = exp(S_smem[tq * BK + tk] - m_new);\n"
+    << "    workgroupBarrier();\n"
+    << "\n";
+
+  // Step 4: load V into KV_smem (reusing the K slot), then accumulate
+  // O_accum[tq, d] += sum_k P[tq, k] * V_smem[k, d] across the owned d slab.
+  s << "    // Load V[k_block_start .. +BK, :] into KV_smem (overwrites K).\n"
+    << "    for (var i: u32 = flat; i < BK * D; i = i + WG) {\n"
+    << "      let row = i / D;\n"
+    << "      let col = i % D;\n"
+    << "      let k_row = k_block_start + row;\n"
+    << "      var vv: f32 = 0.0;\n"
+    << "      if (k_row < L) {\n"
+    << "        vv = f32(v[kv_base + k_row * D + col]);\n"
+    << "      }\n"
+    << "      KV_smem[row * D + col] = vv;\n"
+    << "    }\n"
+    << "    workgroupBarrier();\n"
+    << "\n"
+    << "    // O_accum[tq, d] += sum_k P[tq, k] * V_smem[k, d]\n"
+    << "    // Thread (tq, tk) owns d_slab = {tk, tk+BK, ..., tk+(DPT-1)*BK}.\n"
+    << "    for (var di: u32 = 0u; di < DPT; di = di + 1u) {\n"
+    << "      let d = di * BK + tk;\n"
+    << "      var acc_d: f32 = o_acc[di];\n"
+    << "      for (var kk: u32 = 0u; kk < BK; kk = kk + 1u) {\n"
+    << "        let p = S_smem[tq * BK + kk];\n"
+    << "        acc_d = acc_d + p * KV_smem[kk * D + d];\n"
+    << "      }\n"
+    << "      o_acc[di] = acc_d;\n"
+    << "    }\n"
+    << "    workgroupBarrier();\n"
+    << "  }\n"
+    << "\n";
+
+  // Final normalize + store. Guard on q_row < Tq for tail tile correctness.
+  s << "  // Normalize by l_i[tq] and write O[q_row, d] for owned d slab.\n"
+    << "  let q_row = q_row_base + tq;\n"
+    << "  if (q_row < Tq) {\n"
+    << "    let inv_l = 1.0 / l_i[tq];\n"
+    << "    for (var di: u32 = 0u; di < DPT; di = di + 1u) {\n"
+    << "      let d = di * BK + tk;\n"
+    << "      output[o_base + q_row * D + d] = " << dtype
+    << "(o_acc[di] * inv_l);\n"
+    << "    }\n"
+    << "  }\n"
+    << "}\n";
+
+  return s.str();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -335,6 +670,11 @@ bool ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream s) {
+  // Runtime kill switch from ?sdpa_fallback=1 (demo A/B). Forces the
+  // decomposed matmul→softmax→matmul path unconditionally.
+  if (wgpu::sdpa_fallback_forced()) {
+    return true;
+  }
   // Training / logsumexp path uses the VJP-friendly decomposed kernel.
   if (is_training || output_logsumexp) {
     return true;
@@ -344,16 +684,13 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
-  // VECTOR path only: Tq == 1. (do_causal is a no-op when Tq == 1, accepted.)
-  int tq = q.shape(-2);
-  if (tq != 1) {
-    return true;
-  }
-
-  // Head dim restriction: D in {64, 96, 128}. Gives us unrolling-friendly
-  // shapes and matches the 128-thread workgroup size (one thread per lane).
+  // Head dim restriction. Vector path (Tq==1): D in {64, 96, 128} so that
+  // one thread == one output lane in the 128-wide workgroup. Tile path
+  // (Tq > 1): additionally accept D == 256 (Qwen3.5-0.8B uses head_dim=256).
+  // D must also be divisible by SDPA_TILE_BK=8 so the tile kernel's
+  // d_per_thread slab math works.
   int d = q.shape(-1);
-  if (d != 64 && d != 96 && d != 128) {
+  if (d != 64 && d != 96 && d != 128 && d != 256) {
     return true;
   }
   if (k.shape(-1) != d || v.shape(-1) != d) {
@@ -374,30 +711,45 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
+  // Tq == 1  -> vector kernel path (decode).
+  // Tq  > 1  -> tile kernel path (prefill), gated on D in {64, 96, 128}.
+  // The vector path at D == 256 is NOT supported: its 128-thread workgroup
+  // allocates one thread per output lane and only covers D <= 128.
+  // The tile path at D == 256 is deferred: the shared memory layout at
+  // D=256 (~25 KiB) is correct but the kernel produces incorrect results,
+  // likely a WGSL code-gen issue with the d_per_thread=32 stride pattern.
+  // TODO: debug and enable D=256 tile path.
+  int tq = q.shape(-2);
+  if (d == 256) {
+    return true;
+  }
+
   // Mask handling:
   //   - No mask -> OK.
+  //   - Causal (has_mask && do_causal && !has_arr_mask) -> OK: the tile
+  //     kernel implements causal masking internally via q_offset. The
+  //     vector kernel handles do_causal via the SdpaParams.has_mask flag.
   //   - Array mask (non-bool) -> OK (we read it as additive float).
   //   - Array mask (bool) -> NOT OK: we say supports_bool_mask() == false,
   //     so fast.cpp will convert it to an additive float mask before reaching
   //     eval_gpu. We still accept has_arr_mask here.
-  //   - Scalar bool mask (has_mask && !has_arr_mask) -> fall back.
-  if (has_mask && !has_arr_mask) {
+  //   - Scalar bool mask (has_mask && !has_arr_mask && !do_causal) -> fall back.
+  if (has_mask && !has_arr_mask && !do_causal) {
     return true;
   }
 
-  // Row-contiguity: the kernel indexes Q/K/V as flat arrays. Non-contig inputs
-  // would need per-dim stride arithmetic which we don't implement yet.
-  if (!q.flags().row_contiguous || !k.flags().row_contiguous ||
-      !v.flags().row_contiguous) {
-    return true;
-  }
-
+  // Row-contiguity: the kernel indexes Q/K/V as flat arrays. Non-contig
+  // inputs (e.g. from transpose views) are made contiguous by eval_gpu's
+  // ensure_contig helper, so we do NOT reject them here. This is important
+  // because the common Qwen3.5 prefill path transposes Q/K/V from
+  // [B, T, H, D] to [B, H, T, D], producing non-contiguous views.
+  //
   // NOTE on mask row-contiguity: fast.cpp broadcasts the incoming mask to
-  // shape [B, H, 1, L], which often produces strided (broadcast) arrays.
-  // The kernel assumes row-contiguous mask layout for the [B, H, 1, L]
-  // shape and indexes it as `mask[(b*H + h)*L + l]`. We cannot check the
-  // mask array here (it's built after use_fallback runs), so eval_gpu makes
-  // the mask contiguous via contiguous_copy_gpu if needed.
+  // shape [B, H, Tq, L], which often produces strided (broadcast) arrays.
+  // The kernel assumes row-contiguous mask layout for that shape and
+  // indexes it as `mask[((b*H + h)*Tq + q_row) * L + k_col]`. We cannot
+  // check the mask array here (it's built after use_fallback runs), so
+  // eval_gpu makes the mask contiguous via contiguous_copy_gpu if needed.
 
   return false;
 }
@@ -450,10 +802,11 @@ void ScaledDotProductAttention::eval_gpu(
   const array& k = inputs[1];
   const array& v = inputs[2];
 
-  // Shapes: Q = [B, H, 1, D], K/V = [B, H_kv, L, D].
+  // Shapes: Q = [B, H, Tq, D], K/V = [B, H_kv, L, D].
   uint32_t B = static_cast<uint32_t>(q.shape(0));
   uint32_t H = static_cast<uint32_t>(q.shape(1));
   uint32_t H_kv = static_cast<uint32_t>(k.shape(1));
+  uint32_t Tq = static_cast<uint32_t>(q.shape(-2));
   uint32_t L = static_cast<uint32_t>(k.shape(-2));
   uint32_t D = static_cast<uint32_t>(q.shape(-1));
 
@@ -481,8 +834,8 @@ void ScaledDotProductAttention::eval_gpu(
   array k_c = ensure_contig(k);
   array v_c = ensure_contig(v);
   // The mask, if present, is usually a broadcast view of a smaller mask
-  // (e.g. [1, 1, 1, L] broadcast to [B, H, 1, L]); make it contiguous so
-  // the kernel can read it with a flat offset.
+  // (e.g. [1, 1, 1, L] broadcast to [B, H, 1, L] or [B, H, Tq, L]); make
+  // it contiguous so the kernel can read it with a flat offset.
   std::optional<array> mask_c_opt;
   if (has_mask) {
     mask_c_opt = ensure_contig(inputs[3]);
@@ -511,21 +864,123 @@ void ScaledDotProductAttention::eval_gpu(
   const char* dtype_wgsl = wgpu::dtype_to_wgsl_safe(q.dtype());
   std::string dtype(dtype_wgsl);
 
-  bool use_sg = dev.has_subgroups();
-  std::string sg_suffix = use_sg ? "_sg" : "";
+  // Branch on Tq: vector (Tq==1) vs tile (Tq>1).
+  if (Tq == 1) {
+    // ---------------- Vector kernel path (decode, Tq==1) ----------------
+    bool use_sg = dev.has_subgroups();
+    std::string sg_suffix = use_sg ? "_sg" : "";
+    std::string mask_suffix = has_mask ? "_m" : "";
+    std::string entry_name = std::string("sdpa_v_") + dtype + "_D" +
+        std::to_string(D) + mask_suffix + sg_suffix;
+
+    WGPUShaderModule shader = dev.get_or_create_shader_module(
+        entry_name, [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+          // First-dispatch log — the shader-module cache only invokes this
+          // lambda on a MISS, so each unique entry_name prints exactly once.
+          std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
+          return make_sdpa_vector_kernel(
+              entry_name, dtype, D, has_mask, use_sg);
+        });
+    auto pe =
+        dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
+
+    // Register inputs/outputs with the encoder for bookkeeping.
+    encoder.set_input_array(q_c);
+    encoder.set_input_array(k_c);
+    encoder.set_input_array(v_c);
+    if (has_mask) {
+      encoder.set_input_array(*mask_c_opt);
+    }
+    encoder.set_output_array(out);
+
+    // Populate uniform buffer.
+    SdpaParams params{};
+    params.B = B;
+    params.H = H;
+    params.H_kv = H_kv;
+    params.L = L;
+    params.D = D;
+    params.has_mask = has_mask ? 1u : 0u;
+    params.gqa_factor = gqa_factor;
+    params.scale = scale_;
+
+    auto& pool = dev.uniform_pool();
+    WGPUBuffer uniform_buf =
+        pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaParams));
+
+    // Build bind group.
+    WGPUBuffer q_buf = wgpu::wgpu_buffer(q_c);
+    WGPUBuffer k_buf = wgpu::wgpu_buffer(k_c);
+    WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
+    WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+
+    std::vector<std::pair<WGPUBuffer, uint64_t>> bg_entries;
+    bg_entries.reserve(has_mask ? 6 : 5);
+    bg_entries.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
+    bg_entries.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
+    bg_entries.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+    if (has_mask) {
+      WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
+      bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+    }
+    bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+    bg_entries.emplace_back(uniform_buf, sizeof(SdpaParams));
+
+    WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
+
+    // One workgroup per (batch, head).
+    encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
+
+    wgpuBindGroupRelease(bg);
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
+    return;
+  }
+
+  // ---------------- Tile kernel path (prefill, Tq>1) ----------------
+  // Shared-memory budget: at BQ=16, BK=8 the kernel needs
+  //   Q_smem : BQ*D*4  = 64*D  bytes
+  //   KV_smem: BK*D*4  = 32*D  bytes
+  //   S_smem : BQ*BK*4 = 512   bytes
+  //   m_i/l_i/rescale: 3 * BQ * 4 = 192 bytes
+  // At D=256 that's 96*256 + 512 + 192 = 25280 bytes (~25 KiB).
+  // Chromium's default maxComputeWorkgroupStorageSize on M3 is 32 KiB;
+  // WebGPU minimum is 16 KiB. D in {64, 96, 128} fit comfortably in
+  // 16 KiB. D=256 needs ~25 KiB, which exceeds the 16 KiB minimum but
+  // fits Chromium's 32 KiB — use ?sdpa_fallback=1 on tighter devices.
+  //
+  // NOTE: We intentionally do NOT query wgpuDeviceGetLimits here. The
+  // WGPULimits struct contains uint64_t fields that have 8-byte alignment
+  // in WASM32, introducing padding that the JS-side bridge does not
+  // account for. This causes maxComputeWorkgroupStorageSize to read as
+  // garbage. Since use_fallback already constrains D to {64,96,128,256},
+  // all of which fit Chromium's 32 KiB, the static gate is sufficient.
+
+  // Causal offset: Tq query rows are the LAST Tq rows of a length-L sequence,
+  // so the first q row's absolute index is (L - Tq). The tile kernel guards
+  // `k_col > q_row + q_offset`.
+  uint32_t q_offset = (L >= Tq) ? (L - Tq) : 0u;
+  bool do_causal = do_causal_;
+
   std::string mask_suffix = has_mask ? "_m" : "";
-  std::string entry_name = std::string("sdpa_v_") + dtype + "_D" +
-      std::to_string(D) + mask_suffix + sg_suffix;
+  std::string causal_suffix = do_causal ? "_c" : "";
+  std::string entry_name = std::string("sdpa_tile_") + dtype + "_D" +
+      std::to_string(D) + mask_suffix + causal_suffix;
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name, [&]() {
-        return make_sdpa_vector_kernel(
-            entry_name, dtype, D, has_mask, use_sg);
+#ifdef MLX_WGPU_LOG_KERNELS
+        std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
+        return make_sdpa_tile_kernel(
+            entry_name, dtype, D, has_mask, do_causal);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
-  // Register inputs/outputs with the encoder for bookkeeping.
   encoder.set_input_array(q_c);
   encoder.set_input_array(k_c);
   encoder.set_input_array(v_c);
@@ -534,22 +989,24 @@ void ScaledDotProductAttention::eval_gpu(
   }
   encoder.set_output_array(out);
 
-  // Populate uniform buffer.
-  SdpaParams params{};
+  SdpaTileParams params{};
   params.B = B;
   params.H = H;
   params.H_kv = H_kv;
   params.L = L;
+  params.Tq = Tq;
   params.D = D;
   params.has_mask = has_mask ? 1u : 0u;
+  params.do_causal = do_causal ? 1u : 0u;
   params.gqa_factor = gqa_factor;
+  params.q_offset = q_offset;
   params.scale = scale_;
+  params.pad = 0u;
 
   auto& pool = dev.uniform_pool();
   WGPUBuffer uniform_buf =
-      pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaParams));
+      pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaTileParams));
 
-  // Build bind group.
   WGPUBuffer q_buf = wgpu::wgpu_buffer(q_c);
   WGPUBuffer k_buf = wgpu::wgpu_buffer(k_c);
   WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
@@ -565,12 +1022,13 @@ void ScaledDotProductAttention::eval_gpu(
     bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
   }
   bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
-  bg_entries.emplace_back(uniform_buf, sizeof(SdpaParams));
+  bg_entries.emplace_back(uniform_buf, sizeof(SdpaTileParams));
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
 
-  // One workgroup per (batch, head).
-  encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
+  // Dispatch grid: (qTiles, H, B). qTiles = ceil(Tq / BQ).
+  uint32_t qTiles = (Tq + SDPA_TILE_BQ - 1u) / SDPA_TILE_BQ;
+  encoder.dispatch_compute(pe.pipeline, bg, qTiles, H, B);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
