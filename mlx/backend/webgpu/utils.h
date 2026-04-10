@@ -52,6 +52,39 @@ inline size_t wgpu_packed_alloc_size(const array& arr) {
   return ((arr.size() + 1) / 2) * 4;
 }
 
+// Shared WGSL MatmulParams struct definition. Must match the C++ MatmulParams
+// layout in matmul.cpp (96 bytes, vec4<u32> fields at 16-byte-aligned offsets).
+inline std::string wgsl_matmul_params_struct() {
+  return std::string(
+      "struct MatmulParams {\n"
+      "  M: u32, N: u32, K: u32,\n"
+      "  lda: u32, ldb: u32, ldc: u32,\n"
+      "  batch_size: u32,\n"
+      "  batch_ndim: u32,\n"
+      "  batch_shape: vec4<u32>,\n"
+      "  batch_stride_a: vec4<u32>,\n"
+      "  batch_stride_b: vec4<u32>,\n"
+      "  batch_stride_c: u32,\n"
+      "  offset_a: u32, offset_b: u32,\n"
+      "  _pad: u32,\n"
+      "}\n\n"
+      // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
+      "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, "
+      "a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
+      "  var loc_a: u32 = 0u;\n"
+      "  var loc_b: u32 = 0u;\n"
+      "  var e = elem;\n"
+      "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
+      "    let s = shape[i];\n"
+      "    let pos = e % s;\n"
+      "    e = e / s;\n"
+      "    loc_a = loc_a + pos * a_strides[i];\n"
+      "    loc_b = loc_b + pos * b_strides[i];\n"
+      "  }\n"
+      "  return vec2<u32>(loc_a, loc_b);\n"
+      "}\n\n");
+}
+
 // Shared WGSL helper used by every kernel that reads packed-bf16 storage.
 // Two bf16 values are stored in a u32 as `lo | (hi << 16)`; each bf16 is the
 // upper 16 bits of an f32, so reconstruction is a left-shift + bitcast.

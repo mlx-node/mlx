@@ -35,6 +35,9 @@ constexpr uint32_t GEMV_WORKGROUP_SIZE = 256;
 // Uniform buffer params
 // ---------------------------------------------------------------------------
 
+// Layout must match the WGSL struct emitted by wgsl_matmul_params_struct().
+// vec4<u32> fields require 16-byte alignment in WGSL uniform buffers; the
+// first vec4 (batch_shape) starts at offset 32 which satisfies this.
 struct MatmulParams {
   uint32_t M;
   uint32_t N;
@@ -52,6 +55,7 @@ struct MatmulParams {
   uint32_t offset_b;
   uint32_t _pad;                // pad to multiple of 16 bytes
 };
+static_assert(sizeof(MatmulParams) == 96, "MatmulParams must be 96 bytes to match WGSL layout");
 
 // ---------------------------------------------------------------------------
 // WGSL GEMV kernel generation (split-K)
@@ -99,33 +103,7 @@ std::string make_gemv_kernel(
   s << "const WG_SIZE: u32 = 256u;\n"
     << "const GRID_X: u32 = 65535u;\n\n";
 
-  s << "struct MatmulParams {\n"
-    << "  M: u32, N: u32, K: u32,\n"
-    << "  lda: u32, ldb: u32, ldc: u32,\n"
-    << "  batch_size: u32,\n"
-    << "  batch_ndim: u32,\n"
-    << "  batch_shape: vec4<u32>,\n"
-    << "  batch_stride_a: vec4<u32>,\n"
-    << "  batch_stride_b: vec4<u32>,\n"
-    << "  batch_stride_c: u32,\n"
-    << "  offset_a: u32, offset_b: u32,\n"
-    << "  _pad: u32,\n"
-    << "}\n\n";
-
-  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
-  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
-    << "  var loc_a: u32 = 0u;\n"
-    << "  var loc_b: u32 = 0u;\n"
-    << "  var e = elem;\n"
-    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
-    << "    let s = shape[i];\n"
-    << "    let pos = e % s;\n"
-    << "    e = e / s;\n"
-    << "    loc_a = loc_a + pos * a_strides[i];\n"
-    << "    loc_b = loc_b + pos * b_strides[i];\n"
-    << "  }\n"
-    << "  return vec2<u32>(loc_a, loc_b);\n"
-    << "}\n\n";
+  s << wgpu::wgsl_matmul_params_struct();
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
   if (b_packed_bf16) {
@@ -281,33 +259,7 @@ std::string make_gemv_multi_col_kernel(
     << "const COLS_PER_WG: u32 = " << cols_per_wg << "u;\n"
     << "const GRID_X: u32 = 65535u;\n\n";
 
-  s << "struct MatmulParams {\n"
-    << "  M: u32, N: u32, K: u32,\n"
-    << "  lda: u32, ldb: u32, ldc: u32,\n"
-    << "  batch_size: u32,\n"
-    << "  batch_ndim: u32,\n"
-    << "  batch_shape: vec4<u32>,\n"
-    << "  batch_stride_a: vec4<u32>,\n"
-    << "  batch_stride_b: vec4<u32>,\n"
-    << "  batch_stride_c: u32,\n"
-    << "  offset_a: u32, offset_b: u32,\n"
-    << "  _pad: u32,\n"
-    << "}\n\n";
-
-  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
-  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
-    << "  var loc_a: u32 = 0u;\n"
-    << "  var loc_b: u32 = 0u;\n"
-    << "  var e = elem;\n"
-    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
-    << "    let s = shape[i];\n"
-    << "    let pos = e % s;\n"
-    << "    e = e / s;\n"
-    << "    loc_a = loc_a + pos * a_strides[i];\n"
-    << "    loc_b = loc_b + pos * b_strides[i];\n"
-    << "  }\n"
-    << "  return vec2<u32>(loc_a, loc_b);\n"
-    << "}\n\n";
+  s << wgpu::wgsl_matmul_params_struct();
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
   if (b_packed_bf16) {
@@ -544,33 +496,7 @@ std::string make_gemm_kernel(
 
   s << "const TILE_SIZE: u32 = 16u;\n\n";
 
-  s << "struct MatmulParams {\n"
-    << "  M: u32, N: u32, K: u32,\n"
-    << "  lda: u32, ldb: u32, ldc: u32,\n"
-    << "  batch_size: u32,\n"
-    << "  batch_ndim: u32,\n"
-    << "  batch_shape: vec4<u32>,\n"
-    << "  batch_stride_a: vec4<u32>,\n"
-    << "  batch_stride_b: vec4<u32>,\n"
-    << "  batch_stride_c: u32,\n"
-    << "  offset_a: u32, offset_b: u32,\n"
-    << "  _pad: u32,\n"
-    << "}\n\n";
-
-  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
-  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
-    << "  var loc_a: u32 = 0u;\n"
-    << "  var loc_b: u32 = 0u;\n"
-    << "  var e = elem;\n"
-    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
-    << "    let s = shape[i];\n"
-    << "    let pos = e % s;\n"
-    << "    e = e / s;\n"
-    << "    loc_a = loc_a + pos * a_strides[i];\n"
-    << "    loc_b = loc_b + pos * b_strides[i];\n"
-    << "  }\n"
-    << "  return vec2<u32>(loc_a, loc_b);\n"
-    << "}\n\n";
+  s << wgpu::wgsl_matmul_params_struct();
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
   if (b_packed_bf16) {
@@ -850,9 +776,10 @@ static void dispatch_matmul(
   params.ldb = ldb;
   params.ldc = N; // output is always row-major
   params.batch_size = batch_count;
-  assert(
-      batch_shape.size() <= 4 &&
-      "WebGPU matmul: batch_ndim > 4 would overflow vec4 uniform fields");
+  if (batch_shape.size() > 4) {
+    throw std::runtime_error(
+        "[WebGPU matmul] batch_ndim > 4 exceeds vec4 uniform field capacity");
+  }
   params.batch_ndim = static_cast<uint32_t>(batch_shape.size());
   // Zero-init arrays, then fill from the vectors
   std::memset(params.batch_shape, 0, sizeof(params.batch_shape));
