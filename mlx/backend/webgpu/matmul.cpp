@@ -12,6 +12,7 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -42,11 +43,14 @@ struct MatmulParams {
   uint32_t ldb;
   uint32_t ldc;
   uint32_t batch_size;
-  uint32_t batch_stride_a;
-  uint32_t batch_stride_b;
-  uint32_t batch_stride_c;
+  uint32_t batch_ndim;
+  uint32_t batch_shape[4];      // maps to vec4<u32> in WGSL
+  uint32_t batch_stride_a[4];   // maps to vec4<u32> in WGSL
+  uint32_t batch_stride_b[4];   // maps to vec4<u32> in WGSL
+  uint32_t batch_stride_c;      // output is always contiguous
   uint32_t offset_a;
   uint32_t offset_b;
+  uint32_t _pad;                // pad to multiple of 16 bytes
 };
 
 // ---------------------------------------------------------------------------
@@ -99,8 +103,28 @@ std::string make_gemv_kernel(
     << "  M: u32, N: u32, K: u32,\n"
     << "  lda: u32, ldb: u32, ldc: u32,\n"
     << "  batch_size: u32,\n"
-    << "  batch_stride_a: u32, batch_stride_b: u32, batch_stride_c: u32,\n"
+    << "  batch_ndim: u32,\n"
+    << "  batch_shape: vec4<u32>,\n"
+    << "  batch_stride_a: vec4<u32>,\n"
+    << "  batch_stride_b: vec4<u32>,\n"
+    << "  batch_stride_c: u32,\n"
     << "  offset_a: u32, offset_b: u32,\n"
+    << "  _pad: u32,\n"
+    << "}\n\n";
+
+  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
+  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
+    << "  var loc_a: u32 = 0u;\n"
+    << "  var loc_b: u32 = 0u;\n"
+    << "  var e = elem;\n"
+    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
+    << "    let s = shape[i];\n"
+    << "    let pos = e % s;\n"
+    << "    e = e / s;\n"
+    << "    loc_a = loc_a + pos * a_strides[i];\n"
+    << "    loc_b = loc_b + pos * b_strides[i];\n"
+    << "  }\n"
+    << "  return vec2<u32>(loc_a, loc_b);\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
@@ -139,8 +163,9 @@ std::string make_gemv_kernel(
     << "  let row = output_idx / N;\n"
     << "  let col = output_idx % N;\n"
     << "  let tid = lid.x;\n"
-    << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
-    << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
+    << "  let batch_locs = elem_to_loc_broadcast(batch, params.batch_ndim, params.batch_shape, params.batch_stride_a, params.batch_stride_b);\n"
+    << "  let a_base = batch_locs.x + params.offset_a;\n"
+    << "  let b_base = batch_locs.y + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
     << "  var acc: f32 = 0.0;\n";
 
@@ -260,8 +285,28 @@ std::string make_gemv_multi_col_kernel(
     << "  M: u32, N: u32, K: u32,\n"
     << "  lda: u32, ldb: u32, ldc: u32,\n"
     << "  batch_size: u32,\n"
-    << "  batch_stride_a: u32, batch_stride_b: u32, batch_stride_c: u32,\n"
+    << "  batch_ndim: u32,\n"
+    << "  batch_shape: vec4<u32>,\n"
+    << "  batch_stride_a: vec4<u32>,\n"
+    << "  batch_stride_b: vec4<u32>,\n"
+    << "  batch_stride_c: u32,\n"
     << "  offset_a: u32, offset_b: u32,\n"
+    << "  _pad: u32,\n"
+    << "}\n\n";
+
+  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
+  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
+    << "  var loc_a: u32 = 0u;\n"
+    << "  var loc_b: u32 = 0u;\n"
+    << "  var e = elem;\n"
+    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
+    << "    let s = shape[i];\n"
+    << "    let pos = e % s;\n"
+    << "    e = e / s;\n"
+    << "    loc_a = loc_a + pos * a_strides[i];\n"
+    << "    loc_b = loc_b + pos * b_strides[i];\n"
+    << "  }\n"
+    << "  return vec2<u32>(loc_a, loc_b);\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
@@ -315,8 +360,9 @@ std::string make_gemv_multi_col_kernel(
   }
 
   s << "  let tid = lid.x;\n"
-    << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
-    << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
+    << "  let batch_locs = elem_to_loc_broadcast(batch, params.batch_ndim, params.batch_shape, params.batch_stride_a, params.batch_stride_b);\n"
+    << "  let a_base = batch_locs.x + params.offset_a;\n"
+    << "  let b_base = batch_locs.y + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n";
 
   // Accumulators
@@ -502,8 +548,28 @@ std::string make_gemm_kernel(
     << "  M: u32, N: u32, K: u32,\n"
     << "  lda: u32, ldb: u32, ldc: u32,\n"
     << "  batch_size: u32,\n"
-    << "  batch_stride_a: u32, batch_stride_b: u32, batch_stride_c: u32,\n"
+    << "  batch_ndim: u32,\n"
+    << "  batch_shape: vec4<u32>,\n"
+    << "  batch_stride_a: vec4<u32>,\n"
+    << "  batch_stride_b: vec4<u32>,\n"
+    << "  batch_stride_c: u32,\n"
     << "  offset_a: u32, offset_b: u32,\n"
+    << "  _pad: u32,\n"
+    << "}\n\n";
+
+  // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
+  s << "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
+    << "  var loc_a: u32 = 0u;\n"
+    << "  var loc_b: u32 = 0u;\n"
+    << "  var e = elem;\n"
+    << "  for (var i: i32 = i32(ndim) - 1; i >= 0; i = i - 1) {\n"
+    << "    let s = shape[i];\n"
+    << "    let pos = e % s;\n"
+    << "    e = e / s;\n"
+    << "    loc_a = loc_a + pos * a_strides[i];\n"
+    << "    loc_b = loc_b + pos * b_strides[i];\n"
+    << "  }\n"
+    << "  return vec2<u32>(loc_a, loc_b);\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
@@ -539,8 +605,9 @@ std::string make_gemm_kernel(
     << "  let local_col = lid.x;\n"
     << "  let global_row = wid.y * TILE_SIZE + local_row;\n"
     << "  let global_col = wid.x * TILE_SIZE + local_col;\n"
-    << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
-    << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
+    << "  let batch_locs = elem_to_loc_broadcast(batch, params.batch_ndim, params.batch_shape, params.batch_stride_a, params.batch_stride_b);\n"
+    << "  let a_base = batch_locs.x + params.offset_a;\n"
+    << "  let b_base = batch_locs.y + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
     << "  var acc: f32 = 0.0;\n"
     << "  let num_tiles = (K + TILE_SIZE - 1u) / TILE_SIZE;\n"
@@ -668,8 +735,9 @@ static void dispatch_matmul(
     bool b_transposed,
     uint32_t ldb,
     uint32_t batch_count,
-    uint32_t batch_stride_a,
-    uint32_t batch_stride_b,
+    const Shape& batch_shape,
+    const Strides& a_batch_strides,
+    const Strides& b_batch_strides,
     uint32_t batch_stride_c,
     const Stream& s) {
   auto& dev = wgpu::device();
@@ -782,8 +850,16 @@ static void dispatch_matmul(
   params.ldb = ldb;
   params.ldc = N; // output is always row-major
   params.batch_size = batch_count;
-  params.batch_stride_a = batch_stride_a;
-  params.batch_stride_b = batch_stride_b;
+  params.batch_ndim = static_cast<uint32_t>(batch_shape.size());
+  // Zero-init arrays, then fill from the vectors
+  std::memset(params.batch_shape, 0, sizeof(params.batch_shape));
+  std::memset(params.batch_stride_a, 0, sizeof(params.batch_stride_a));
+  std::memset(params.batch_stride_b, 0, sizeof(params.batch_stride_b));
+  for (size_t i = 0; i < batch_shape.size() && i < 4; ++i) {
+    params.batch_shape[i] = static_cast<uint32_t>(batch_shape[i]);
+    params.batch_stride_a[i] = static_cast<uint32_t>(a_batch_strides[i]);
+    params.batch_stride_b[i] = static_cast<uint32_t>(b_batch_strides[i]);
+  }
   params.batch_stride_c = batch_stride_c;
   params.offset_a = static_cast<uint32_t>(a.offset() / a.itemsize());
   // For packed-bf16 B buffers the shader indexes array<u32>, so the offset
@@ -873,17 +949,14 @@ void matmul_dispatch(
     batch_shape = {1};
   }
 
-  uint32_t batch_stride_a =
-      static_cast<uint32_t>(a_batch_strides.back());
-  uint32_t batch_stride_b =
-      static_cast<uint32_t>(b_batch_strides.back());
   uint32_t batch_stride_c = M * N;
 
   // Use GEMV for M=1 or N=1 cases
   MatmulKind kind = (M == 1 || N == 1) ? MatmulKind::GEMV : MatmulKind::GEMM;
   dispatch_matmul(
       kind, a, b, out, M, N, K, a_transposed, lda, b_transposed, ldb,
-      batch_count, batch_stride_a, batch_stride_b, batch_stride_c, s);
+      batch_count, batch_shape, a_batch_strides, b_batch_strides,
+      batch_stride_c, s);
 }
 
 } // namespace
