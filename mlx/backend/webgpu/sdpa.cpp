@@ -288,19 +288,35 @@ std::string make_sdpa_vector_kernel(
     << "    thread_sum = thread_sum + weight;\n"
     << "    workgroupBarrier();\n"
     << "\n"
-    << "    // Step 2: V accumulation for D_PER_THREAD output lanes per thread.\n"
-    << "    var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
-    << "    if (chunk_end > L) { chunk_end = L; }\n"
-    << "    for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
-    << "         l_inner = l_inner + 1u) {\n"
-    << "      let w_val = shared_red[l_inner - chunk_start];\n"
-    << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
-    << "        let d = tid + dd * WORKGROUP_SIZE;\n"
-    << "        if (d < D) {\n"
-    << "          o_acc[dd] = o_acc[dd] + w_val * f32(v[kv_base + l_inner * D + d]);\n"
-    << "        }\n"
-    << "      }\n"
-    << "    }\n"
+    << "    // Step 2: V accumulation for D_PER_THREAD output lanes per thread.\n";
+  if (d_per_thread == 1) {
+    // D <= WG_SIZE: each thread owns at most one lane. Hoist the guard
+    // outside the l_inner loop so threads with tid >= D skip entirely.
+    s << "    if (tid < D) {\n"
+      << "      var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
+      << "      if (chunk_end > L) { chunk_end = L; }\n"
+      << "      for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
+      << "           l_inner = l_inner + 1u) {\n"
+      << "        let w_val = shared_red[l_inner - chunk_start];\n"
+      << "        o_acc[0] = o_acc[0] + w_val * f32(v[kv_base + l_inner * D + tid]);\n"
+      << "      }\n"
+      << "    }\n";
+  } else {
+    // D > WG_SIZE: each thread owns multiple lanes. Guard inside the dd loop.
+    s << "    var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
+      << "    if (chunk_end > L) { chunk_end = L; }\n"
+      << "    for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
+      << "         l_inner = l_inner + 1u) {\n"
+      << "      let w_val = shared_red[l_inner - chunk_start];\n"
+      << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+      << "        let d = tid + dd * WORKGROUP_SIZE;\n"
+      << "        if (d < D) {\n"
+      << "          o_acc[dd] = o_acc[dd] + w_val * f32(v[kv_base + l_inner * D + d]);\n"
+      << "        }\n"
+      << "      }\n"
+      << "    }\n";
+  }
+  s
     << "    workgroupBarrier();\n"
     << "  }\n"
     << "\n";
