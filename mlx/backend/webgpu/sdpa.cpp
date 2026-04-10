@@ -712,15 +712,13 @@ bool ScaledDotProductAttention::use_fallback(
   }
 
   // Tq == 1  -> vector kernel path (decode).
-  // Tq  > 1  -> tile kernel path (prefill), gated on D in {64, 96, 128}.
+  // Tq  > 1  -> tile kernel path (prefill).
   // The vector path at D == 256 is NOT supported: its 128-thread workgroup
   // allocates one thread per output lane and only covers D <= 128.
-  // The tile path at D == 256 is deferred: the shared memory layout at
-  // D=256 (~25 KiB) is correct but the kernel produces incorrect results,
-  // likely a WGSL code-gen issue with the d_per_thread=32 stride pattern.
-  // TODO: debug and enable D=256 tile path.
+  // The tile path at D == 256 (~25 KiB shared memory) is supported on
+  // Chromium's 32 KiB default; use ?sdpa_fallback=1 on tighter devices.
   int tq = q.shape(-2);
-  if (d == 256) {
+  if (d == 256 && tq == 1) {
     return true;
   }
 
