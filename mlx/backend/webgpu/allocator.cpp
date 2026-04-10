@@ -1,12 +1,15 @@
 // Copyright 2026 Apple Inc.
 
 #include "mlx/backend/webgpu/allocator.h"
+#include "mlx/array.h"
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
+#include "mlx/dtype.h"
 #include "mlx/memory.h"
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <cstring>
@@ -16,6 +19,69 @@
 namespace mlx::core {
 
 namespace wgpu {
+
+// Runtime opt-in for packed-bf16 storage. Browser has no env vars, so this
+// is plumbed from the TS init message via a FFI call.
+static std::atomic<bool> g_packed_bf16_enabled{false};
+
+void set_packed_bf16_enabled(bool enabled) {
+  g_packed_bf16_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool packed_bf16_enabled() {
+  return g_packed_bf16_enabled.load(std::memory_order_relaxed);
+}
+
+// Flip the storage mode of an upload-pending bf16 array to PackedBf16 when
+// eligible (bf16 dtype, size >= threshold, packed_bf16_enabled() is true,
+// and the buffer is still in "upload-pending" state). Called from the Rust
+// `fromBfloat16Bytes` constructor immediately after the array is created
+// (via the FFI bridge in mlx_array_ops.cpp), so the first wgpu_buffer() call
+// uploads via the packed path. A no-op if any precondition fails — safe to
+// call unconditionally from a constructor.
+bool try_opt_in_packed_bf16(array& arr, size_t min_elements) {
+  if (!packed_bf16_enabled()) {
+    return false;
+  }
+  if (arr.dtype() != bfloat16) {
+    return false;
+  }
+  if (arr.size() < min_elements) {
+    return false;
+  }
+  auto* wbuf = static_cast<WebGPUBuffer*>(arr.buffer().ptr());
+  if (!wbuf) {
+    return false;
+  }
+  // Only flip on buffers that are still in "upload-pending" state — never
+  // touch a buffer that has already been used as a GPU compute input/output.
+  if (wbuf->gpu_has_data) {
+    return false;
+  }
+  if (!wbuf->cpu_dirty && !wbuf->cpu_ptr) {
+    return false;
+  }
+  wbuf->storage_mode = StorageMode::PackedBf16;
+  return true;
+}
+
+// Unconditionally mark a buffer as PackedBf16 storage. Used by the JS-side
+// weight upload path in gpu-worker.ts, which has already packed the bf16
+// data into u32 slots by the time it reaches the import call. The caller is
+// responsible for making sure the underlying WGPUBuffer contents actually
+// match the packed layout; this only flips the bookkeeping flag so the
+// dispatcher and readback guards behave correctly.
+bool mark_buffer_packed_bf16(array& arr) {
+  if (arr.dtype() != bfloat16) {
+    return false;
+  }
+  auto* wbuf = static_cast<WebGPUBuffer*>(arr.buffer().ptr());
+  if (!wbuf) {
+    return false;
+  }
+  wbuf->storage_mode = StorageMode::PackedBf16;
+  return true;
+}
 
 constexpr size_t page_size = 16384;
 
@@ -33,6 +99,14 @@ Buffer WebGPUAllocator::malloc(size_t size) {
     return Buffer{new WebGPUBuffer{nullptr, 0, nullptr}};
   }
 
+  // Remember the caller's requested (unrounded) byte count. This is the
+  // "logical CPU byte count" we stash on WebGPUBuffer::cpu_bytes so that
+  // wgpu_buffer()'s bf16 sizing and upload_with_conversion()'s pack loop
+  // use the exact number of bytes the caller intends to populate — not the
+  // rounded-up allocation size, which overestimates for types whose GPU
+  // representation is wider than the CPU representation (bf16→f32, bool→u32).
+  const size_t requested_size = size;
+
   // Round up size
   if (size <= 8) {
     size = 8;
@@ -46,13 +120,24 @@ Buffer WebGPUAllocator::malloc(size_t size) {
   std::unique_lock lock(mutex_);
   WebGPUBuffer* buf = buffer_cache_.reuse_from_cache(size);
   if (buf) {
-    // Reset state for reused buffer
+    // Reset state for reused buffer. storage_mode MUST be reset — otherwise
+    // a buffer previously used as PackedBf16 leaks its mode to unrelated
+    // future allocations, corrupting subsequent uploads and readback logic.
     if (buf->cpu_ptr) {
       std::free(buf->cpu_ptr);
       buf->cpu_ptr = nullptr;
     }
+    // Set cpu_bytes to the NEW caller's requested size, not the cache
+    // slot's physical size (which may be larger from cache slack). Without
+    // this, a stale or oversized value would feed back into wgpu_buffer's
+    // `needed` sizing (which uses cpu_bytes for bf16) and
+    // upload_with_conversion's full_n (which packs cpu_bytes/2 elements),
+    // causing uploads to overrun or truncate the buffer.
+    buf->cpu_bytes = requested_size;
     buf->cpu_dirty = false;
     buf->gpu_has_data = false;
+    buf->storage_mode = StorageMode::Upconverted;
+    buf->dtype_val = Dtype::Val::float32;
   }
   if (!buf) {
     // Release cached buffers under memory pressure
@@ -85,6 +170,12 @@ Buffer WebGPUAllocator::malloc(size_t size) {
     }
 
     buf = new WebGPUBuffer{gpu_buf, size, nullptr, false, false};
+    // Record the caller's intended CPU byte count. See comment above in the
+    // cache-reuse branch for rationale. For bf16/bool, the GPU-side element
+    // size (4B) is wider than the CPU-side size (2B/1B) — storing the
+    // unrounded CPU request here keeps wgpu_buffer()'s bf16 sizing and
+    // upload_with_conversion's pack loop consistent with the caller's data.
+    buf->cpu_bytes = requested_size;
     lock.lock();
   }
 
@@ -218,6 +309,15 @@ void* Buffer::raw_ptr() {
     return nullptr;
   }
 
+  // Packed-bf16 buffers are upload-only in Step A. Activation packing (with
+  // an unpack-on-readback path) arrives in Step C; until then, attempting to
+  // read a packed weight buffer back to CPU is a programming error.
+  if (wbuf.storage_mode == wgpu::StorageMode::PackedBf16) {
+    throw std::runtime_error(
+        "[WebGPU] attempted to read packed weight buffer back to CPU; "
+        "this buffer is not readable in Upconverted form");
+  }
+
   // If the GPU buffer has no meaningful data (freshly allocated, never
   // computed on), skip the expensive GPU readback and just allocate
   // CPU memory. The caller (array::init) will write data into this
@@ -230,6 +330,13 @@ void* Buffer::raw_ptr() {
     }
     std::memset(cpu_data, 0, wbuf.size);
     wbuf.cpu_ptr = cpu_data;
+    // NOTE: do NOT touch wbuf.cpu_bytes here. It was set by
+    // WebGPUAllocator::malloc() to the caller's unrounded request size,
+    // which is the correct CPU byte count. wbuf.size is the rounded-up
+    // physical allocation size, and for bf16/bool would overestimate the
+    // logical CPU byte count (e.g. bf16 stores 2B per element on CPU but
+    // the GPU buffer is 4B per element, so setting cpu_bytes = wbuf.size
+    // would double the count). Leave cpu_bytes alone.
     wbuf.cpu_dirty = true;
     return cpu_data;
   }
@@ -354,7 +461,16 @@ void* Buffer::raw_ptr() {
   wgpuBufferDestroy(staging);
   wgpuBufferRelease(staging);
 
-  // Store CPU pointer; GPU buffer remains valid for potential future GPU use
+  // Store CPU pointer; GPU buffer remains valid for potential future GPU use.
+  // NOTE: do NOT overwrite wbuf.cpu_bytes here. For buffers that came through
+  // WebGPUAllocator::malloc(), cpu_bytes already holds the caller's original
+  // unrounded request size (the logical CPU byte count), which is preserved
+  // across GPU upload + readback round-trips. For bf16/bool buffers, setting
+  // cpu_bytes = wbuf.size would overestimate the logical CPU byte count by
+  // 2x/4x (wbuf.size is the wider GPU byte count). For buffers that never
+  // went through malloc() (e.g. imported via mlx_array_from_gpu_buffer),
+  // cpu_bytes stays 0, which makes wgpu_buffer()'s bf16 sizing fall back to
+  // the safe `data_size * wgpu_itemsize` path.
   wbuf.cpu_ptr = cpu_data;
   wbuf.cpu_dirty = false; // Just read from GPU, so CPU is in sync
 

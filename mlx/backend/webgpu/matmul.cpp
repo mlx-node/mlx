@@ -15,6 +15,12 @@
 #include <sstream>
 #include <stdexcept>
 
+#ifdef MLX_WGPU_LOG_KERNELS
+#include <iostream>
+#include <mutex>
+#include <unordered_set>
+#endif
+
 namespace mlx::core {
 
 namespace {
@@ -76,7 +82,8 @@ std::string make_gemv_kernel(
     const std::string& dtype,
     bool a_transposed,
     bool b_transposed,
-    bool use_sg) {
+    bool use_sg,
+    bool b_packed_bf16 = false) {
   std::ostringstream s;
 
   if (use_sg) {
@@ -98,11 +105,20 @@ std::string make_gemv_kernel(
     << "  offset_a: u32, offset_b: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> b: array<" << dtype << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
+  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
+  if (b_packed_bf16) {
+    s << "@group(0) @binding(1) var<storage, read> b: array<u32>;\n";
+  } else {
+    s << "@group(0) @binding(1) var<storage, read> b: array<" << dtype
+      << ">;\n";
+  }
+  s << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
+
+  if (b_packed_bf16) {
+    s << wgpu::wgsl_unpack_bf16_pair();
+  }
 
   // Helper for unrolled / subgroup tree-reduce phase.
   s << "fn sum_op(x: f32, y: f32) -> f32 { return x + y; }\n\n";
@@ -128,25 +144,48 @@ std::string make_gemv_kernel(
     << "  let a_base = batch * params.batch_stride_a + params.offset_a;\n"
     << "  let b_base = batch * params.batch_stride_b + params.offset_b;\n"
     << "  let c_base = batch * params.batch_stride_c;\n"
-    << "  var acc: f32 = 0.0;\n"
-    << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
+    << "  var acc: f32 = 0.0;\n";
 
-  // A indexing: row=m, col=k
-  if (!a_transposed) {
-    s << "    let a_val = a[a_base + row * params.lda + k];\n";
+  if (b_packed_bf16) {
+    // Step A only implements the b_transposed=true (row=N, col=K) hot path:
+    // each row of B lives contiguously in K, so we can stride pairs of bf16
+    // values through array<u32>. Step B will add the non-transposed variant.
+    assert(b_transposed && "packed bf16 GEMV requires b_transposed=true in Step A");
+    s << "  // Packed bf16: each u32 holds 2 consecutive K values of row `col`.\n"
+      << "  let ldb_u32 = params.ldb >> 1u;\n"
+      << "  let b_row_u32 = b_base + col * ldb_u32;\n"
+      << "  let k_pairs = K >> 1u;\n"
+      << "  for (var kp: u32 = tid; kp < k_pairs; kp = kp + WG_SIZE) {\n";
+    if (!a_transposed) {
+      s << "    let a0 = f32(a[a_base + row * params.lda + kp * 2u]);\n"
+        << "    let a1 = f32(a[a_base + row * params.lda + kp * 2u + 1u]);\n";
+    } else {
+      s << "    let a0 = f32(a[a_base + (kp * 2u) * params.lda + row]);\n"
+        << "    let a1 = f32(a[a_base + (kp * 2u + 1u) * params.lda + row]);\n";
+    }
+    s << "    let bpair = unpack_bf16_pair(b[b_row_u32 + kp]);\n"
+      << "    acc = acc + a0 * bpair.x + a1 * bpair.y;\n"
+      << "  }\n";
   } else {
-    s << "    let a_val = a[a_base + k * params.lda + row];\n";
-  }
+    s << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
 
-  // B indexing: row=k, col=n
-  if (!b_transposed) {
-    s << "    let b_val = b[b_base + k * params.ldb + col];\n";
-  } else {
-    s << "    let b_val = b[b_base + col * params.ldb + k];\n";
-  }
+    // A indexing: row=m, col=k
+    if (!a_transposed) {
+      s << "    let a_val = a[a_base + row * params.lda + k];\n";
+    } else {
+      s << "    let a_val = a[a_base + k * params.lda + row];\n";
+    }
 
-  s << "    acc = acc + f32(a_val) * f32(b_val);\n"
-    << "  }\n";
+    // B indexing: row=k, col=n
+    if (!b_transposed) {
+      s << "    let b_val = b[b_base + k * params.ldb + col];\n";
+    } else {
+      s << "    let b_val = b[b_base + col * params.ldb + k];\n";
+    }
+
+    s << "    acc = acc + f32(a_val) * f32(b_val);\n"
+      << "  }\n";
+  }
 
   // Workgroup reduction: subgroup-accelerated or fully unrolled tree.
   if (use_sg) {
@@ -203,7 +242,8 @@ std::string make_gemv_multi_col_kernel(
     bool b_transposed,
     bool use_sg,
     uint32_t cols_per_wg,
-    bool n_aligned) {
+    bool n_aligned,
+    bool b_packed_bf16 = false) {
   std::ostringstream s;
 
   if (use_sg) {
@@ -226,11 +266,20 @@ std::string make_gemv_multi_col_kernel(
     << "  offset_a: u32, offset_b: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> b: array<" << dtype << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
+  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
+  if (b_packed_bf16) {
+    s << "@group(0) @binding(1) var<storage, read> b: array<u32>;\n";
+  } else {
+    s << "@group(0) @binding(1) var<storage, read> b: array<" << dtype
+      << ">;\n";
+  }
+  s << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
+
+  if (b_packed_bf16) {
+    s << wgpu::wgsl_unpack_bf16_pair();
+  }
 
   // cols_per_wg parallel shared arrays so all reductions run in fused barriers.
   for (uint32_t i = 0; i < cols_per_wg; ++i) {
@@ -277,42 +326,80 @@ std::string make_gemv_multi_col_kernel(
     s << "  var acc" << i << ": f32 = 0.0;\n";
   }
 
-  s << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
-
-  if (!a_transposed) {
-    s << "    let a_val = f32(a[a_base + row * params.lda + k]);\n";
-  } else {
-    s << "    let a_val = f32(a[a_base + k * params.lda + row]);\n";
-  }
-
-  if (!b_transposed) {
-    // B row-major (K, N) → b[k*ldb + col]
-    s << "    let b_row = b_base + k * params.ldb;\n";
-    s << "    acc0 = acc0 + a_val * f32(b[b_row + col0]);\n";
+  if (b_packed_bf16) {
+    // Step A: only the b_transposed=true hot path is implemented. Step B will
+    // add a packed non-transposed variant.
+    assert(b_transposed &&
+           "packed bf16 multi-col GEMV requires b_transposed=true in Step A");
+    s << "  // Packed bf16 iterates in K/2 pairs; each u32 load unpacks into\n"
+      << "  // two bf16 values that get broadcast across all cols.\n"
+      << "  let ldb_u32 = params.ldb >> 1u;\n"
+      << "  let k_pairs = K >> 1u;\n"
+      << "  for (var kp: u32 = tid; kp < k_pairs; kp = kp + WG_SIZE) {\n";
+    // Load two consecutive K values of A once and reuse across all cols.
+    if (!a_transposed) {
+      s << "    let a0 = f32(a[a_base + row * params.lda + kp * 2u]);\n"
+        << "    let a1 = f32(a[a_base + row * params.lda + kp * 2u + 1u]);\n";
+    } else {
+      s << "    let a0 = f32(a[a_base + (kp * 2u) * params.lda + row]);\n"
+        << "    let a1 = f32(a[a_base + (kp * 2u + 1u) * params.lda + row]);\n";
+    }
+    s << "    let bp0 = unpack_bf16_pair(b[b_base + col0 * ldb_u32 + kp]);\n"
+      << "    acc0 = acc0 + a0 * bp0.x + a1 * bp0.y;\n";
     for (uint32_t i = 1; i < cols_per_wg; ++i) {
       if (n_aligned) {
-        s << "    acc" << i << " = acc" << i << " + a_val * f32(b[b_row + col"
-          << i << "]);\n";
+        s << "    let bp" << i << " = unpack_bf16_pair(b[b_base + col" << i
+          << " * ldb_u32 + kp]);\n"
+          << "    acc" << i << " = acc" << i << " + a0 * bp" << i
+          << ".x + a1 * bp" << i << ".y;\n";
       } else {
-        s << "    if (has" << i << ") { acc" << i << " = acc" << i
-          << " + a_val * f32(b[b_row + col" << i << "]); }\n";
+        s << "    if (has" << i << ") {\n"
+          << "      let bp" << i << " = unpack_bf16_pair(b[b_base + col" << i
+          << " * ldb_u32 + kp]);\n"
+          << "      acc" << i << " = acc" << i << " + a0 * bp" << i
+          << ".x + a1 * bp" << i << ".y;\n"
+          << "    }\n";
       }
     }
+    s << "  }\n";
   } else {
-    // B transposed (N, K) row-major → b[col*ldb + k]
-    s << "    acc0 = acc0 + a_val * f32(b[b_base + col0 * params.ldb + k]);\n";
-    for (uint32_t i = 1; i < cols_per_wg; ++i) {
-      if (n_aligned) {
-        s << "    acc" << i << " = acc" << i
-          << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]);\n";
-      } else {
-        s << "    if (has" << i << ") { acc" << i << " = acc" << i
-          << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]); }\n";
+    s << "  for (var k: u32 = tid; k < K; k = k + WG_SIZE) {\n";
+
+    if (!a_transposed) {
+      s << "    let a_val = f32(a[a_base + row * params.lda + k]);\n";
+    } else {
+      s << "    let a_val = f32(a[a_base + k * params.lda + row]);\n";
+    }
+
+    if (!b_transposed) {
+      // B row-major (K, N) → b[k*ldb + col]
+      s << "    let b_row = b_base + k * params.ldb;\n";
+      s << "    acc0 = acc0 + a_val * f32(b[b_row + col0]);\n";
+      for (uint32_t i = 1; i < cols_per_wg; ++i) {
+        if (n_aligned) {
+          s << "    acc" << i << " = acc" << i
+            << " + a_val * f32(b[b_row + col" << i << "]);\n";
+        } else {
+          s << "    if (has" << i << ") { acc" << i << " = acc" << i
+            << " + a_val * f32(b[b_row + col" << i << "]); }\n";
+        }
+      }
+    } else {
+      // B transposed (N, K) row-major → b[col*ldb + k]
+      s << "    acc0 = acc0 + a_val * f32(b[b_base + col0 * params.ldb + k]);\n";
+      for (uint32_t i = 1; i < cols_per_wg; ++i) {
+        if (n_aligned) {
+          s << "    acc" << i << " = acc" << i
+            << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]);\n";
+        } else {
+          s << "    if (has" << i << ") { acc" << i << " = acc" << i
+            << " + a_val * f32(b[b_base + col" << i << " * params.ldb + k]); }\n";
+        }
       }
     }
-  }
 
-  s << "  }\n";
+    s << "  }\n";
+  }
 
   // cols_per_wg parallel workgroup reductions, fused into the same barriers.
   if (use_sg) {
@@ -383,12 +470,29 @@ std::string make_gemv_multi_col_kernel(
 // Tiled GEMM with 16x16 tiles, 256 threads per workgroup.
 // Transpose variants: NN, NT, TN, TT.
 // Uses shared memory for A and B tiles, f32 accumulation.
+//
+// Packed bf16 variant (b_packed_bf16=true): B is bound as array<u32> where
+// every u32 holds two adjacent bf16 values along the K dimension. Each tile
+// load reads the appropriate u32 and parity-selects the right half. Required
+// for prefill correctness when the same weight buffer is consumed by GEMM
+// (Tq > 1) and GEMV (Tq == 1) — without this, prefill reads packed bytes as
+// f32 and produces garbage logits (the Step A "garbage prefill" bug).
+//
+// Step A only implements the b_transposed=true path because every Qwen3.5
+// linear projection routes through get_weight_t() → check_transpose() →
+// b_transposed=true. Non-transposed packed B is a Step B concern.
 std::string make_gemm_kernel(
     const std::string& entry_name,
     const std::string& dtype,
     bool a_transposed,
-    bool b_transposed) {
+    bool b_transposed,
+    bool b_packed_bf16 = false) {
   std::ostringstream s;
+
+  if (b_packed_bf16) {
+    assert(b_transposed &&
+           "packed bf16 GEMM requires b_transposed=true in Step A");
+  }
 
   if (dtype == "f16") {
     s << "enable f16;\n\n";
@@ -404,11 +508,20 @@ std::string make_gemm_kernel(
     << "  offset_a: u32, offset_b: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> b: array<" << dtype << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
+  s << "@group(0) @binding(0) var<storage, read> a: array<" << dtype << ">;\n";
+  if (b_packed_bf16) {
+    s << "@group(0) @binding(1) var<storage, read> b: array<u32>;\n";
+  } else {
+    s << "@group(0) @binding(1) var<storage, read> b: array<" << dtype
+      << ">;\n";
+  }
+  s << "@group(0) @binding(2) var<storage, read_write> out: array<" << dtype
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: MatmulParams;\n\n";
+
+  if (b_packed_bf16) {
+    s << wgpu::wgsl_unpack_bf16_pair();
+  }
 
   // Shared memory tiles (f32 for accumulation precision)
   s << "var<workgroup> a_shared: array<array<f32, 16>, 16>;\n"
@@ -464,6 +577,21 @@ std::string make_gemm_kernel(
       << "    let b_col = global_col;\n"
       << "    if (b_row < K && b_col < N) {\n"
       << "      b_shared[local_row][local_col] = f32(b[b_base + b_row * params.ldb + b_col]);\n"
+      << "    } else {\n"
+      << "      b_shared[local_row][local_col] = 0.0;\n"
+      << "    }\n";
+  } else if (b_packed_bf16) {
+    // B is transposed AND packed: each row (col index in matmul terms) of K
+    // bf16 values is stored as K/2 u32 pairs along the K dimension. Index by
+    // u32 unit (ldb_u32 = ldb / 2) and pick the right half by K parity.
+    s << "    let b_k = k_offset + local_row;\n"
+      << "    let b_n = global_col;\n"
+      << "    if (b_k < K && b_n < N) {\n"
+      << "      let ldb_u32 = params.ldb >> 1u;\n"
+      << "      let pair = b[b_base + b_n * ldb_u32 + (b_k >> 1u)];\n"
+      << "      let unpacked = unpack_bf16_pair(pair);\n"
+      << "      let val = select(unpacked.y, unpacked.x, (b_k & 1u) == 0u);\n"
+      << "      b_shared[local_row][local_col] = val;\n"
       << "    } else {\n"
       << "      b_shared[local_row][local_col] = 0.0;\n"
       << "    }\n";
@@ -566,6 +694,26 @@ static void dispatch_matmul(
   // intermediate=4864, vocab=151936 — all divisible by 8).
   const bool n_aligned = use_multi_col && (N % cols_per_wg == 0);
 
+  // Resolve GPU buffers up-front. wgpu_buffer() has the side-effect of
+  // flipping eligible bf16 weight buffers into StorageMode::PackedBf16 on
+  // their first dispatch, so we need the buffer handles before deciding
+  // which kernel variant to pick.
+  WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
+  WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
+  WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+
+  // Packed-bf16 selection: GEMV b_transposed=true hot path is the primary
+  // optimization, but we ALSO need GEMM b_transposed=true to handle packed
+  // weights so prefill (Tq > 1) doesn't read packed bytes as f32 garbage.
+  // Both Qwen3.5 GEMV (decode) and GEMM (prefill) of linear weights land here
+  // via check_transpose. Non-transposed packed B is a Step B concern.
+  auto* b_wbuf = static_cast<const wgpu::WebGPUBuffer*>(b.buffer().ptr());
+  const bool b_packed_bf16 =
+      b_transposed &&
+      b_wbuf != nullptr &&
+      b_wbuf->storage_mode == wgpu::StorageMode::PackedBf16 &&
+      (K % 2u == 0u);
+
   // Build transpose suffix for pipeline key
   std::string trans_suffix;
   trans_suffix += (a_transposed ? "T" : "N");
@@ -579,12 +727,29 @@ static void dispatch_matmul(
       : "gemm_";
   std::string entry_name =
       std::string(prefix) + trans_suffix + "_" + wgsl_type;
+  if (b_packed_bf16) {
+    entry_name += "_bf16p";
+  }
   if (use_sg) {
     entry_name += "_sg";
   }
   if (n_aligned) {
     entry_name += "_al";
   }
+
+#ifdef MLX_WGPU_LOG_KERNELS
+  // First-dispatch log — one line per unique entry_name. Guarded by a
+  // compile-time flag because the mutex + set lookup were measurable hot-path
+  // overhead on wasm (std::mutex is not free in wasi-pthreads).
+  {
+    static std::mutex s_log_mutex;
+    static std::unordered_set<std::string> s_logged;
+    std::lock_guard<std::mutex> g(s_log_mutex);
+    if (s_logged.insert(entry_name).second) {
+      std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+    }
+  }
+#endif
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
@@ -598,11 +763,18 @@ static void dispatch_matmul(
                     b_transposed,
                     use_sg,
                     cols_per_wg,
-                    n_aligned)
+                    n_aligned,
+                    b_packed_bf16)
               : make_gemv_kernel(
-                    entry_name, wgsl_type, a_transposed, b_transposed, use_sg);
+                    entry_name,
+                    wgsl_type,
+                    a_transposed,
+                    b_transposed,
+                    use_sg,
+                    b_packed_bf16);
         }
-        return make_gemm_kernel(entry_name, wgsl_type, a_transposed, b_transposed);
+        return make_gemm_kernel(
+            entry_name, wgsl_type, a_transposed, b_transposed, b_packed_bf16);
       });
 
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -624,16 +796,22 @@ static void dispatch_matmul(
   params.batch_stride_b = batch_stride_b;
   params.batch_stride_c = batch_stride_c;
   params.offset_a = static_cast<uint32_t>(a.offset() / a.itemsize());
-  params.offset_b = static_cast<uint32_t>(b.offset() / b.itemsize());
-
+  // For packed-bf16 B buffers the shader indexes array<u32>, so the offset
+  // must be expressed in u32 units (4 bytes each). array::offset() returns
+  // BYTES, and in packed mode those bytes are stored 2 bf16 per u32 — any
+  // slice must start on a u32 boundary (element index divisible by 2) so
+  // dividing the byte offset by 4 gives the packed u32 index.
+  if (b_packed_bf16) {
+    params.offset_b = static_cast<uint32_t>(b.offset() / 4);
+  } else {
+    params.offset_b = static_cast<uint32_t>(b.offset() / b.itemsize());
+  }
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
       pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(MatmulParams));
 
-  WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
-  WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
-  WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-
+  // a_buf / b_buf / out_buf were already resolved above so the packed-bf16
+  // storage mode is visible before kernel selection.
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
       {{a_buf, wgpuBufferGetSize(a_buf)},

@@ -398,6 +398,14 @@ void flush_all_encoders() {
 
 // Upload CPU data to GPU with format conversion for types where
 // GPU element size differs from CPU (bf16→f32, bool→u32).
+//
+// For bf16 we always upload the WHOLE owning CPU buffer, not just the
+// `data_size` elements of the (possibly sliced) view that triggered the
+// upload. If a view of the second half of a bf16 tensor is the first
+// caller into wgpu_buffer(), uploading only `data_size` elements would
+// leave the actual region the view references unwritten (zeroed), and
+// kernel reads at the view's offset would then read garbage. Using the
+// buffer's `cpu_bytes` guarantees the full owning buffer is uploaded once.
 static void upload_with_conversion(
     WebGPUBuffer* buf,
     Dtype::Val dtype_val,
@@ -405,13 +413,54 @@ static void upload_with_conversion(
   auto queue = device().gpu_queue();
 
   if (dtype_val == Dtype::Val::bfloat16) {
+    // Owning CPU allocation holds `cpu_bytes` bytes of bf16 data
+    // (2 bytes per element). Use this count — not the view's data_size —
+    // so slice-triggered uploads still cover the entire buffer.
+    size_t full_n =
+        buf->cpu_bytes > 0 ? (buf->cpu_bytes / 2) : data_size;
+    if (buf->storage_mode == StorageMode::PackedBf16) {
+      // Pack bf16 pairs into u32 (lo | hi << 16). Odd element counts pad
+      // the trailing slot with a zero — the kernel masks out-of-range loads.
+      size_t n_u32 = (full_n + 1) / 2;
+      size_t byte_size = n_u32 * 4;
+      // Cap to the actual GPU buffer capacity in case rounding pushed it
+      // above wbuf->size (shouldn't happen, but be defensive).
+      if (byte_size > buf->size) {
+        byte_size = buf->size;
+        n_u32 = byte_size / 4;
+      }
+      std::vector<uint32_t> tmp(n_u32, 0u);
+      auto* src = static_cast<const uint8_t*>(buf->cpu_ptr);
+      // The source is a contiguous block of bf16 values. bf16 elements are
+      // 2 bytes each; we copy two at a time into the low / high halves of
+      // each u32. A byte-by-byte path handles non-4B-aligned inputs.
+      size_t n_pack = n_u32 * 2;
+      if (n_pack > full_n) n_pack = full_n;
+      for (size_t i = 0; i < n_pack; ++i) {
+        uint16_t v = static_cast<uint16_t>(src[2 * i]) |
+            (static_cast<uint16_t>(src[2 * i + 1]) << 8);
+        uint32_t& slot = tmp[i >> 1];
+        if ((i & 1u) == 0u) {
+          slot = (slot & 0xFFFF0000u) | static_cast<uint32_t>(v);
+        } else {
+          slot = (slot & 0x0000FFFFu) |
+              (static_cast<uint32_t>(v) << 16);
+        }
+      }
+      wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), byte_size);
+      return;
+    }
     // Expand bf16 (2 bytes) → f32 (4 bytes)
-    std::vector<float> tmp(data_size);
+    size_t n_up = full_n;
+    if (n_up * 4 > buf->size) {
+      n_up = buf->size / 4;
+    }
+    std::vector<float> tmp(n_up);
     auto* src = static_cast<const bfloat16_t*>(buf->cpu_ptr);
-    for (size_t i = 0; i < data_size; i++) {
+    for (size_t i = 0; i < n_up; i++) {
       tmp[i] = static_cast<float>(src[i]);
     }
-    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), data_size * 4);
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), n_up * 4);
   } else if (dtype_val == Dtype::Val::bool_) {
     // Expand bool (1 byte) → u32 (4 bytes)
     std::vector<uint32_t> tmp(data_size);
@@ -436,10 +485,64 @@ WGPUBuffer wgpu_buffer(const array& arr) {
   // Track dtype for download conversion in raw_ptr()
   buf->dtype_val = arr.dtype().val();
 
+  // NOTE: there is deliberately no auto-opt-in to StorageMode::PackedBf16
+  // here. The packed path is only reachable through explicit "weight upload"
+  // entry points that set the storage mode at the buffer's birth:
+  //   * mlx_array_from_bfloat16 — CPU bytes → WebGPUBuffer (test harness)
+  //   * mlx_array_from_gpu_buffer(..., packed_bf16=true) — JS-side packed
+  //     GPU handle import (demo weight-upload path in gpu-worker.ts)
+  // Flipping intermediate/compute bf16 tensors would break readback because
+  // PackedBf16 is upload-only (raw_ptr() throws on packed buffers).
+
   // Ensure GPU buffer is large enough for GPU-side element sizes.
   // Input arrays allocated for CPU types (bf16=2B, bool=1B) may be too small
   // for GPU types (f32=4B, u32=4B). Recreate the buffer if needed.
-  size_t needed = arr.data_size() * wgpu_itemsize(arr.dtype());
+  //
+  // For compute-output buffers (the hot path during decode), the caller
+  // already passes a GPU-sized byte count to allocator::malloc — i.e.
+  // `wgpu_alloc_size(out) = nelements * wgpu_itemsize`. The GPU buffer is
+  // already the right size; `arr.data_size() * wgpu_itemsize()` gives the
+  // exact `needed` and never triggers a recreate. This is the baseline path
+  // and MUST stay cheap (called per matmul per layer per token).
+  //
+  // The slice-safety case (described below) only matters when the buffer
+  // was populated from raw CPU bytes via from_bfloat16_bytes / from_bool —
+  // in that case `cpu_dirty && cpu_ptr` is true and `cpu_bytes` holds the
+  // raw bf16/bool byte count of the owning allocation, which we use to size
+  // the full owning buffer so subsequent slice uploads cover the whole
+  // region.
+  //
+  // Slice-safety rationale: if the first wgpu_buffer() call for an owning
+  // bf16/bool allocation comes from a *slice view*, arr.data_size() reflects
+  // only the view's span. Using that for `needed` would make the GPU buffer
+  // too small for the bf16→f32 (or bool→u32) expansion of the OWNING
+  // allocation, and upload_with_conversion() would silently truncate the
+  // upload — leaving the rest of the buffer uninitialised.
+  size_t needed;
+  if (buf->storage_mode == StorageMode::PackedBf16) {
+    // Packed bf16: 2 bf16 per u32. Source has cpu_bytes/2 bf16 elements
+    // → ((cpu_bytes/2 + 1) / 2) * 4 bytes of u32 storage.
+    if (buf->cpu_bytes > 0) {
+      size_t full_n = buf->cpu_bytes / 2;
+      needed = ((full_n + 1) / 2) * 4;
+    } else {
+      needed = ((arr.size() + 1) / 2) * 4;
+    }
+  } else if (
+      arr.dtype().val() == Dtype::Val::bfloat16 && buf->cpu_bytes > 0 &&
+      buf->cpu_dirty && buf->cpu_ptr) {
+    // Raw bf16 bytes pending upload from CPU: size for the full owning
+    // allocation. cpu_bytes here is the literal bf16 byte count (2B/elem).
+    needed = (buf->cpu_bytes / 2) * 4;
+  } else if (
+      arr.dtype().val() == Dtype::Val::bool_ && buf->cpu_bytes > 0 &&
+      buf->cpu_dirty && buf->cpu_ptr) {
+    // Raw bool bytes pending upload from CPU: size for the full owning
+    // allocation. cpu_bytes here is the literal bool byte count (1B/elem).
+    needed = buf->cpu_bytes * 4;
+  } else {
+    needed = arr.data_size() * wgpu_itemsize(arr.dtype());
+  }
   if (needed > buf->size) {
     if (buf->buffer) {
       wgpuBufferDestroy(buf->buffer);

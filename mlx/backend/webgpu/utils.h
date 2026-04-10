@@ -44,6 +44,26 @@ inline size_t wgpu_alloc_size(const array& arr) {
   return arr.size() * wgpu_itemsize(arr.dtype());
 }
 
+// Return the GPU allocation size for a bf16 array stored in packed form
+// (two bf16 per u32, with odd-size arrays rounded up to the next pair).
+// This intentionally bypasses wgpu_itemsize()/wgpu_alloc_size() — the packed
+// path is opt-in and never touches those helpers.
+inline size_t wgpu_packed_alloc_size(const array& arr) {
+  return ((arr.size() + 1) / 2) * 4;
+}
+
+// Shared WGSL helper used by every kernel that reads packed-bf16 storage.
+// Two bf16 values are stored in a u32 as `lo | (hi << 16)`; each bf16 is the
+// upper 16 bits of an f32, so reconstruction is a left-shift + bitcast.
+inline std::string wgsl_unpack_bf16_pair() {
+  return std::string(
+      "fn unpack_bf16_pair(p: u32) -> vec2<f32> {\n"
+      "  let lo_bits = (p & 0x0000FFFFu) << 16u;\n"
+      "  let hi_bits = p & 0xFFFF0000u;\n"
+      "  return vec2<f32>(bitcast<f32>(lo_bits), bitcast<f32>(hi_bits));\n"
+      "}\n\n");
+}
+
 // Ensure the output array's buffer is large enough for GPU-side element sizes.
 // Call after set_*_output_data() which allocates based on CPU itemsize.
 // For types where GPU elements are larger (bool, bfloat16), this reallocates.
