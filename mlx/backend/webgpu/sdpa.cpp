@@ -765,6 +765,25 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
+  // GPU occupancy gate for the Tq==1 vector kernel.  The fused vector
+  // kernel dispatches exactly B*H workgroups (one per batch×head).  For
+  // small models like Qwen3.5-0.8B (B=1, H=8 → 8 workgroups) this leaves
+  // the GPU severely underutilised.  The decomposed matmul→softmax→matmul
+  // path dispatches 100+ workgroups per GEMV call, saturating the GPU far
+  // better.  Only keep the fused path when there are enough workgroups to
+  // justify the launch.  Tq>1 uses the tile kernel which dispatches
+  // ceil(Tq/BQ)*H workgroups — plenty of parallelism, so skip this check.
+  {
+    int tq = q.shape(-2);
+    if (tq == 1) {
+      int b = q.shape(0);
+      int h = q.shape(1);
+      if (b * h < 32) {
+        return true;
+      }
+    }
+  }
+
   // Row-contiguity: the kernel indexes Q/K/V as flat arrays. Non-contig
   // inputs (e.g. from transpose views) are made contiguous by eval_gpu's
   // ensure_contig helper, so we do NOT reject them here. This is important

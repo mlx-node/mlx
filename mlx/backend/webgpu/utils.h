@@ -68,9 +68,14 @@ inline std::string wgsl_matmul_params_struct() {
       "  offset_a: u32, offset_b: u32,\n"
       "  _pad: u32,\n"
       "}\n\n"
-      // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast)
+      // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast).
+      // Fast path for batch_ndim==1 avoids the loop + division/modulo overhead
+      // that the general path pays on every thread invocation.
       "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, "
       "a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
+      "  if (ndim == 1u) {\n"
+      "    return vec2<u32>(elem * a_strides[0], elem * b_strides[0]);\n"
+      "  }\n"
       "  var loc_a: u32 = 0u;\n"
       "  var loc_b: u32 = 0u;\n"
       "  var e = elem;\n"
