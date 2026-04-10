@@ -21,6 +21,7 @@
 #include "mlx/fast_primitives.h"
 
 #include <cassert>
+#include <iostream>
 #include <sstream>
 
 namespace mlx::core::fast {
@@ -52,7 +53,8 @@ std::string make_rmsnorm_kernel(
     const std::string& in_type,
     const std::string& w_type,
     const std::string& acc_type,
-    bool use_subgroups) {
+    bool use_subgroups,
+    bool w_packed_bf16) {
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -70,12 +72,21 @@ std::string make_rmsnorm_kernel(
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
-    << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> weight: array<" << w_type
-    << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> output: array<"
+    << ">;\n";
+  if (w_packed_bf16) {
+    // Packed bf16: two bf16 values per u32 slot. Kernel unpacks per load.
+    s << "@group(0) @binding(1) var<storage, read> weight: array<u32>;\n";
+  } else {
+    s << "@group(0) @binding(1) var<storage, read> weight: array<" << w_type
+      << ">;\n";
+  }
+  s << "@group(0) @binding(2) var<storage, read_write> output: array<"
     << in_type << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: RMSNormParams;\n\n";
+
+  if (w_packed_bf16) {
+    s << wgpu::wgsl_unpack_bf16_pair();
+  }
 
   s << "var<workgroup> shared_sum: array<" << acc_type
     << ", WORKGROUP_SIZE>;\n\n";
@@ -117,9 +128,21 @@ std::string make_rmsnorm_kernel(
     << "\n"
     << "  // Phase 2: Write output = input * inv_rms * weight\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
-    << "    let w = " << acc_type << "(weight[i * w_stride]);\n"
-    << "    output[row_start + i] = " << in_type
+    << "    let val = " << acc_type << "(input[row_start + i]);\n";
+  if (w_packed_bf16) {
+    // w_stride is 0 (broadcast scalar) or 1 (1D contiguous). The packed
+    // indexing formula works for both: w_stride=0 always reads slot 0's
+    // low half (the broadcast scalar). When w_stride=1 we read element
+    // `i` as `weight[i>>1].{x|y}` depending on parity.
+    s << "    let w_elem_idx = i * w_stride;\n"
+      << "    let w_u32_idx = w_elem_idx >> 1u;\n"
+      << "    let w_parity = w_elem_idx & 1u;\n"
+      << "    let w_pair = unpack_bf16_pair(weight[w_u32_idx]);\n"
+      << "    let w = select(w_pair.y, w_pair.x, w_parity == 0u);\n";
+  } else {
+    s << "    let w = " << acc_type << "(weight[i * w_stride]);\n";
+  }
+  s << "    output[row_start + i] = " << in_type
     << "(val * inv_rms * w);\n"
     << "  }\n"
     << "}\n";
@@ -137,7 +160,9 @@ std::string make_layernorm_kernel(
     const std::string& w_type,
     const std::string& acc_type,
     bool has_bias,
-    bool use_subgroups) {
+    bool use_subgroups,
+    bool w_packed_bf16,
+    bool b_packed_bf16) {
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -158,15 +183,29 @@ std::string make_layernorm_kernel(
   uint32_t binding = 0;
   s << "@group(0) @binding(" << binding++ << ") var<storage, read> input: array<"
     << in_type << ">;\n";
-  s << "@group(0) @binding(" << binding++ << ") var<storage, read> weight: array<"
-    << w_type << ">;\n";
+  if (w_packed_bf16) {
+    s << "@group(0) @binding(" << binding++
+      << ") var<storage, read> weight: array<u32>;\n";
+  } else {
+    s << "@group(0) @binding(" << binding++
+      << ") var<storage, read> weight: array<" << w_type << ">;\n";
+  }
   if (has_bias) {
-    s << "@group(0) @binding(" << binding++ << ") var<storage, read> bias: array<"
-      << w_type << ">;\n";
+    if (b_packed_bf16) {
+      s << "@group(0) @binding(" << binding++
+        << ") var<storage, read> bias: array<u32>;\n";
+    } else {
+      s << "@group(0) @binding(" << binding++
+        << ") var<storage, read> bias: array<" << w_type << ">;\n";
+    }
   }
   s << "@group(0) @binding(" << binding++ << ") var<storage, read_write> output: array<"
     << in_type << ">;\n";
   s << "@group(0) @binding(" << binding++ << ") var<uniform> params: LayerNormParams;\n\n";
+
+  if (w_packed_bf16 || b_packed_bf16) {
+    s << wgpu::wgsl_unpack_bf16_pair();
+  }
 
   // Shared memory for reductions (reused for mean and variance)
   s << "var<workgroup> shared_sum: array<" << acc_type
@@ -238,12 +277,30 @@ std::string make_layernorm_kernel(
   // Phase 3: Output = (x - mean) * inv_std * weight + bias
   s << "  // Phase 3: Output = (x - mean) * inv_std * weight + bias\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = (" << acc_type << "(input[row_start + i]) - mean_val) * inv_std;\n"
-    << "    let w = " << acc_type << "(weight[i * w_stride]);\n";
+    << "    let val = (" << acc_type << "(input[row_start + i]) - mean_val) * inv_std;\n";
+  if (w_packed_bf16) {
+    // w_stride is 0 (broadcast) or 1 (1D contiguous); packed formula
+    // handles both — broadcast always reads slot 0 low half.
+    s << "    let w_elem_idx = i * w_stride;\n"
+      << "    let w_u32_idx = w_elem_idx >> 1u;\n"
+      << "    let w_parity = w_elem_idx & 1u;\n"
+      << "    let w_pair = unpack_bf16_pair(weight[w_u32_idx]);\n"
+      << "    let w = select(w_pair.y, w_pair.x, w_parity == 0u);\n";
+  } else {
+    s << "    let w = " << acc_type << "(weight[i * w_stride]);\n";
+  }
 
   if (has_bias) {
-    s << "    let b = " << acc_type << "(bias[i * w_stride]);\n"
-      << "    output[row_start + i] = " << in_type << "(val * w + b);\n";
+    if (b_packed_bf16) {
+      s << "    let b_elem_idx = i * w_stride;\n"
+        << "    let b_u32_idx = b_elem_idx >> 1u;\n"
+        << "    let b_parity = b_elem_idx & 1u;\n"
+        << "    let b_pair = unpack_bf16_pair(bias[b_u32_idx]);\n"
+        << "    let b = select(b_pair.y, b_pair.x, b_parity == 0u);\n";
+    } else {
+      s << "    let b = " << acc_type << "(bias[i * w_stride]);\n";
+    }
+    s << "    output[row_start + i] = " << in_type << "(val * w + b);\n";
   } else {
     s << "    output[row_start + i] = " << in_type << "(val * w);\n";
   }
@@ -311,14 +368,31 @@ void RMSNorm::eval_gpu(
 
   bool use_sg = dev.has_subgroups();
   std::string sg_suffix = use_sg ? "_sg" : "";
-  std::string entry_name =
-      std::string("rmsnorm_") + in_type + "_w" + w_type + sg_suffix;
+
+  // Detect whether the weight buffer is stored in packed-bf16 layout
+  // (2 bf16 values per u32 slot). The Step C norm-weight allowlist in
+  // gpu-worker.ts can flip 1-D bf16 norm weights into PackedBf16 mode on
+  // first upload — the kernel then binds `weight` as `array<u32>` and
+  // unpacks per element. Safe only when the source dtype is bf16; any
+  // other weight type means the buffer was never packed.
+  auto* w_wbuf = static_cast<const wgpu::WebGPUBuffer*>(w.buffer().ptr());
+  const bool w_packed_bf16 = (w.dtype() == bfloat16) && (w_wbuf != nullptr) &&
+      (w_wbuf->storage_mode == wgpu::StorageMode::PackedBf16);
+
+  std::string packed_suffix = w_packed_bf16 ? "_bf16p" : "";
+  std::string entry_name = std::string("rmsnorm_") + in_type + "_w" + w_type +
+      packed_suffix + sg_suffix;
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+        // First-dispatch log — the shader-module cache only invokes this
+        // lambda on a MISS, so each unique entry_name prints exactly once.
+        std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
         return make_rmsnorm_kernel(
-            entry_name, in_type, w_type, acc_type, use_sg);
+            entry_name, in_type, w_type, acc_type, use_sg, w_packed_bf16);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -420,14 +494,41 @@ void LayerNorm::eval_gpu(
   bool use_sg = dev.has_subgroups();
   std::string sg_suffix = use_sg ? "_sg" : "";
   std::string bias_suffix = has_bias ? "_bias" : "_nobias";
-  std::string entry_name =
-      std::string("layernorm_") + in_type + "_w" + w_type + bias_suffix + sg_suffix;
+
+  // Detect packed-bf16 storage on the weight (and optional bias) buffers.
+  // Matches the RMSNorm::eval_gpu logic — only valid for bf16 source dtype.
+  auto* w_wbuf = static_cast<const wgpu::WebGPUBuffer*>(w.buffer().ptr());
+  const bool w_packed_bf16 = (w.dtype() == bfloat16) && (w_wbuf != nullptr) &&
+      (w_wbuf->storage_mode == wgpu::StorageMode::PackedBf16);
+  bool b_packed_bf16 = false;
+  if (has_bias) {
+    auto* b_wbuf =
+        static_cast<const wgpu::WebGPUBuffer*>(inputs[2].buffer().ptr());
+    b_packed_bf16 = (inputs[2].dtype() == bfloat16) && (b_wbuf != nullptr) &&
+        (b_wbuf->storage_mode == wgpu::StorageMode::PackedBf16);
+  }
+  std::string packed_suffix;
+  if (w_packed_bf16) packed_suffix += "_wbf16p";
+  if (b_packed_bf16) packed_suffix += "_bbf16p";
+
+  std::string entry_name = std::string("layernorm_") + in_type + "_w" +
+      w_type + bias_suffix + packed_suffix + sg_suffix;
 
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
       [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+        std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
         return make_layernorm_kernel(
-            entry_name, in_type, w_type, acc_type, has_bias, use_sg);
+            entry_name,
+            in_type,
+            w_type,
+            acc_type,
+            has_bias,
+            use_sg,
+            w_packed_bf16,
+            b_packed_bf16);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
