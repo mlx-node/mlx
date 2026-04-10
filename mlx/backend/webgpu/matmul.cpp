@@ -850,6 +850,9 @@ static void dispatch_matmul(
   params.ldb = ldb;
   params.ldc = N; // output is always row-major
   params.batch_size = batch_count;
+  assert(
+      batch_shape.size() <= 4 &&
+      "WebGPU matmul: batch_ndim > 4 would overflow vec4 uniform fields");
   params.batch_ndim = static_cast<uint32_t>(batch_shape.size());
   // Zero-init arrays, then fill from the vectors
   std::memset(params.batch_shape, 0, sizeof(params.batch_shape));
