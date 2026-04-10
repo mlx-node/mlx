@@ -23,7 +23,9 @@
 // shared memory and each K column is read exactly twice (once in Phase A,
 // once in Phase B weight compute), dropping K traffic to 2·L·D.
 //
-// - Workgroup size: 128 threads (matches max supported head dim).
+// - Workgroup size: 128 threads. For D ≤ 128 each thread owns one output
+//   lane; for D = 256 each thread owns D_PER_THREAD = 2 lanes via a
+//   strided loop (tid, tid + 128).
 // - One workgroup per (batch * n_heads). Dispatch grid = (B*H, 1, 1).
 // - Head dim D is baked into the WGSL source as a `const`, so loops over D
 //   unroll and the pipeline cache keys by (dtype, D, has_mask, subgroups).
@@ -72,10 +74,10 @@ namespace mlx::core::fast {
 
 namespace {
 
-// SDPA workgroup size: 128 threads. This matches the largest head dim we
-// accept (D = 128), so each thread owns one lane of the output when D == 128.
-// For D = 64 / 96, threads with tid >= D idle during the per-lane Phase B
-// write but still participate in the Phase A reduction.
+// SDPA workgroup size: 128 threads. For D ≤ 128, each thread owns at most
+// one output lane (threads with tid >= D idle during the per-lane Phase B
+// write but still participate in the Phase A reduction). For D = 256, each
+// thread owns D_PER_THREAD = 2 output lanes via a strided loop.
 constexpr uint32_t SDPA_WORKGROUP_SIZE = 128;
 
 // Uniform struct laid out to match the WGSL definition below.
@@ -111,8 +113,13 @@ std::string make_sdpa_vector_kernel(
   }
   s << "\n";
 
+  // D_PER_THREAD: number of output lanes per thread. 1 for D ≤ 128, 2 for
+  // D = 256. Allows the 128-thread workgroup to cover all D output lanes.
+  uint32_t d_per_thread = (D + SDPA_WORKGROUP_SIZE - 1) / SDPA_WORKGROUP_SIZE;
+
   s << "const WORKGROUP_SIZE: u32 = " << SDPA_WORKGROUP_SIZE << "u;\n";
-  s << "const D: u32 = " << D << "u;\n\n";
+  s << "const D: u32 = " << D << "u;\n";
+  s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n\n";
 
   s << "struct SdpaParams {\n"
     << "  B: u32,\n"
@@ -190,10 +197,14 @@ std::string make_sdpa_vector_kernel(
   }
   s << "\n";
 
-  // Phase 0: cache Q into shared memory.
+  // Phase 0: cache Q into shared memory. When D > WORKGROUP_SIZE, each
+  // thread loads D_PER_THREAD elements at stride WORKGROUP_SIZE.
   s << "  // Phase 0: cooperatively cache Q[b, h, 0, :] into shared memory.\n"
-    << "  if (tid < D) {\n"
-    << "    shared_q[tid] = f32(q[q_base + tid]);\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "    if (d < D) {\n"
+    << "      shared_q[d] = f32(q[q_base + d]);\n"
+    << "    }\n"
     << "  }\n"
     << "  workgroupBarrier();\n"
     << "\n";
@@ -245,17 +256,17 @@ std::string make_sdpa_vector_kernel(
   //      l = chunk_start + tid (if in range); otherwise weight = 0.
   //      Cache weights in shared_red[tid] AND add to thread-local
   //      partial sum (thread_sum).
-  //   2. Threads with tid < D read the cached weights and accumulate
-  //      weighted V contributions into o_acc (one output lane per thread).
+  //   2. Each thread accumulates D_PER_THREAD output lanes from V,
+  //      reading shared_red for cached weights.
   //
   // After the loop, reduce thread_sum across the workgroup to get row_sum,
-  // then normalize and write O[d] = o_acc[d] / row_sum.
-  //
-  // Eliminates Phase A-2 (second full K traversal) and the Phase B score
-  // recomputation from the old two-phase variant; total K bandwidth drops
-  // from ~L·D² to ~2·L·D reads per workgroup.
+  // then normalize and write O[d] = o_acc[d] / row_sum. Each thread owns
+  // D_PER_THREAD accumulators for lanes {tid, tid+WG, ..., tid+(DPT-1)*WG}.
   s << "  // Phase B: single-pass chunked weight cache + V accumulation.\n"
-    << "  var o_acc: f32 = 0.0;\n"
+    << "  var o_acc: array<f32, D_PER_THREAD>;\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    o_acc[dd] = 0.0;\n"
+    << "  }\n"
     << "  var thread_sum: f32 = 0.0;\n"
     << "  for (var chunk_start: u32 = 0u; chunk_start < L;\n"
     << "       chunk_start = chunk_start + WORKGROUP_SIZE) {\n"
@@ -277,14 +288,17 @@ std::string make_sdpa_vector_kernel(
     << "    thread_sum = thread_sum + weight;\n"
     << "    workgroupBarrier();\n"
     << "\n"
-    << "    // Step 2: V accumulation for output lanes 0..D-1.\n"
-    << "    if (tid < D) {\n"
-    << "      var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
-    << "      if (chunk_end > L) { chunk_end = L; }\n"
-    << "      for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
-    << "           l_inner = l_inner + 1u) {\n"
-    << "        let w_val = shared_red[l_inner - chunk_start];\n"
-    << "        o_acc = o_acc + w_val * f32(v[kv_base + l_inner * D + tid]);\n"
+    << "    // Step 2: V accumulation for D_PER_THREAD output lanes per thread.\n"
+    << "    var chunk_end: u32 = chunk_start + WORKGROUP_SIZE;\n"
+    << "    if (chunk_end > L) { chunk_end = L; }\n"
+    << "    for (var l_inner: u32 = chunk_start; l_inner < chunk_end;\n"
+    << "         l_inner = l_inner + 1u) {\n"
+    << "      let w_val = shared_red[l_inner - chunk_start];\n"
+    << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "        let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "        if (d < D) {\n"
+    << "          o_acc[dd] = o_acc[dd] + w_val * f32(v[kv_base + l_inner * D + d]);\n"
+    << "        }\n"
     << "      }\n"
     << "    }\n"
     << "    workgroupBarrier();\n"
@@ -315,9 +329,12 @@ std::string make_sdpa_vector_kernel(
     << "  let inv_s = shared_inv_s;\n"
     << "\n";
 
-  // Normalize and write the output.
-  s << "  if (tid < D) {\n"
-    << "    output[o_base + tid] = " << dtype << "(o_acc * inv_s);\n"
+  // Normalize and write the output. Each thread writes D_PER_THREAD lanes.
+  s << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "    if (d < D) {\n"
+    << "      output[o_base + d] = " << dtype << "(o_acc[dd] * inv_s);\n"
+    << "    }\n"
     << "  }\n"
     << "}\n";
 
@@ -684,9 +701,9 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
-  // Head dim restriction. Vector path (Tq==1): D in {64, 96, 128} so that
-  // one thread == one output lane in the 128-wide workgroup. Tile path
-  // (Tq > 1): additionally accept D == 256 (Qwen3.5-0.8B uses head_dim=256).
+  // Head dim restriction. Both the vector path (Tq==1) and tile path (Tq>1)
+  // support D in {64, 96, 128, 256}. At D=256, the vector kernel uses
+  // D_PER_THREAD=2 so each of the 128 threads owns 2 output lanes.
   // D must also be divisible by SDPA_TILE_BK=8 so the tile kernel's
   // d_per_thread slab math works.
   int d = q.shape(-1);
@@ -711,16 +728,12 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
-  // Tq == 1  -> vector kernel path (decode).
+  // Tq == 1  -> vector kernel path (decode, D_PER_THREAD strided loop).
   // Tq  > 1  -> tile kernel path (prefill).
-  // The vector path at D == 256 is NOT supported: its 128-thread workgroup
-  // allocates one thread per output lane and only covers D <= 128.
-  // The tile path at D == 256 (~25 KiB shared memory) is supported on
-  // Chromium's 32 KiB default; use ?sdpa_fallback=1 on tighter devices.
-  int tq = q.shape(-2);
-  if (d == 256 && tq == 1) {
-    return true;
-  }
+  // Both paths support D == 256. The tile path at D == 256 needs ~25 KiB
+  // shared memory (fits Chromium's 32 KiB); use ?sdpa_fallback=1 on tighter
+  // devices. The vector path at D == 256 uses only D*4 = 1 KiB for shared_q
+  // plus 512 bytes for shared_red — well within any budget.
 
   // Mask handling:
   //   - No mask -> OK.
