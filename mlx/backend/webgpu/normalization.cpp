@@ -21,8 +21,11 @@
 #include "mlx/fast_primitives.h"
 
 #include <cassert>
-#include <iostream>
 #include <sstream>
+
+#ifdef MLX_WGPU_LOG_KERNELS
+#include <iostream>
+#endif
 
 namespace mlx::core::fast {
 
