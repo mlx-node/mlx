@@ -1,10 +1,13 @@
 // Copyright 2026 Apple Inc.
 //
-// WebGPU fused ScaledDotProductAttention — VECTOR path only (Tq == 1, i.e.
-// decode step). The prompt path (Tq > 1) is left on the decomposed fallback.
+// WebGPU fused ScaledDotProductAttention — VECTOR (Tq==1, decode) + TILE
+// (Tq>1, prefill) paths.
 //
-// Algorithm (single-pass chunked FlashAttention-style):
-//   For each (batch, query_head), one workgroup of WG threads:
+// VECTOR path algorithms:
+//
+// Single-pass (nblocks=1, L <= BLOCK_L=128):
+//   For each (batch, query_head), one workgroup of WG threads performs
+//   chunked FlashAttention-style attention:
 //
 //     Phase A — parallel reduction over L (sequence length):
 //         m = max_l (score_l)          where score_l = dot(Q, K[l]) * scale (+ mask[l])
@@ -17,6 +20,18 @@
 //
 //     Final: reduce thread_sum to row_sum, normalize O[d] = o_acc[d] / row_sum.
 //
+// 2-pass split-L (nblocks>1, L > BLOCK_L=128):
+//   When B*H is small (e.g. 8 for Qwen3.5-0.8B), the single-pass kernel
+//   dispatches too few workgroups. The 2-pass approach splits L across
+//   nblocks = ceil(L/BLOCK_L) workgroups:
+//
+//     Pass 1: B*H*nblocks workgroups. Each handles one (batch, head, block_idx)
+//       triple over [block_start, block_end). Writes unnormalized partial O,
+//       block max, and block sum to intermediate f32 buffers.
+//
+//     Pass 2: B*H workgroups. Reads all nblocks partials, finds the global max,
+//       reweights and sums the partial outputs, normalizes, writes final output.
+//
 // This eliminates the redundant K reads from the old two-phase variant. The
 // old Phase B recomputed scores (D threads × L iterations × D K reads =
 // L·D² K reads per workgroup); the single-pass variant caches weights in
@@ -26,7 +41,8 @@
 // - Workgroup size: 128 threads. For D ≤ 128 each thread owns one output
 //   lane; for D = 256 each thread owns D_PER_THREAD = 2 lanes via a
 //   strided loop (tid, tid + 128).
-// - One workgroup per (batch * n_heads). Dispatch grid = (B*H, 1, 1).
+// - Single-pass: one workgroup per (batch * n_heads). Dispatch = (B*H, 1, 1).
+// - 2-pass: pass 1 dispatches (B*H*nblocks, 1, 1), pass 2 dispatches (B*H, 1, 1).
 // - Head dim D is baked into the WGSL source as a `const`, so loops over D
 //   unroll and the pipeline cache keys by (dtype, D, has_mask, subgroups).
 // - bf16 arrays arrive on the GPU already promoted to f32 (see
@@ -81,7 +97,7 @@ namespace {
 constexpr uint32_t SDPA_WORKGROUP_SIZE = 128;
 
 // Uniform struct laid out to match the WGSL definition below.
-// Total size = 32 bytes (8 u32/f32 slots). Padded to 256 by the WGPU pool.
+// Total size = 40 bytes (10 u32/f32 slots). Padded to 256 by the WGPU pool.
 struct SdpaParams {
   uint32_t B;          // batch
   uint32_t H;          // query heads
@@ -91,6 +107,8 @@ struct SdpaParams {
   uint32_t has_mask;   // 0 or 1
   uint32_t gqa_factor; // H / H_kv
   float    scale;      // scale factor (usually 1/sqrt(D), but caller decides)
+  uint32_t nblocks;    // 2-pass: ceil(L / BLOCK_L), 0 for single-pass
+  uint32_t pad;        // 16-byte alignment
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +148,8 @@ std::string make_sdpa_vector_kernel(
     << "  has_mask: u32,\n"
     << "  gqa_factor: u32,\n"
     << "  scale: f32,\n"
+    << "  nblocks: u32,\n"
+    << "  pad: u32,\n"
     << "}\n\n";
 
   // Bindings: q, k, v, [mask], output, uniform
@@ -350,6 +370,407 @@ std::string make_sdpa_vector_kernel(
     << "    let d = tid + dd * WORKGROUP_SIZE;\n"
     << "    if (d < D) {\n"
     << "      output[o_base + d] = " << dtype << "(o_acc[dd] * inv_s);\n"
+    << "    }\n"
+    << "  }\n"
+    << "}\n";
+
+  return s.str();
+}
+
+// ---------------------------------------------------------------------------
+// 2-pass split-L vector SDPA kernels.
+//
+// When B*H is small (e.g. 8 for Qwen3.5-0.8B), the single-pass vector kernel
+// dispatches only 8 workgroups, severely underutilizing the GPU. The 2-pass
+// approach splits the KV sequence length (L) across `nblocks = ceil(L/BLOCK_L)`
+// workgroups, giving B*H*nblocks workgroups for pass 1.
+//
+// Pass 1: each workgroup handles one (batch, head, block_idx) triple over a
+//   contiguous slice [block_start, block_end) of L. It writes unnormalized
+//   partial O, block max, and block sum to intermediate f32 buffers.
+//
+// Pass 2: one workgroup per (batch, head) reads all nblocks partials, finds the
+//   global max, reweights and sums the partial outputs, then normalizes.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t SDPA_BLOCK_L = 128;
+
+std::string make_sdpa_vector_2pass_1_kernel(
+    const std::string& entry_name,
+    const std::string& dtype,
+    uint32_t D,
+    bool has_mask,
+    bool use_subgroups) {
+  std::ostringstream s;
+
+  if (use_subgroups) {
+    s << "enable subgroups;\n";
+  }
+  if (dtype == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
+
+  uint32_t d_per_thread = (D + SDPA_WORKGROUP_SIZE - 1) / SDPA_WORKGROUP_SIZE;
+
+  s << "const WORKGROUP_SIZE: u32 = " << SDPA_WORKGROUP_SIZE << "u;\n";
+  s << "const D: u32 = " << D << "u;\n";
+  s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n";
+  s << "const BLOCK_L: u32 = " << SDPA_BLOCK_L << "u;\n\n";
+
+  s << "struct SdpaParams {\n"
+    << "  B: u32,\n"
+    << "  H: u32,\n"
+    << "  H_kv: u32,\n"
+    << "  L: u32,\n"
+    << "  D: u32,\n"
+    << "  has_mask: u32,\n"
+    << "  gqa_factor: u32,\n"
+    << "  scale: f32,\n"
+    << "  nblocks: u32,\n"
+    << "  pad: u32,\n"
+    << "}\n\n";
+
+  // Bindings: q, k, v, [mask], intermediate_o, partial_maxs, partial_sums, params
+  uint32_t binding = 0;
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> q: array<"
+    << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> k: array<"
+    << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++ << ") var<storage, read> v: array<"
+    << dtype << ">;\n";
+  if (has_mask) {
+    s << "@group(0) @binding(" << binding++
+      << ") var<storage, read> mask: array<" << dtype << ">;\n";
+  }
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read_write> intermediate_o: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read_write> partial_maxs: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read_write> partial_sums: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<uniform> params: SdpaParams;\n\n";
+
+  // Shared memory
+  s << "var<workgroup> shared_red: array<f32, WORKGROUP_SIZE>;\n";
+  s << "var<workgroup> shared_m: f32;\n";
+  s << "var<workgroup> shared_q: array<f32, D>;\n\n";
+
+  s << "fn max_op(a: f32, b: f32) -> f32 { return max(a, b); }\n";
+  s << "fn sum_op(a: f32, b: f32) -> f32 { return a + b; }\n\n";
+
+  // Main entry.
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << "  let tid = lid.x;\n"
+    << "  let wg = wg_id.x;\n"
+    << "  let H = params.H;\n"
+    << "  let H_kv = params.H_kv;\n"
+    << "  let L = params.L;\n"
+    << "  let gqa = params.gqa_factor;\n"
+    << "  let scale = params.scale;\n"
+    << "  let nblocks = params.nblocks;\n"
+    << "\n"
+    << "  // Decompose wg into (bh, block_idx)\n"
+    << "  let block_idx = wg % nblocks;\n"
+    << "  let bh = wg / nblocks;\n"
+    << "  let b = bh / H;\n"
+    << "  let h = bh % H;\n"
+    << "  let h_kv = h / gqa;\n"
+    << "\n"
+    << "  // Block bounds in L dimension\n"
+    << "  let block_start = block_idx * BLOCK_L;\n"
+    << "  let block_end = min(block_start + BLOCK_L, L);\n"
+    << "  let block_len = block_end - block_start;\n"
+    << "\n"
+    << "  let q_base = (b * H + h) * D;\n"
+    << "  let kv_base = (b * H_kv + h_kv) * L * D;\n";
+  if (has_mask) {
+    s << "  let mask_base = (b * H + h) * L;\n";
+  }
+  s << "\n";
+
+  // Phase 0: cache Q into shared memory.
+  s << "  // Phase 0: cache Q[b, h, 0, :] into shared memory.\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "    if (d < D) {\n"
+    << "      shared_q[d] = f32(q[q_base + d]);\n"
+    << "    }\n"
+    << "  }\n"
+    << "  workgroupBarrier();\n"
+    << "\n";
+
+  // Phase A: compute max of scores over [block_start, block_end).
+  s << "  // Phase A: per-thread partial max over [block_start, block_end).\n"
+    << "  var thread_max: f32 = f32(-3.402823e+38);\n"
+    << "  for (var l: u32 = block_start + tid; l < block_end; l = l + WORKGROUP_SIZE) {\n"
+    << "    var acc: f32 = 0.0;\n"
+    << "    let k_row = kv_base + l * D;\n"
+    << "    for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "      acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
+    << "    }\n"
+    << "    var score = acc * scale;\n";
+  if (has_mask) {
+    s << "    score = score + f32(mask[mask_base + l]);\n";
+  }
+  s << "    thread_max = max(thread_max, score);\n"
+    << "  }\n"
+    << "\n";
+
+  // Reduce max across workgroup.
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(
+        s, "thread_max", "shared_red", "subgroupMax", "max_op",
+        SDPA_WORKGROUP_SIZE, 32, "mx");
+  } else {
+    s << "  shared_red[tid] = thread_max;\n"
+      << "  workgroupBarrier();\n";
+    wgpu::emit_unrolled_reduction(s, "shared_red", "max_op", SDPA_WORKGROUP_SIZE);
+  }
+
+  // Broadcast block max.
+  s << "  if (tid == 0u) { shared_m = shared_red[0]; }\n"
+    << "  workgroupBarrier();\n"
+    << "  let block_max = shared_m;\n"
+    << "\n";
+
+  // Phase B: compute weights and accumulate V, over [block_start, block_end).
+  s << "  // Phase B: weight compute + V accumulation over [block_start, block_end).\n"
+    << "  var o_acc: array<f32, D_PER_THREAD>;\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    o_acc[dd] = 0.0;\n"
+    << "  }\n"
+    << "  var thread_sum: f32 = 0.0;\n"
+    << "  for (var chunk_start: u32 = block_start; chunk_start < block_end;\n"
+    << "       chunk_start = chunk_start + WORKGROUP_SIZE) {\n"
+    << "    let l = chunk_start + tid;\n"
+    << "    var weight: f32 = 0.0;\n"
+    << "    if (l < block_end) {\n"
+    << "      var acc: f32 = 0.0;\n"
+    << "      let k_row = kv_base + l * D;\n"
+    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
+    << "      }\n"
+    << "      var score = acc * scale;\n";
+  if (has_mask) {
+    s << "      score = score + f32(mask[mask_base + l]);\n";
+  }
+  s << "      weight = exp(score - block_max);\n"
+    << "    }\n"
+    << "    shared_red[tid] = weight;\n"
+    << "    thread_sum = thread_sum + weight;\n"
+    << "    workgroupBarrier();\n"
+    << "\n"
+    << "    // V accumulation for D_PER_THREAD output lanes per thread.\n";
+  if (d_per_thread == 1) {
+    s << "    if (tid < D) {\n"
+      << "      var chunk_end_v: u32 = chunk_start + WORKGROUP_SIZE;\n"
+      << "      if (chunk_end_v > block_end) { chunk_end_v = block_end; }\n"
+      << "      for (var l_inner: u32 = chunk_start; l_inner < chunk_end_v;\n"
+      << "           l_inner = l_inner + 1u) {\n"
+      << "        let w_val = shared_red[l_inner - chunk_start];\n"
+      << "        o_acc[0] = o_acc[0] + w_val * f32(v[kv_base + l_inner * D + tid]);\n"
+      << "      }\n"
+      << "    }\n";
+  } else {
+    s << "    var chunk_end_v: u32 = chunk_start + WORKGROUP_SIZE;\n"
+      << "    if (chunk_end_v > block_end) { chunk_end_v = block_end; }\n"
+      << "    for (var l_inner: u32 = chunk_start; l_inner < chunk_end_v;\n"
+      << "         l_inner = l_inner + 1u) {\n"
+      << "      let w_val = shared_red[l_inner - chunk_start];\n"
+      << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+      << "        let d = tid + dd * WORKGROUP_SIZE;\n"
+      << "        if (d < D) {\n"
+      << "          o_acc[dd] = o_acc[dd] + w_val * f32(v[kv_base + l_inner * D + d]);\n"
+      << "        }\n"
+      << "      }\n"
+      << "    }\n";
+  }
+  s << "    workgroupBarrier();\n"
+    << "  }\n"
+    << "\n";
+
+  // Reduce thread_sum across workgroup.
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(
+        s, "thread_sum", "shared_red", "subgroupAdd", "sum_op",
+        SDPA_WORKGROUP_SIZE, 32, "sm");
+  } else {
+    s << "  shared_red[tid] = thread_sum;\n"
+      << "  workgroupBarrier();\n";
+    wgpu::emit_unrolled_reduction(s, "shared_red", "sum_op", SDPA_WORKGROUP_SIZE);
+  }
+
+  // Write partials: unnormalized O, block max, block sum.
+  s << "  let block_sum = shared_red[0];\n"
+    << "\n"
+    << "  // Write partial O (unnormalized) to intermediate buffer.\n"
+    << "  let o_partial_base = bh * nblocks * D + block_idx * D;\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "    if (d < D) {\n"
+    << "      intermediate_o[o_partial_base + d] = o_acc[dd];\n"
+    << "    }\n"
+    << "  }\n"
+    << "\n"
+    << "  // Write block max and sum (one thread per workgroup).\n"
+    << "  if (tid == 0u) {\n"
+    << "    let ms_idx = bh * nblocks + block_idx;\n"
+    << "    partial_maxs[ms_idx] = block_max;\n"
+    << "    partial_sums[ms_idx] = block_sum;\n"
+    << "  }\n"
+    << "}\n";
+
+  return s.str();
+}
+
+std::string make_sdpa_vector_2pass_2_kernel(
+    const std::string& entry_name,
+    const std::string& dtype,
+    uint32_t D,
+    bool use_subgroups) {
+  std::ostringstream s;
+
+  if (use_subgroups) {
+    s << "enable subgroups;\n";
+  }
+  if (dtype == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
+
+  uint32_t d_per_thread = (D + SDPA_WORKGROUP_SIZE - 1) / SDPA_WORKGROUP_SIZE;
+
+  s << "const WORKGROUP_SIZE: u32 = " << SDPA_WORKGROUP_SIZE << "u;\n";
+  s << "const D: u32 = " << D << "u;\n";
+  s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n\n";
+
+  s << "struct SdpaParams {\n"
+    << "  B: u32,\n"
+    << "  H: u32,\n"
+    << "  H_kv: u32,\n"
+    << "  L: u32,\n"
+    << "  D: u32,\n"
+    << "  has_mask: u32,\n"
+    << "  gqa_factor: u32,\n"
+    << "  scale: f32,\n"
+    << "  nblocks: u32,\n"
+    << "  pad: u32,\n"
+    << "}\n\n";
+
+  // Bindings: intermediate_o, partial_maxs, partial_sums, output, params
+  uint32_t binding = 0;
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read> intermediate_o: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read> partial_maxs: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read> partial_sums: array<f32>;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<storage, read_write> output: array<" << dtype << ">;\n";
+  s << "@group(0) @binding(" << binding++
+    << ") var<uniform> params: SdpaParams;\n\n";
+
+  // Shared memory for reductions.
+  s << "var<workgroup> shared_red: array<f32, WORKGROUP_SIZE>;\n";
+  s << "var<workgroup> shared_global_max: f32;\n";
+  s << "var<workgroup> shared_global_sum: f32;\n\n";
+
+  s << "fn max_op(a: f32, b: f32) -> f32 { return max(a, b); }\n";
+  s << "fn sum_op(a: f32, b: f32) -> f32 { return a + b; }\n\n";
+
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << "  let tid = lid.x;\n"
+    << "  let bh = wg_id.x;\n"
+    << "  let H = params.H;\n"
+    << "  let nblocks = params.nblocks;\n"
+    << "  let b = bh / H;\n"
+    << "  let h = bh % H;\n"
+    << "\n";
+
+  // Step 1: find global max across all nblocks partials.
+  s << "  // Step 1: find global max across all blocks.\n"
+    << "  var thread_max: f32 = f32(-3.402823e+38);\n"
+    << "  for (var i: u32 = tid; i < nblocks; i = i + WORKGROUP_SIZE) {\n"
+    << "    thread_max = max(thread_max, partial_maxs[bh * nblocks + i]);\n"
+    << "  }\n"
+    << "\n";
+
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(
+        s, "thread_max", "shared_red", "subgroupMax", "max_op",
+        SDPA_WORKGROUP_SIZE, 32, "mx");
+  } else {
+    s << "  shared_red[tid] = thread_max;\n"
+      << "  workgroupBarrier();\n";
+    wgpu::emit_unrolled_reduction(s, "shared_red", "max_op", SDPA_WORKGROUP_SIZE);
+  }
+
+  s << "  if (tid == 0u) { shared_global_max = shared_red[0]; }\n"
+    << "  workgroupBarrier();\n"
+    << "  let global_max = shared_global_max;\n"
+    << "\n";
+
+  // Step 2: compute reweighted global sum.
+  s << "  // Step 2: compute reweighted global sum.\n"
+    << "  var thread_sum: f32 = 0.0;\n"
+    << "  for (var i: u32 = tid; i < nblocks; i = i + WORKGROUP_SIZE) {\n"
+    << "    let idx = bh * nblocks + i;\n"
+    << "    let factor = exp(partial_maxs[idx] - global_max);\n"
+    << "    thread_sum = thread_sum + factor * partial_sums[idx];\n"
+    << "  }\n"
+    << "\n";
+
+  if (use_subgroups) {
+    wgpu::emit_subgroup_reduction(
+        s, "thread_sum", "shared_red", "subgroupAdd", "sum_op",
+        SDPA_WORKGROUP_SIZE, 32, "sm");
+  } else {
+    s << "  shared_red[tid] = thread_sum;\n"
+      << "  workgroupBarrier();\n";
+    wgpu::emit_unrolled_reduction(s, "shared_red", "sum_op", SDPA_WORKGROUP_SIZE);
+  }
+
+  s << "  if (tid == 0u) { shared_global_sum = shared_red[0]; }\n"
+    << "  workgroupBarrier();\n"
+    << "  let global_sum = shared_global_sum;\n"
+    << "  let inv_sum = 1.0 / global_sum;\n"
+    << "\n";
+
+  // Step 3: accumulate reweighted O across all blocks.
+  s << "  // Step 3: accumulate reweighted O across all blocks.\n"
+    << "  var o_acc: array<f32, D_PER_THREAD>;\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    o_acc[dd] = 0.0;\n"
+    << "  }\n"
+    << "\n"
+    << "  for (var i: u32 = 0u; i < nblocks; i = i + 1u) {\n"
+    << "    let idx = bh * nblocks + i;\n"
+    << "    let factor = exp(partial_maxs[idx] - global_max);\n"
+    << "    let o_base_partial = bh * nblocks * D + i * D;\n"
+    << "    for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "      let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "      if (d < D) {\n"
+    << "        o_acc[dd] = o_acc[dd] + factor * intermediate_o[o_base_partial + d];\n"
+    << "      }\n"
+    << "    }\n"
+    << "  }\n"
+    << "\n";
+
+  // Step 4: normalize and write output.
+  s << "  // Step 4: normalize and write output.\n"
+    << "  let o_base = (b * H + h) * D;\n"
+    << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "    let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "    if (d < D) {\n"
+    << "      output[o_base + d] = " << dtype << "(o_acc[dd] * inv_sum);\n"
     << "    }\n"
     << "  }\n"
     << "}\n";
@@ -765,24 +1186,9 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
-  // GPU occupancy gate for the Tq==1 vector kernel.  The fused vector
-  // kernel dispatches exactly B*H workgroups (one per batch×head).  For
-  // small models like Qwen3.5-0.8B (B=1, H=8 → 8 workgroups) this leaves
-  // the GPU severely underutilised.  The decomposed matmul→softmax→matmul
-  // path dispatches 100+ workgroups per GEMV call, saturating the GPU far
-  // better.  Only keep the fused path when there are enough workgroups to
-  // justify the launch.  Tq>1 uses the tile kernel which dispatches
-  // ceil(Tq/BQ)*H workgroups — plenty of parallelism, so skip this check.
-  {
-    int tq = q.shape(-2);
-    if (tq == 1) {
-      int b = q.shape(0);
-      int h = q.shape(1);
-      if (b * h < 32) {
-        return true;
-      }
-    }
-  }
+  // GPU occupancy for the Tq==1 vector kernel: the 2-pass split-L kernel
+  // dispatches B*H*nblocks workgroups, so even small B*H (e.g. 8 for
+  // Qwen3.5-0.8B) gets enough parallelism. No occupancy gate needed.
 
   // Row-contiguity: the kernel indexes Q/K/V as flat arrays. Non-contig
   // inputs (e.g. from transpose views) are made contiguous by eval_gpu's
@@ -916,21 +1322,8 @@ void ScaledDotProductAttention::eval_gpu(
     bool use_sg = dev.has_subgroups();
     std::string sg_suffix = use_sg ? "_sg" : "";
     std::string mask_suffix = has_mask ? "_m" : "";
-    std::string entry_name = std::string("sdpa_v_") + dtype + "_D" +
-        std::to_string(D) + mask_suffix + sg_suffix;
 
-    WGPUShaderModule shader = dev.get_or_create_shader_module(
-        entry_name, [&]() {
-#ifdef MLX_WGPU_LOG_KERNELS
-          // First-dispatch log — the shader-module cache only invokes this
-          // lambda on a MISS, so each unique entry_name prints exactly once.
-          std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
-#endif
-          return make_sdpa_vector_kernel(
-              entry_name, dtype, D, has_mask, use_sg);
-        });
-    auto pe =
-        dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
+    uint32_t nblocks = (L + SDPA_BLOCK_L - 1u) / SDPA_BLOCK_L;
 
     // Register inputs/outputs with the encoder for bookkeeping.
     encoder.set_input_array(q_c);
@@ -941,48 +1334,178 @@ void ScaledDotProductAttention::eval_gpu(
     }
     encoder.set_output_array(out);
 
-    // Populate uniform buffer.
-    SdpaParams params{};
-    params.B = B;
-    params.H = H;
-    params.H_kv = H_kv;
-    params.L = L;
-    params.D = D;
-    params.has_mask = has_mask ? 1u : 0u;
-    params.gqa_factor = gqa_factor;
-    params.scale = scale_;
-
     auto& pool = dev.uniform_pool();
-    WGPUBuffer uniform_buf =
-        pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaParams));
 
-    // Build bind group.
-    WGPUBuffer q_buf = wgpu::wgpu_buffer(q_c);
-    WGPUBuffer k_buf = wgpu::wgpu_buffer(k_c);
-    WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
-    WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+    if (nblocks <= 1) {
+      // ---------- Single-pass: L fits in one block ----------
+      std::string entry_name = std::string("sdpa_v_") + dtype + "_D" +
+          std::to_string(D) + mask_suffix + sg_suffix;
 
-    std::vector<std::pair<WGPUBuffer, uint64_t>> bg_entries;
-    bg_entries.reserve(has_mask ? 6 : 5);
-    bg_entries.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
-    bg_entries.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
-    bg_entries.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
-    if (has_mask) {
-      WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
-      bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+      WGPUShaderModule shader = dev.get_or_create_shader_module(
+          entry_name, [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+            std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
+#endif
+            return make_sdpa_vector_kernel(
+                entry_name, dtype, D, has_mask, use_sg);
+          });
+      auto pe =
+          dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
+
+      SdpaParams params{};
+      params.B = B;
+      params.H = H;
+      params.H_kv = H_kv;
+      params.L = L;
+      params.D = D;
+      params.has_mask = has_mask ? 1u : 0u;
+      params.gqa_factor = gqa_factor;
+      params.scale = scale_;
+      params.nblocks = 0u;
+      params.pad = 0u;
+
+      WGPUBuffer uniform_buf =
+          pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaParams));
+
+      WGPUBuffer q_buf = wgpu::wgpu_buffer(q_c);
+      WGPUBuffer k_buf = wgpu::wgpu_buffer(k_c);
+      WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
+      WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+
+      std::vector<std::pair<WGPUBuffer, uint64_t>> bg_entries;
+      bg_entries.reserve(has_mask ? 6 : 5);
+      bg_entries.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
+      bg_entries.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
+      bg_entries.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+      if (has_mask) {
+        WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
+        bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+      }
+      bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+      bg_entries.emplace_back(uniform_buf, sizeof(SdpaParams));
+
+      WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
+
+      encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
+
+      wgpuBindGroupRelease(bg);
+      encoder.add_completed_handler([uniform_buf]() {
+        wgpu::device().uniform_pool().release(uniform_buf);
+      });
+    } else {
+      // ---------- 2-pass split-L: B*H*nblocks workgroups ----------
+
+      // Allocate intermediate buffers as temporary arrays. The allocator
+      // returns GPU storage buffers; add_temporary keeps them alive until
+      // the encoder's GPU work completes.
+      uint32_t BH = B * H;
+      size_t inter_o_elems = static_cast<size_t>(BH) * nblocks * D;
+      size_t inter_ms_elems = static_cast<size_t>(BH) * nblocks;
+
+      array inter_o({static_cast<int>(inter_o_elems)}, float32, nullptr, {});
+      inter_o.set_data(allocator::malloc(wgpu::wgpu_alloc_size(inter_o)));
+      encoder.add_temporary(inter_o);
+
+      array inter_maxs({static_cast<int>(inter_ms_elems)}, float32, nullptr, {});
+      inter_maxs.set_data(allocator::malloc(wgpu::wgpu_alloc_size(inter_maxs)));
+      encoder.add_temporary(inter_maxs);
+
+      array inter_sums({static_cast<int>(inter_ms_elems)}, float32, nullptr, {});
+      inter_sums.set_data(allocator::malloc(wgpu::wgpu_alloc_size(inter_sums)));
+      encoder.add_temporary(inter_sums);
+
+      // ---- Pass 1: partial reductions per L-block ----
+      std::string p1_name = std::string("sdpa_v2p1_") + dtype + "_D" +
+          std::to_string(D) + mask_suffix + sg_suffix;
+
+      WGPUShaderModule p1_shader = dev.get_or_create_shader_module(
+          p1_name, [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+            std::cerr << "[MLX-KERNEL] " << p1_name << std::endl;
+#endif
+            return make_sdpa_vector_2pass_1_kernel(
+                p1_name, dtype, D, has_mask, use_sg);
+          });
+      auto p1_pe =
+          dev.get_or_create_pipeline(p1_name, p1_shader, p1_name.c_str());
+
+      SdpaParams params{};
+      params.B = B;
+      params.H = H;
+      params.H_kv = H_kv;
+      params.L = L;
+      params.D = D;
+      params.has_mask = has_mask ? 1u : 0u;
+      params.gqa_factor = gqa_factor;
+      params.scale = scale_;
+      params.nblocks = nblocks;
+      params.pad = 0u;
+
+      WGPUBuffer uniform_buf =
+          pool.acquire(dev.gpu_queue(), &params, sizeof(SdpaParams));
+
+      WGPUBuffer q_buf = wgpu::wgpu_buffer(q_c);
+      WGPUBuffer k_buf = wgpu::wgpu_buffer(k_c);
+      WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
+      WGPUBuffer inter_o_buf = wgpu::wgpu_buffer(inter_o);
+      WGPUBuffer inter_maxs_buf = wgpu::wgpu_buffer(inter_maxs);
+      WGPUBuffer inter_sums_buf = wgpu::wgpu_buffer(inter_sums);
+      WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+
+      // Pass 1 bind group: q, k, v, [mask], intermediate_o, partial_maxs,
+      //                    partial_sums, params
+      std::vector<std::pair<WGPUBuffer, uint64_t>> p1_bg;
+      p1_bg.reserve(has_mask ? 8 : 7);
+      p1_bg.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
+      p1_bg.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
+      p1_bg.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+      if (has_mask) {
+        WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
+        p1_bg.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+      }
+      p1_bg.emplace_back(inter_o_buf, wgpuBufferGetSize(inter_o_buf));
+      p1_bg.emplace_back(inter_maxs_buf, wgpuBufferGetSize(inter_maxs_buf));
+      p1_bg.emplace_back(inter_sums_buf, wgpuBufferGetSize(inter_sums_buf));
+      p1_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
+
+      WGPUBindGroup p1_bg_obj = wgpu::create_bind_group(p1_pe.layout, p1_bg);
+      encoder.dispatch_compute(
+          p1_pe.pipeline, p1_bg_obj, BH * nblocks, 1u, 1u);
+      wgpuBindGroupRelease(p1_bg_obj);
+
+      // ---- Pass 2: merge partials and write final output ----
+      std::string p2_name = std::string("sdpa_v2p2_") + dtype + "_D" +
+          std::to_string(D) + sg_suffix;
+
+      WGPUShaderModule p2_shader = dev.get_or_create_shader_module(
+          p2_name, [&]() {
+#ifdef MLX_WGPU_LOG_KERNELS
+            std::cerr << "[MLX-KERNEL] " << p2_name << std::endl;
+#endif
+            return make_sdpa_vector_2pass_2_kernel(
+                p2_name, dtype, D, use_sg);
+          });
+      auto p2_pe =
+          dev.get_or_create_pipeline(p2_name, p2_shader, p2_name.c_str());
+
+      // Pass 2 bind group: intermediate_o, partial_maxs, partial_sums,
+      //                    output, params (reuse same uniform)
+      std::vector<std::pair<WGPUBuffer, uint64_t>> p2_bg;
+      p2_bg.reserve(5);
+      p2_bg.emplace_back(inter_o_buf, wgpuBufferGetSize(inter_o_buf));
+      p2_bg.emplace_back(inter_maxs_buf, wgpuBufferGetSize(inter_maxs_buf));
+      p2_bg.emplace_back(inter_sums_buf, wgpuBufferGetSize(inter_sums_buf));
+      p2_bg.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+      p2_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
+
+      WGPUBindGroup p2_bg_obj = wgpu::create_bind_group(p2_pe.layout, p2_bg);
+      encoder.dispatch_compute(p2_pe.pipeline, p2_bg_obj, BH, 1u, 1u);
+      wgpuBindGroupRelease(p2_bg_obj);
+
+      encoder.add_completed_handler([uniform_buf]() {
+        wgpu::device().uniform_pool().release(uniform_buf);
+      });
     }
-    bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
-    bg_entries.emplace_back(uniform_buf, sizeof(SdpaParams));
-
-    WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
-
-    // One workgroup per (batch, head).
-    encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
-
-    wgpuBindGroupRelease(bg);
-    encoder.add_completed_handler([uniform_buf]() {
-      wgpu::device().uniform_pool().release(uniform_buf);
-    });
     return;
   }
 
