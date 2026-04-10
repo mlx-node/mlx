@@ -55,6 +55,14 @@ struct WebGPUBuffer {
 void set_packed_bf16_enabled(bool enabled);
 bool packed_bf16_enabled();
 
+// Runtime force-on for the SDPA decomposed fallback. When true, the SDPA
+// primitive reports `use_fallback() == true` unconditionally so the op
+// decomposes into matmul(Q·K^T) + softmax + matmul(·V). Used by the demo
+// app to A/B test the fused vector + tile kernels against the baseline
+// without a rebuild. Defaults to false; plumbed from ?sdpa_fallback=1.
+void set_sdpa_fallback_forced(bool enabled);
+bool sdpa_fallback_forced();
+
 // Helpers that flip an array's WebGPUBuffer into StorageMode::PackedBf16.
 // These are defined in allocator.cpp (which has the full WebGPUBuffer layout
 // + mlx::core::array include path) so that the FFI-bridge translation unit

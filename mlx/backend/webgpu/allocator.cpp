@@ -32,6 +32,19 @@ bool packed_bf16_enabled() {
   return g_packed_bf16_enabled.load(std::memory_order_relaxed);
 }
 
+// Runtime force-on for the SDPA decomposed fallback. When set, SDPA always
+// reports use_fallback() == true so the tile / vector kernels never fire.
+// Used by the demo app for TTFT A/B comparisons.
+static std::atomic<bool> g_sdpa_fallback_forced{false};
+
+void set_sdpa_fallback_forced(bool enabled) {
+  g_sdpa_fallback_forced.store(enabled, std::memory_order_relaxed);
+}
+
+bool sdpa_fallback_forced() {
+  return g_sdpa_fallback_forced.load(std::memory_order_relaxed);
+}
+
 // Flip the storage mode of an upload-pending bf16 array to PackedBf16 when
 // eligible (bf16 dtype, size >= threshold, packed_bf16_enabled() is true,
 // and the buffer is still in "upload-pending" state). Called from the Rust
