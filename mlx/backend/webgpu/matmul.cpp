@@ -788,7 +788,13 @@ static void dispatch_matmul(
   for (size_t i = 0; i < batch_shape.size() && i < 4; ++i) {
     params.batch_shape[i] = static_cast<uint32_t>(batch_shape[i]);
     params.batch_stride_a[i] = static_cast<uint32_t>(a_batch_strides[i]);
-    params.batch_stride_b[i] = static_cast<uint32_t>(b_batch_strides[i]);
+    // For packed-bf16 B, the kernel indexes array<u32> (2 bf16 per u32),
+    // so batch strides must be in u32 units. collapse_batches returns
+    // element strides, so divide by 2. (In practice packed B is always
+    // a 2D weight with stride 0, but guard against future batched use.)
+    params.batch_stride_b[i] = b_packed_bf16
+        ? static_cast<uint32_t>(b_batch_strides[i] / 2)
+        : static_cast<uint32_t>(b_batch_strides[i]);
   }
   params.batch_stride_c = batch_stride_c;
   params.offset_a = static_cast<uint32_t>(a.offset() / a.itemsize());
