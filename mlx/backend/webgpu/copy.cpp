@@ -238,9 +238,14 @@ void copy_gpu_inplace(
           static_cast<const wgpu::WebGPUBuffer*>(in.buffer().ptr());
       auto* out_wb =
           static_cast<const wgpu::WebGPUBuffer*>(out.buffer().ptr());
-      bool storage_match = in_wb && out_wb &&
-          in_wb->storage_mode == out_wb->storage_mode;
-      if (storage_match) {
+      // Restrict to Upconverted. A PackedBf16 buffer stores two bf16 values
+      // per u32, so its real byte size is ((N+1)/2)*4 — not
+      // data_size * wgpu_itemsize(bfloat16) = data_size*4, which is double.
+      // Using the Upconverted gate keeps the byte-count math below correct.
+      bool storage_ok = in_wb && out_wb &&
+          in_wb->storage_mode == wgpu::StorageMode::Upconverted &&
+          out_wb->storage_mode == wgpu::StorageMode::Upconverted;
+      if (storage_ok) {
         uint64_t wgpu_elem_bytes =
             static_cast<uint64_t>(wgpu::wgpu_itemsize(out.dtype()));
         // Mirror dispatch_copy()'s element-offset calculation: arr.offset()
@@ -257,9 +262,10 @@ void copy_gpu_inplace(
         uint64_t byte_count =
             static_cast<uint64_t>(out.data_size()) * wgpu_elem_bytes;
         // WebGPU copyBufferToBuffer requires size + offsets to be multiples
-        // of 4 bytes. Every current wgpu_itemsize is 4, so these checks are
-        // effectively always-true, but we keep them as a forward-compatible
-        // guard against future sub-u32 element sizes.
+        // of 4 bytes. Load-bearing today: wgpu_itemsize(float16) == 2, so an
+        // odd-length or odd-start float16 slice fails these guards and falls
+        // through to the shader path. int32/uint32/float32/bool/bfloat16 are
+        // all 4 bytes and trivially pass.
         if ((byte_count & 3u) == 0 && (in_byte_offset & 3u) == 0 &&
             (out_byte_offset & 3u) == 0) {
           WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
