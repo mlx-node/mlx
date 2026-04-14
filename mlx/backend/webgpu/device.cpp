@@ -5,6 +5,7 @@
 #include "mlx/backend/webgpu/worker.h"
 #include "mlx/utils.h"
 
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
@@ -15,6 +16,38 @@
 #include <stdexcept>
 
 namespace mlx::core::wgpu {
+
+// ---------------------------------------------------------------------------
+// Phase 0 dispatch-stats counters (observability only, no behavior change).
+//
+// Global atomics, not CommandEncoder members, because:
+//   1. CommandEncoder instances are per-stream and their WGPU encoder handle
+//      is released on every commit() — the object survives, but counters that
+//      intentionally outlive individual commits still need to live at a
+//      single, process-wide location so the FFI reader does not have to walk
+//      Device::encoders_ (which would also need locking).
+//   2. The packed-bf16 / sdpa-fallback toggles in allocator.cpp already use
+//      the same "global atomic" pattern; we keep Phase 0 instrumentation
+//      consistent with that pattern.
+//
+// These counters are read by mlx_wgpu_get_dispatch_stats / reset by
+// mlx_wgpu_reset_dispatch_stats (see crates/mlx-sys/src/mlx_stream.cpp).
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_total_dispatches{0};
+static std::atomic<uint64_t> g_total_pass_ends{0};
+
+uint64_t get_total_dispatches() {
+  return g_total_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t get_total_pass_ends() {
+  return g_total_pass_ends.load(std::memory_order_relaxed);
+}
+
+void reset_dispatch_stats() {
+  g_total_dispatches.store(0, std::memory_order_relaxed);
+  g_total_pass_ends.store(0, std::memory_order_relaxed);
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // UniformBufferPool implementation
@@ -661,6 +694,9 @@ void CommandEncoder::ensure_active() {
 
 void CommandEncoder::end_compute_pass() {
   if (compute_pass_) {
+    // Phase 0 instrumentation: count actual pass-end events (i.e., only
+    // when we had an open pass). See g_total_pass_ends above.
+    g_total_pass_ends.fetch_add(1, std::memory_order_relaxed);
     wgpuComputePassEncoderEnd(compute_pass_);
     wgpuComputePassEncoderRelease(compute_pass_);
     compute_pass_ = nullptr;
@@ -689,6 +725,8 @@ void CommandEncoder::dispatch_compute(
   }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
+  // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
+  g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
   // End compute pass after each dispatch to avoid WebGPU buffer aliasing
   // violations. WebGPU disallows a buffer being both read-only and read-write
   // storage within a single compute pass. Ending the pass after each dispatch
@@ -709,8 +747,32 @@ void CommandEncoder::dispatch_compute(
       compute_pass_, 0, bind_group, 0, nullptr);
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   op_count_++;
+  // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
+  g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
   // End compute pass after each dispatch (same reason as above)
   end_compute_pass();
+}
+
+void CommandEncoder::copy_buffer_to_buffer(
+    WGPUBuffer src,
+    uint64_t src_offset,
+    WGPUBuffer dst,
+    uint64_t dst_offset,
+    uint64_t size) {
+  if (size == 0) {
+    return;
+  }
+  // Make sure we have a raw command encoder but NOT an open compute pass —
+  // wgpuCommandEncoderCopyBufferToBuffer is only valid outside a pass.
+  ensure_active();
+  end_compute_pass();
+  wgpuCommandEncoderCopyBufferToBuffer(
+      encoder_, src, src_offset, dst, dst_offset, size);
+  // Count as an op so needs_commit() still flushes at the right time, but
+  // deliberately NOT as a shader dispatch — Phase 0's g_total_dispatches
+  // tracks kernel launches only. The whole point of this fast path is that
+  // no shader ran.
+  op_count_++;
 }
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {

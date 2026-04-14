@@ -46,6 +46,17 @@ class CommandEncoder {
       uint32_t y = 1,
       uint32_t z = 1);
 
+  // Native buffer-to-buffer copy (no shader dispatch). Used by the metadata
+  // fast path in copy.cpp for same-dtype linear copies that previously went
+  // through the copy_v WGSL kernel. Must end any active compute pass because
+  // wgpuCommandEncoderCopyBufferToBuffer is not valid inside a compute pass.
+  void copy_buffer_to_buffer(
+      WGPUBuffer src,
+      uint64_t src_offset,
+      WGPUBuffer dst,
+      uint64_t dst_offset,
+      uint64_t size);
+
   // Keep buffer alive until GPU work completes
   void add_temporary(const array& arr) {
     temporaries_.push_back(arr.data_shared_ptr());
@@ -189,5 +200,13 @@ CommandEncoder& get_command_encoder(Stream s);
 
 // Flush all pending command encoders
 void flush_all_encoders();
+
+// Phase 0 dispatch-stats (observability only). These counters are global
+// atomics incremented inside CommandEncoder::dispatch_compute /
+// end_compute_pass; they are read + reset from the FFI bridge in mlx-sys
+// so the browser can expose `?profile=1` metrics to the demo page.
+uint64_t get_total_dispatches();
+uint64_t get_total_pass_ends();
+void reset_dispatch_stats();
 
 } // namespace mlx::core::wgpu

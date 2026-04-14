@@ -2,8 +2,10 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/backend/webgpu/allocator.h"
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
+#include "mlx/utils.h"
 #include "gen/wgsl_sources.h"
 
 #include <cassert>
@@ -221,6 +223,57 @@ void copy_gpu_inplace(
   encoder.set_output_array(out);
 
   if (ctype == CopyType::Scalar || ctype == CopyType::Vector) {
+    // Phase 4 fast path: a Vector copy with matching dtype + matching
+    // storage_mode is a straight byte-for-byte copy of a contiguous range.
+    // Short-circuit to wgpuCommandEncoderCopyBufferToBuffer so no WGSL
+    // kernel launches. Scalar is a broadcast (1 src elem → N out elems)
+    // so it still needs the shader.
+    //
+    // Gated on MLX_WGPU_METADATA_FAST_PATH (default ON) as a kill switch.
+    static const bool metadata_fast_path =
+        env::get_var("MLX_WGPU_METADATA_FAST_PATH", 1) != 0;
+    if (metadata_fast_path && ctype == CopyType::Vector &&
+        in.dtype() == out.dtype()) {
+      auto* in_wb =
+          static_cast<const wgpu::WebGPUBuffer*>(in.buffer().ptr());
+      auto* out_wb =
+          static_cast<const wgpu::WebGPUBuffer*>(out.buffer().ptr());
+      bool storage_match = in_wb && out_wb &&
+          in_wb->storage_mode == out_wb->storage_mode;
+      if (storage_match) {
+        uint64_t wgpu_elem_bytes =
+            static_cast<uint64_t>(wgpu::wgpu_itemsize(out.dtype()));
+        // Mirror dispatch_copy()'s element-offset calculation: arr.offset()
+        // is a CPU byte offset, so divide by CPU itemsize to get an element
+        // index, then add the caller-provided element offset.
+        uint64_t in_elem = static_cast<uint64_t>(in.offset()) /
+                static_cast<uint64_t>(in.itemsize()) +
+            static_cast<uint64_t>(i_offset);
+        uint64_t out_elem = static_cast<uint64_t>(out.offset()) /
+                static_cast<uint64_t>(out.itemsize()) +
+            static_cast<uint64_t>(o_offset);
+        uint64_t in_byte_offset = in_elem * wgpu_elem_bytes;
+        uint64_t out_byte_offset = out_elem * wgpu_elem_bytes;
+        uint64_t byte_count =
+            static_cast<uint64_t>(out.data_size()) * wgpu_elem_bytes;
+        // WebGPU copyBufferToBuffer requires size + offsets to be multiples
+        // of 4 bytes. Every current wgpu_itemsize is 4, so these checks are
+        // effectively always-true, but we keep them as a forward-compatible
+        // guard against future sub-u32 element sizes.
+        if ((byte_count & 3u) == 0 && (in_byte_offset & 3u) == 0 &&
+            (out_byte_offset & 3u) == 0) {
+          WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
+          WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+          encoder.copy_buffer_to_buffer(
+              in_buf,
+              in_byte_offset,
+              out_buf,
+              out_byte_offset,
+              byte_count);
+          return;
+        }
+      }
+    }
     // For array<u32> buffers, element count = total bytes / 4.
     // For 4-byte types this equals data_size; for other sizes we adjust.
     uint32_t byte_count =
