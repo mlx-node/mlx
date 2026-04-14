@@ -183,9 +183,13 @@ inline WGPUBuffer create_storage_buffer(const void* data, size_t byte_size) {
 
 // Create a bind group with a dynamic number of buffer entries.
 // Each pair is (buffer, size). Bindings are assigned sequentially from 0.
+// `label` is optional diagnostic text surfaced in the error message on
+// failure; callers typically pass the kernel name. Default empty string
+// preserves the previous minimal error text for unlabeled call sites.
 inline WGPUBindGroup create_bind_group(
     WGPUBindGroupLayout layout,
-    const std::vector<std::pair<WGPUBuffer, uint64_t>>& buffers) {
+    const std::vector<std::pair<WGPUBuffer, uint64_t>>& buffers,
+    const char* label = nullptr) {
   auto& dev = device();
 
   std::vector<WGPUBindGroupEntry> entries(buffers.size());
@@ -205,7 +209,15 @@ inline WGPUBindGroup create_bind_group(
   WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.gpu_device(), &bg_desc);
 
   if (!bg) {
-    throw std::runtime_error("[WebGPU] Failed to create bind group");
+    std::string msg = "[WebGPU] Failed to create bind group";
+    if (label && *label) {
+      msg += " (kernel=";
+      msg += label;
+      msg += ", entries=";
+      msg += std::to_string(buffers.size());
+      msg += ")";
+    }
+    throw std::runtime_error(msg);
   }
   return bg;
 }
