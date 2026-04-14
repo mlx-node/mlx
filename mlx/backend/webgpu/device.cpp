@@ -762,16 +762,25 @@ void CommandEncoder::copy_buffer_to_buffer(
   if (size == 0) {
     return;
   }
-  // Make sure we have a raw command encoder but NOT an open compute pass —
-  // wgpuCommandEncoderCopyBufferToBuffer is only valid outside a pass.
-  ensure_active();
+  // wgpuCommandEncoderCopyBufferToBuffer is only valid outside a compute
+  // pass, so close one if it's open. Do NOT call ensure_active() here: that
+  // would open a fresh compute pass we'd immediately tear down, adding two
+  // spurious RPCs and inflating g_total_pass_ends per fast-path call.
   end_compute_pass();
+  if (!encoder_) {
+    WGPUCommandEncoderDescriptor enc_desc = {};
+    encoder_ = wgpuDeviceCreateCommandEncoder(device_.gpu_device(), &enc_desc);
+    if (!encoder_) {
+      throw std::runtime_error("[WebGPU] Failed to create command encoder");
+    }
+  }
   wgpuCommandEncoderCopyBufferToBuffer(
       encoder_, src, src_offset, dst, dst_offset, size);
   // Count as an op so needs_commit() still flushes at the right time, but
   // deliberately NOT as a shader dispatch — Phase 0's g_total_dispatches
   // tracks kernel launches only. The whole point of this fast path is that
-  // no shader ran.
+  // no shader ran. bytes_tracked_ was already bumped by set_input_array /
+  // set_output_array upstream in copy_gpu_inplace.
   op_count_++;
 }
 
