@@ -595,7 +595,31 @@ void Compiled::eval_gpu(
         strides_buf, wgpuBufferGetSize(strides_buf));
   }
 
-  WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
+  WGPUBindGroup bg;
+  try {
+    bg = wgpu::create_bind_group(pe.layout, bg_entries);
+  } catch (const std::exception& e) {
+    // Tag the opaque "Failed to create bind group" with the kernel name,
+    // binding count, and input/output split so we can diagnose fused-node
+    // layout mismatches without rebuilding with a debug shader. Also dumps
+    // the first few binding buffer handles so we can see if the same
+    // underlying WGPUBuffer is being bound to multiple slots (which some
+    // WebGPU validators reject for storage bindings).
+    std::ostringstream diag;
+    diag << "[WebGPU compiled] " << e.what() << " kernel=" << kernel_lib_
+         << " (" << (contiguous ? "c" : "g_nd") << (contiguous ? "" : std::to_string(ndim))
+         << ") entries=" << bg_entries.size()
+         << " inputs=" << num_binding_inputs
+         << " outputs=" << outputs.size()
+         << " has_strides=" << (strides_buf ? 1 : 0);
+    diag << " bufs=[";
+    for (size_t i = 0; i < bg_entries.size() && i < 12; ++i) {
+      if (i) diag << ",";
+      diag << reinterpret_cast<uintptr_t>(bg_entries[i].first);
+    }
+    diag << "]";
+    throw std::runtime_error(diag.str());
+  }
 
   uint32_t total_threads =
       (total_size + wgpu::N_READS - 1) / wgpu::N_READS;
