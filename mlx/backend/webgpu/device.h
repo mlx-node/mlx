@@ -99,18 +99,7 @@ class CommandEncoder {
   size_t bytes_tracked_{0};
   std::vector<std::shared_ptr<array::Data>> temporaries_;
 
-  // DEV-F003: pipeline + bind-group RPC-elision caches.
-  //
-  // These were previously reset in end_compute_pass(), which defeated any
-  // within-pass elision because dispatch_compute() ends the pass after every
-  // dispatch. They are now encoder-scope: reset only when a new compute pass
-  // is opened (see ensure_active()). In today's dispatch_compute() — which
-  // ends the pass after every call — the cache starts empty for every
-  // dispatch and provides no elision, but the plumbing is correct for a
-  // future relaxation (DEV-F004) that keeps the pass open across back-to-back
-  // dispatches on disjoint buffer sets. Correctness invariant: WebGPU's
-  // setPipeline / setBindGroup commands are pass-scoped, so the cache MUST
-  // be reset on pass-begin (not pass-end).
+  // Track last-set pipeline/bindgroups to skip redundant RPC calls
   WGPUComputePipeline last_pipeline_{nullptr};
   WGPUBindGroup last_bind_group_{nullptr};
 };
@@ -125,31 +114,13 @@ class UniformBufferPool {
   ~UniformBufferPool();
 
  private:
-  // WebGPU's minimum uniform alignment is 256 bytes. We also use 256 as the
-  // smallest bucket.
-  static constexpr size_t MIN_BUCKET = 256;
-
-  // DEV-F008: power-of-two bucketing above the 256B floor. A request for N
-  // bytes lands in the smallest power-of-two bucket >= max(N, 256). acquire()
-  // also walks up from the target bucket, so a 260B request can be satisfied
-  // by a free 512B buffer (the previous aligned-size keying could not share
-  // across buckets).
-  static size_t bucket_for(size_t s) {
-    if (s <= MIN_BUCKET) {
-      return MIN_BUCKET;
-    }
-    // Round up to next power of two (C++20 std::bit_ceil).
-    size_t b = 1;
-    while (b < s) b <<= 1;
-    return b;
+  static constexpr size_t ALIGNMENT = 256;
+  size_t align_size(size_t s) const {
+    return (s + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
   }
-
-  // Map from bucket-size -> free list of buffers. Buckets are powers of two
-  // with a 256B floor.
+  // Map from aligned_size -> free list of buffers
   std::unordered_map<size_t, std::vector<WGPUBuffer>> free_lists_;
-  // Track allocated bucket-size for each buffer. Holds every buffer ever
-  // created by this pool (whether checked out or free). The destructor walks
-  // this map to destroy all allocations, including those not yet returned.
+  // Track allocated size for each buffer (for reuse lookup)
   std::unordered_map<WGPUBuffer, size_t> buf_sizes_;
   std::mutex mutex_;
 };
