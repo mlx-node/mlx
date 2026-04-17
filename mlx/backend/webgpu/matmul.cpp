@@ -12,9 +12,7 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <cstdint>
 #include <cstring>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -40,16 +38,6 @@ constexpr uint32_t GEMV_WORKGROUP_SIZE = 256;
 // Layout must match the WGSL struct emitted by wgsl_matmul_params_struct().
 // vec4<u32> fields require 16-byte alignment in WGSL uniform buffers; the
 // first vec4 (batch_shape) starts at offset 32 which satisfies this.
-//
-// MM-F012 safe-model-size note: all offsets / strides in this struct are u32.
-// `offset_a`, `offset_b`, and `batch_stride_*` are therefore limited to
-// 2^32 - 1 *elements* (or u32 indices, for the packed bf16 B path). For f32
-// weights that is ~16 GiB worth of elements; for bf16 weights stored packed
-// (two per u32) that is ~16 Gi u32 pairs ≈ 32 Gi bf16 scalars. In practice
-// the biggest buffer we touch today (Qwen3.5-0.8B embeddings) is ~272 MiB and
-// sits comfortably inside u32 range. dispatch_matmul() has explicit runtime
-// asserts that every offset/stride it pushes fits in u32 so an oversized
-// model fails loudly instead of silently truncating into a garbage index.
 struct MatmulParams {
   uint32_t M;
   uint32_t N;
@@ -142,11 +130,6 @@ std::string make_gemv_kernel(
     << "fn " << entry_name
     << "(@builtin(workgroup_id) wid: vec3u,\n"
     << " @builtin(local_invocation_id) lid: vec3u) {\n"
-    << "  // MM-F006 contract: `output_idx = wid.x + wid.y * GRID_X` assumes\n"
-    << "  // the host decomposed `total_tiles` using `wg_x == GRID_X` (65535)\n"
-    << "  // whenever `wg_y > 1`. Any other `wg_x` with `wg_y > 1` produces a\n"
-    << "  // non-bijective mapping and silent wrong logits. The host-side\n"
-    << "  // invariant is asserted in dispatch_matmul() below.\n"
     << "  let output_idx = wid.x + wid.y * GRID_X;\n"
     << "  let batch = wid.z;\n"
     << "  if (batch >= params.batch_size) { return; }\n"
@@ -303,11 +286,6 @@ std::string make_gemv_multi_col_kernel(
     << "fn " << entry_name
     << "(@builtin(workgroup_id) wid: vec3u,\n"
     << " @builtin(local_invocation_id) lid: vec3u) {\n"
-    << "  // MM-F006 contract: `tile_idx = wid.x + wid.y * GRID_X` assumes the\n"
-    << "  // host decomposed `total_tiles` using `wg_x == GRID_X` (65535)\n"
-    << "  // whenever `wg_y > 1`. Any other `wg_x` with `wg_y > 1` produces a\n"
-    << "  // non-bijective mapping. The host-side invariant is asserted in\n"
-    << "  // dispatch_matmul() below.\n"
     << "  let tile_idx = wid.x + wid.y * GRID_X;\n"
     << "  let batch = wid.z;\n"
     << "  if (batch >= params.batch_size) { return; }\n"
@@ -807,77 +785,28 @@ static void dispatch_matmul(
   std::memset(params.batch_shape, 0, sizeof(params.batch_shape));
   std::memset(params.batch_stride_a, 0, sizeof(params.batch_stride_a));
   std::memset(params.batch_stride_b, 0, sizeof(params.batch_stride_b));
-  // MM-F012: every stride we push into the uniform is narrowed to u32. For the
-  // model sizes we actually dispatch (see MatmulParams comment) this is safe,
-  // but fail loudly instead of silently truncating if that ever stops holding.
-  constexpr int64_t kU32Max =
-      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
   for (size_t i = 0; i < batch_shape.size() && i < 4; ++i) {
-    // batch_shape is int32_t so by definition fits in u32 once >= 0. Keep
-    // only the sign check — the upper-bound comparison would be tautological
-    // and triggers a -Wtautological-constant-out-of-range-compare warning.
-    if (batch_shape[i] < 0) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F012: batch_shape entry must be non-negative");
-    }
-    if (a_batch_strides[i] < 0 || a_batch_strides[i] > kU32Max) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F012: a batch stride does not fit in u32");
-    }
+    params.batch_shape[i] = static_cast<uint32_t>(batch_shape[i]);
+    params.batch_stride_a[i] = static_cast<uint32_t>(a_batch_strides[i]);
     // For packed-bf16 B, the kernel indexes array<u32> (2 bf16 per u32),
     // so batch strides must be in u32 units. collapse_batches returns
     // element strides, so divide by 2. (In practice packed B is always
     // a 2D weight with stride 0, but guard against future batched use.)
-    const int64_t b_stride = b_packed_bf16
-        ? (b_batch_strides[i] / 2)
-        : b_batch_strides[i];
-    if (b_stride < 0 || b_stride > kU32Max) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F012: b batch stride does not fit in u32");
-    }
-    params.batch_shape[i] = static_cast<uint32_t>(batch_shape[i]);
-    params.batch_stride_a[i] = static_cast<uint32_t>(a_batch_strides[i]);
-    params.batch_stride_b[i] = static_cast<uint32_t>(b_stride);
+    params.batch_stride_b[i] = b_packed_bf16
+        ? static_cast<uint32_t>(b_batch_strides[i] / 2)
+        : static_cast<uint32_t>(b_batch_strides[i]);
   }
   params.batch_stride_c = batch_stride_c;
-  // MM-F012: offset_a is in element units — verify it survives u32 narrowing.
-  const int64_t offset_a_elems =
-      static_cast<int64_t>(a.offset()) /
-      static_cast<int64_t>(a.itemsize());
-  if (offset_a_elems < 0 || offset_a_elems > kU32Max) {
-    throw std::runtime_error(
-        "[WebGPU matmul] MM-F012: offset_a does not fit in u32");
-  }
-  params.offset_a = static_cast<uint32_t>(offset_a_elems);
+  params.offset_a = static_cast<uint32_t>(a.offset() / a.itemsize());
   // For packed-bf16 B buffers the shader indexes array<u32>, so the offset
   // must be expressed in u32 units (4 bytes each). array::offset() returns
   // BYTES, and in packed mode those bytes are stored 2 bf16 per u32 — any
   // slice must start on a u32 boundary (element index divisible by 2) so
   // dividing the byte offset by 4 gives the packed u32 index.
   if (b_packed_bf16) {
-    // MM-F011: b.offset() is a byte count. Packed-bf16 indexing divides it by
-    // 4 to obtain a u32 index, which silently rounds down any misaligned
-    // slice into a wrong starting element. Reject misalignment loudly.
-    if ((b.offset() % 4u) != 0u) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F011: packed bf16 b.offset() must be a multiple"
-          " of 4 bytes (u32-aligned); got byte offset not divisible by 4");
-    }
-    const int64_t offset_b_u32 = static_cast<int64_t>(b.offset()) / 4;
-    if (offset_b_u32 < 0 || offset_b_u32 > kU32Max) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F012: packed offset_b does not fit in u32");
-    }
-    params.offset_b = static_cast<uint32_t>(offset_b_u32);
+    params.offset_b = static_cast<uint32_t>(b.offset() / 4);
   } else {
-    const int64_t offset_b_elems =
-        static_cast<int64_t>(b.offset()) /
-        static_cast<int64_t>(b.itemsize());
-    if (offset_b_elems < 0 || offset_b_elems > kU32Max) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F012: offset_b does not fit in u32");
-    }
-    params.offset_b = static_cast<uint32_t>(offset_b_elems);
+    params.offset_b = static_cast<uint32_t>(b.offset() / b.itemsize());
   }
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
@@ -899,38 +828,10 @@ static void dispatch_matmul(
     uint32_t tiles_per_row = use_multi_col
         ? ((N + cols_per_wg - 1) / cols_per_wg)
         : N;
-    // MM-F006: compute total_tiles in u64 first so we can detect the case
-    // where the 2D decomposition itself is undefined. The (wg_x, wg_y) fan
-    // out uses a fixed GRID_X=65535, so the addressable space is 65535 *
-    // 65535 = 4_294_836_225 tiles. Beyond that, `wg_y` would need to exceed
-    // 65535 too, which the WebGPU spec does not guarantee any device will
-    // accept (maxComputeWorkgroupsPerDimension minimum is 65535).
-    const uint64_t total_tiles_u64 =
-        static_cast<uint64_t>(M) * static_cast<uint64_t>(tiles_per_row);
-    constexpr uint64_t kGridMax2D =
-        static_cast<uint64_t>(65535u) * static_cast<uint64_t>(65535u);
-    if (total_tiles_u64 >= kGridMax2D) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F006: total_tiles >= 65535^2; the 2D (wg_x, "
-          "wg_y) decomposition cannot address this many tiles with "
-          "GRID_X=65535 fan-out");
-    }
-    const uint32_t total_tiles = static_cast<uint32_t>(total_tiles_u64);
+    uint32_t total_tiles = M * tiles_per_row;
     constexpr uint32_t kGridX = 65535u;
     uint32_t wg_x = total_tiles < kGridX ? total_tiles : kGridX;
     uint32_t wg_y = (total_tiles + kGridX - 1) / kGridX;
-    // MM-F006: the GEMV kernels compute `tile_idx = wid.x + wid.y * GRID_X`
-    // with GRID_X baked to 65535. The (wid.x, wid.y) -> tile_idx mapping is
-    // only bijective when `wg_x == GRID_X` whenever `wg_y > 1`. If we ever
-    // relaxed the clamp, short rows would collide with different `wid.y`
-    // values and silently produce wrong outputs. Assert the invariant loudly
-    // here instead of shipping garbage logits.
-    if (wg_y > 1 && wg_x != kGridX) {
-      throw std::runtime_error(
-          "[WebGPU matmul] MM-F006: GRID_X=65535 dispatch invariant violated"
-          " (wg_y > 1 requires wg_x == 65535 so kernel tile_idx stays"
-          " bijective)");
-    }
     encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y, batch_count);
   } else {
     // Grid: (ceil(N/16), ceil(M/16), batch_size)
@@ -994,137 +895,6 @@ void matmul_dispatch(
       batch_stride_c, s);
 }
 
-// ---------------------------------------------------------------------------
-// MM-F014: pipeline warmup for first-token latency
-// ---------------------------------------------------------------------------
-//
-// Qwen3.5-0.8B decode + prefill together exercise ~6-12 distinct matmul
-// variants (GEMV single-col / GEMV mc4 / GEMV mc8 / GEMM NT — each with and
-// without packed bf16 B). The first dispatch of each variant invokes the
-// WebGPU driver's shader compiler (10-50 ms per pipeline on current
-// hardware). When those compiles happen in the hot path they stack directly
-// into visible TTFT.
-//
-// `warmup_matmul_pipelines_impl` populates the shader-module + pipeline cache
-// with the variant set actually fired by Qwen3.5-0.8B so the real dispatch
-// path is always a cache hit. It is deliberately *not* called from static
-// init — the caller (typically the mlx-node / Device bringup path) decides
-// when to invoke it so startup can overlap warmup with other work.
-//
-// The variant list is enumerated by hand rather than generated because it is
-// small and we want the set to be greppable. Keep it in sync with the
-// selection logic in `dispatch_matmul`:
-//   - GEMV prefix:  `gemv_` for N < 16, `gemv_mc4_` for 16 ≤ N < 512,
-//                   `gemv_mc8_` for N ≥ 512. Qwen3.5 hidden=896,
-//                   intermediate=4864, vocab=151936 all ≥ 512 so mc8 is the
-//                   dominant path; mc4 is cached to cover narrower
-//                   projections and `gemv_` for the degenerate N < 16 case.
-//   - `_al` suffix: fires when N % cols_per_wg == 0 (always true for
-//                   Qwen3.5 dims, which are multiples of 8).
-//   - `_bf16p`:     fires after the first dispatch flips the weight buffer
-//                   into StorageMode::PackedBf16 — we pre-compile both the
-//                   packed and non-packed variants so neither dispatch
-//                   pays compile latency.
-//   - `_sg<N>`:     appended by `wgpu::subgroup_suffix()` when the subgroup
-//                   path is enabled; empty on hardware without subgroups.
-//                   Handled automatically by the helper below.
-void warmup_matmul_pipelines_impl(bool include_packed_bf16) {
-  auto& dev = wgpu::device();
-  const int sg = wgpu::effective_subgroup_size();
-  const std::string sg_suffix = wgpu::subgroup_suffix();
-
-  // Qwen3.5 weights are bf16, which the backend widens to f32 on upload
-  // (dtype_to_wgsl maps bfloat16 → "f32"). f16 decode would produce a
-  // separate variant set if shader-f16 is ever enabled, but Qwen3.5-0.8B
-  // does not rely on it today, so keep the list tight.
-  const char* wgsl_type = "f32";
-
-  auto warm_gemv = [&](const char* prefix,
-                       bool a_transposed,
-                       bool b_transposed,
-                       uint32_t cols_per_wg,
-                       bool n_aligned,
-                       bool b_packed_bf16) {
-    std::string trans_suffix;
-    trans_suffix += (a_transposed ? "T" : "N");
-    trans_suffix += (b_transposed ? "T" : "N");
-    std::string entry_name =
-        std::string(prefix) + trans_suffix + "_" + wgsl_type;
-    if (b_packed_bf16) {
-      entry_name += "_bf16p";
-    }
-    entry_name += sg_suffix;
-    if (n_aligned) {
-      entry_name += "_al";
-    }
-    const bool is_multi_col = (std::string(prefix) != "gemv_");
-    WGPUShaderModule shader = dev.get_or_create_shader_module(
-        entry_name,
-        [&]() {
-          return is_multi_col
-              ? make_gemv_multi_col_kernel(
-                    entry_name,
-                    wgsl_type,
-                    a_transposed,
-                    b_transposed,
-                    sg,
-                    cols_per_wg,
-                    n_aligned,
-                    b_packed_bf16)
-              : make_gemv_kernel(
-                    entry_name,
-                    wgsl_type,
-                    a_transposed,
-                    b_transposed,
-                    sg,
-                    b_packed_bf16);
-        });
-    (void)dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
-  };
-
-  auto warm_gemm = [&](bool a_transposed,
-                       bool b_transposed,
-                       bool b_packed_bf16) {
-    std::string trans_suffix;
-    trans_suffix += (a_transposed ? "T" : "N");
-    trans_suffix += (b_transposed ? "T" : "N");
-    std::string entry_name =
-        std::string("gemm_") + trans_suffix + "_" + wgsl_type;
-    if (b_packed_bf16) {
-      entry_name += "_bf16p";
-    }
-    // GEMM does not take the subgroup path (dispatch_matmul passes sg=0 for
-    // GEMM) and does not append sg_suffix. Match that here so cache keys
-    // line up with the production dispatch.
-    WGPUShaderModule shader = dev.get_or_create_shader_module(
-        entry_name,
-        [&]() {
-          return make_gemm_kernel(
-              entry_name, wgsl_type, a_transposed, b_transposed, b_packed_bf16);
-        });
-    (void)dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
-  };
-
-  // ---- GEMV NT (Qwen decode hot path; b_transposed=true via
-  // check_transpose() on every linear weight). ----
-  warm_gemv("gemv_mc4_", false, true, 4u, /*n_aligned=*/true, false);
-  warm_gemv("gemv_mc8_", false, true, 8u, /*n_aligned=*/true, false);
-  warm_gemv("gemv_", false, true, 1u, /*n_aligned=*/false, false);
-
-  // ---- GEMM NT at TILE_SIZE=16 (prefill / Tq > 1 hot path). ----
-  warm_gemm(false, true, /*b_packed_bf16=*/false);
-
-  if (!include_packed_bf16) {
-    return;
-  }
-  // ---- Packed-bf16 siblings. Packed variants require b_transposed=true
-  // (enforced by make_gemv_*/make_gemm_kernel assertions). ----
-  warm_gemv("gemv_mc4_", false, true, 4u, /*n_aligned=*/true, true);
-  warm_gemv("gemv_mc8_", false, true, 8u, /*n_aligned=*/true, true);
-  warm_gemv("gemv_", false, true, 1u, /*n_aligned=*/false, true);
-  warm_gemm(false, true, /*b_packed_bf16=*/true);
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1166,18 +936,6 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // Allocate output
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
-
-  // MM-F018: the epilogue path below binds `c_in` as read-only storage and
-  // `out_buf` as read_write in the same compute pass. WebGPU forbids the same
-  // buffer from appearing in both roles, so if a graph-level optimizer ever
-  // donates C's buffer to `out` (C == out going in) the dispatch would fail
-  // validation. Call `ensure_no_alias` *before* the matmul dispatch so that
-  // any reallocation receives the matmul output and the epilogue then reads
-  // C and writes out from distinct buffers. Matches the idiom used in
-  // unary/binary/ternary/compiled primitives. In practice `out.set_data`
-  // above already allocates a fresh buffer so this is defensive, but it
-  // costs nothing and keeps the invariant explicit.
-  wgpu::ensure_no_alias(out, c);
 
   // First compute the matmul part: alpha * A @ B
   // We'll create a temporary for the matmul result, then combine with C.
@@ -1302,28 +1060,6 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       wgpu::device().uniform_pool().release(uniform_buf);
     });
   }
-}
-
-// ---------------------------------------------------------------------------
-// MM-F014: free-function entry point for pipeline warmup
-// ---------------------------------------------------------------------------
-//
-// Intentionally *not* auto-called from static init. The caller decides when
-// to invoke it (typically once, right after device bringup in mlx-node's
-// init path) so startup can overlap warmup with other work. Callers declare
-// this forward in their own TU:
-//
-//   namespace mlx::core { void warmup_matmul_pipelines(); }
-//
-// until a shared header for WebGPU init hooks lands. That header lives
-// outside this agent's scope.
-//
-// TODO(matmul/warmup): expose a public entry point — needs a header change
-// (e.g. `mlx/backend/webgpu/warmup.h`) that is owned by the device/worker
-// agent. When that lands, move this declaration into the header and drop
-// the manual forward-declaration above.
-void warmup_matmul_pipelines() {
-  warmup_matmul_pipelines_impl(/*include_packed_bf16=*/true);
 }
 
 } // namespace mlx::core
