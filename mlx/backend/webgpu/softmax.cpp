@@ -40,7 +40,8 @@ std::string make_softmax_kernel(
     const std::string& entry_name,
     const std::string& in_type,
     const std::string& acc_type,
-    bool use_subgroups = false) {
+    int subgroup_size = 0) {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -93,7 +94,9 @@ std::string make_softmax_kernel(
     ;
 
   if (use_subgroups) {
-    wgpu::emit_subgroup_reduction(s, "thread_max", "shared_max", "subgroupMax", "max", wgpu::WORKGROUP_SIZE, 32, "mx");
+    wgpu::emit_subgroup_reduction(
+        s, "thread_max", "shared_max", "subgroupMax", "max",
+        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "mx");
   } else {
     s << "  // Store to shared memory and reduce\n"
       << "  shared_max[tid] = thread_max;\n"
@@ -112,7 +115,9 @@ std::string make_softmax_kernel(
     << "\n";
 
   if (use_subgroups) {
-    wgpu::emit_subgroup_reduction(s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op", wgpu::WORKGROUP_SIZE, 32, "sm");
+    wgpu::emit_subgroup_reduction(
+        s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op",
+        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "sm");
   } else {
     s << "  shared_sum[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n\n";
@@ -179,13 +184,13 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Always accumulate in f32 for precision
   std::string acc_type = "f32";
 
-  bool use_sg = dev.has_subgroups();
-  std::string sg_suffix = use_sg ? "_sg" : "";
+  int sg = wgpu::effective_subgroup_size();
+  std::string sg_suffix = wgpu::subgroup_suffix();
 
   std::string entry_name = std::string("softmax_") + in_type + sg_suffix;
   WGPUShaderModule shader = dev.get_or_create_shader_module(
       entry_name,
-      [&]() { return make_softmax_kernel(entry_name, in_type, acc_type, use_sg); });
+      [&]() { return make_softmax_kernel(entry_name, in_type, acc_type, sg); });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(in);
