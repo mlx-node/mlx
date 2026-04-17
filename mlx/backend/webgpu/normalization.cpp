@@ -61,9 +61,8 @@ std::string make_rmsnorm_kernel(
     const std::string& in_type,
     const std::string& w_type,
     const std::string& acc_type,
-    int subgroup_size,
+    bool use_subgroups,
     bool w_packed_bf16) {
-  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -125,8 +124,7 @@ std::string make_rmsnorm_kernel(
 
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
-        s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op",
-        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size));
+        s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op");
   } else {
     s << "  shared_sum[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n\n";
@@ -170,10 +168,9 @@ std::string make_layernorm_kernel(
     const std::string& w_type,
     const std::string& acc_type,
     bool has_bias,
-    int subgroup_size,
+    bool use_subgroups,
     bool w_packed_bf16,
     bool b_packed_bf16) {
-  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -250,7 +247,7 @@ std::string make_layernorm_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_sum", "shared_sum", "subgroupAdd", "sum_op",
-        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "mn");
+        wgpu::WORKGROUP_SIZE, 32, "mn");
   } else {
     s << "  shared_sum[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n\n";
@@ -275,7 +272,7 @@ std::string make_layernorm_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_var", "shared_sum", "subgroupAdd", "sum_op",
-        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "vr");
+        wgpu::WORKGROUP_SIZE, 32, "vr");
   } else {
     s << "  shared_sum[tid] = thread_var;\n"
       << "  workgroupBarrier();\n\n";
@@ -380,8 +377,8 @@ void RMSNorm::eval_gpu(
   std::string w_type(w_wgsl);
   std::string acc_type = "f32"; // Always accumulate in f32
 
-  int sg = wgpu::effective_subgroup_size();
-  std::string sg_suffix = wgpu::subgroup_suffix();
+  bool use_sg = dev.has_subgroups();
+  std::string sg_suffix = use_sg ? "_sg" : "";
 
   // Detect whether the weight buffer is stored in packed-bf16 layout
   // (2 bf16 values per u32 slot). The Step C norm-weight allowlist in
@@ -406,7 +403,7 @@ void RMSNorm::eval_gpu(
         std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
 #endif
         return make_rmsnorm_kernel(
-            entry_name, in_type, w_type, acc_type, sg, w_packed_bf16);
+            entry_name, in_type, w_type, acc_type, use_sg, w_packed_bf16);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -505,8 +502,8 @@ void LayerNorm::eval_gpu(
   std::string w_type(w_wgsl);
   std::string acc_type = "f32"; // Always accumulate in f32
 
-  int sg = wgpu::effective_subgroup_size();
-  std::string sg_suffix = wgpu::subgroup_suffix();
+  bool use_sg = dev.has_subgroups();
+  std::string sg_suffix = use_sg ? "_sg" : "";
   std::string bias_suffix = has_bias ? "_bias" : "_nobias";
 
   // Detect packed-bf16 storage on the weight (and optional bias) buffers.
@@ -540,7 +537,7 @@ void LayerNorm::eval_gpu(
             w_type,
             acc_type,
             has_bias,
-            sg,
+            use_sg,
             w_packed_bf16,
             b_packed_bf16);
       });

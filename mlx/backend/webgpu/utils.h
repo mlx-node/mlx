@@ -380,11 +380,11 @@ inline int effective_subgroup_size() {
 // the detected subgroup size (i.e. emits subgroup builtins). Returns the
 // empty string when the subgroup path is disabled.
 //
-// Every call site that selects the subgroup path MUST append this suffix
-// (not a bare "_sg") to its entry_name, because a cached pipeline compiled
-// for subgroup_size=32 must NOT be reused on a device where we later
-// detected subgroup_size=64 — the tree-reduction tail in the emitted WGSL
-// is constant-folded for a specific lane count.
+// Callers currently append "_sg" manually when has_subgroups() is true; that
+// is insufficient because a cached pipeline compiled for subgroup_size=32
+// must NOT be reused on a device where we later detected subgroup_size=64.
+// Part B will swap all call sites from `"_sg"` to `subgroup_suffix()` so the
+// cache keys per detected subgroup size.
 inline std::string subgroup_suffix() {
   int sg = effective_subgroup_size();
   if (sg == 0) return "";
@@ -403,24 +403,23 @@ inline std::string subgroup_suffix() {
 //                   effective_subgroup_size(). MUST match the actual runtime
 //                   subgroupSize on the device the pipeline executes on —
 //                   otherwise the tree-reduction step reads uninitialized
-//                   slots in `shared_name` and returns garbage. 32 is only
-//                   correct on Apple Silicon / NVIDIA / WARP-32 hardware;
-//                   AMD is 64 and Intel is 8/16/32. Callers MUST pass the
-//                   detected size explicitly (no default), and MUST cache
-//                   the resulting pipeline under a key that includes
-//                   subgroup_suffix() so a pipeline compiled for one lane
-//                   count is never reused on a device with a different one.
+//                   slots in `shared_name` and returns garbage. The default
+//                   of 32 is only correct on Apple Silicon / NVIDIA / WARP-32
+//                   hardware; AMD is 64 and Intel is 8/16/32. Part B will
+//                   remove this default and make all callers pass the
+//                   detected size explicitly. Do NOT add new callers that
+//                   rely on the default.
 //   num_subgroups is emitted as a constant, so the WGSL is the same number
 //   of tree-reduce iterations regardless of device — the pipeline must be
-//   cache-keyed per subgroup_size (see subgroup_suffix() above).
+//   cache-keyed per subgroup_size (see subgroup_suffix() below).
 inline void emit_subgroup_reduction(
     std::ostringstream& s,
     const std::string& acc_var,
     const std::string& shared_name,
     const std::string& subgroup_builtin,
     const std::string& reduce_op,
-    uint32_t workgroup_size,
-    uint32_t subgroup_size,
+    uint32_t workgroup_size = WORKGROUP_SIZE,
+    uint32_t subgroup_size = 32, // TODO(Part B): remove default.
     const std::string& prefix = "") {
   uint32_t num_subgroups = workgroup_size / subgroup_size;
 
