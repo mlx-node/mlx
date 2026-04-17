@@ -42,14 +42,9 @@ struct RMSNormParams {
 // ---------------------------------------------------------------------------
 // LayerNorm params — must match the WGSL struct layout
 // ---------------------------------------------------------------------------
-//
-// data[3] holds the bias stride. `has_bias` is a shader-compile-time variant
-// (encoded in the pipeline entry_name) and therefore does not need to be
-// passed through the uniform. When has_bias is false the b_stride field is
-// still populated (as 0) but never read.
 
 struct LayerNormParams {
-  uint32_t data[4]; // [axis_size, w_stride, eps_bits, b_stride]
+  uint32_t data[4]; // [axis_size, w_stride, eps_bits, has_bias]
 };
 
 // ---------------------------------------------------------------------------
@@ -230,7 +225,6 @@ std::string make_layernorm_kernel(
     << "  let axis_size = params.data.x;\n"
     << "  let w_stride = params.data.y;\n"
     << "  let eps = bitcast<f32>(params.data.z);\n"
-    << "  let b_stride = params.data.w;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
     << "  let row_start = row * axis_size;\n"
@@ -301,15 +295,13 @@ std::string make_layernorm_kernel(
 
   if (has_bias) {
     if (b_packed_bf16) {
-      // b_stride is 0 (broadcast scalar) or 1 (1D contiguous). Packed formula
-      // handles both — broadcast always reads slot 0 low half.
-      s << "    let b_elem_idx = i * b_stride;\n"
+      s << "    let b_elem_idx = i * w_stride;\n"
         << "    let b_u32_idx = b_elem_idx >> 1u;\n"
         << "    let b_parity = b_elem_idx & 1u;\n"
         << "    let b_pair = unpack_bf16_pair(bias[b_u32_idx]);\n"
         << "    let b = select(b_pair.y, b_pair.x, b_parity == 0u);\n";
     } else {
-      s << "    let b = " << acc_type << "(bias[i * b_stride]);\n";
+      s << "    let b = " << acc_type << "(bias[i * w_stride]);\n";
     }
     s << "    output[row_start + i] = " << in_type << "(val * w + b);\n";
   } else {
@@ -558,21 +550,7 @@ void LayerNorm::eval_gpu(
   uint32_t eps_bits;
   std::memcpy(&eps_bits, &eps_val, sizeof(eps_bits));
   params.data[2] = eps_bits;
-  // RED-F002: bias uses its OWN stride. When bias is a scalar broadcast
-  // (ndim() == 0 or stride 0) b_stride is 0 so the kernel reads bias[0]
-  // for every element, which is correct. When bias is 1-D contiguous,
-  // b_stride is beta.strides()[last_axis] (typically 1). Previously the
-  // kernel indexed bias by the weight's stride — silently wrong whenever
-  // the two had distinct strides (e.g. scalar-broadcast bias + vector
-  // weight, or vice-versa).
-  uint32_t b_stride = 0;
-  if (has_bias) {
-    const auto& beta = inputs[2];
-    if (beta.ndim() == 1) {
-      b_stride = static_cast<uint32_t>(beta.strides()[0]);
-    }
-  }
-  params.data[3] = b_stride;
+  params.data[3] = has_bias ? 1u : 0u;
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =

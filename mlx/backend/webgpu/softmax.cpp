@@ -144,16 +144,6 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   const auto& in_orig = inputs[0];
 
-  // RED-F016: scalar input has no "last axis" — `in.strides()[in.ndim() - 1]`
-  // and `in.shape().back()` are UB on a 0-D array. Softmax of a single scalar
-  // is mathematically degenerate (a single element, no reduction), so reject
-  // it with a clear message rather than silently reading past the end of an
-  // empty vector.
-  if (in_orig.ndim() == 0) {
-    throw std::invalid_argument(
-        "[Softmax::eval_gpu] Softmax requires a non-scalar input; got ndim==0.");
-  }
-
   // Make sure the last dimension is contiguous.
   // If the input is contiguous with stride-1 last axis, we can work in-place.
   array in = in_orig;
