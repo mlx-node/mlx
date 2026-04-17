@@ -105,15 +105,33 @@ inline std::string wgsl_unpack_bf16_pair() {
 // Ensure the output array's buffer is large enough for GPU-side element sizes.
 // Call after set_*_output_data() which allocates based on CPU itemsize.
 // For types where GPU elements are larger (bool, bfloat16), this reallocates.
+//
+// CEL-F001: when an output is donated from an input whose physical WebGPU
+// buffer is already GPU-sized (e.g. a bf16 array produced by a prior GPU
+// kernel, then donated to this op's output), we must NOT reallocate — the
+// donation is the whole point. The caller's `out.itemsize()` is the CPU
+// itemsize (2 for bf16), but the underlying WebGPUBuffer is already the
+// wider 4B/elem. Short-circuit when the existing buffer is large enough to
+// hold the GPU-sized payload; otherwise fall through to the reallocation.
 inline void ensure_wgpu_size(array& out) {
   size_t gpu_is = wgpu_itemsize(out.dtype());
-  if (gpu_is > out.itemsize()) {
-    out.set_data(
-        allocator::malloc(out.data_size() * gpu_is),
-        out.data_size(),
-        out.strides(),
-        out.flags());
+  if (gpu_is <= out.itemsize()) {
+    return;
   }
+  auto* wbuf = static_cast<const WebGPUBuffer*>(out.buffer().ptr());
+  size_t needed = out.data_size() * gpu_is;
+  if (wbuf && wbuf->size >= needed) {
+    // Physical buffer is already wide enough (either a donation from a
+    // prior GPU kernel or a previous ensure_wgpu_size call). Skip the
+    // reallocation — this preserves donation and avoids churning the
+    // buffer pool every time a fused output is emitted.
+    return;
+  }
+  out.set_data(
+      allocator::malloc(needed),
+      out.data_size(),
+      out.strides(),
+      out.flags());
 }
 
 // WebGPU forbids the same buffer appearing as both read-only and read-write
@@ -281,10 +299,34 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
   }
 }
 
-// Device-aware dtype helper: falls back to f32 when shader-f16 is unavailable.
+// Device-aware dtype helper: returns the WGSL type name for a dtype, falling
+// back to "f32" for f16 when the device has no `shader-f16` feature.
+//
+// CG-F012: the old fallback just returned "f32" by name while wgpu_itemsize
+// kept reporting 2 bytes for f16. Kernels emitted with array<f32> then read
+// 4 bytes per element from a buffer that only holds 2-byte elements — silent
+// garbage past the first half. Fully fixing this requires:
+//
+//   1. wgpu_itemsize(f16) returning 4 when shader-f16 is absent, AND
+//   2. upload_with_conversion() in device.cpp widening f16 → f32 on upload
+//      (mirroring the existing bf16 → f32 path).
+//
+// (2) lives in device.cpp, which is off-limits to this change cluster. Until
+// that lands, we fail closed: throw at shader-generation time rather than
+// silently emit a kernel whose reads will return garbage. Devices without
+// `shader-f16` simply cannot execute an f16 workload today — this makes that
+// explicit instead of producing incorrect numerics.
+//
+// TODO: coordinate with device.cpp: add an `f16 → f32` widening branch in
+// `upload_with_conversion()` and flip this throw to return "f32" once the
+// upload side can materialise the buffer with f32 elements.
 inline const char* dtype_to_wgsl_safe(Dtype dtype) {
   if (dtype.val() == Dtype::Val::float16 && !device().has_shader_f16()) {
-    return "f32";
+    throw std::runtime_error(
+        "[WebGPU] float16 kernel requested on a device without the "
+        "'shader-f16' feature. A widened-upload fallback is not yet "
+        "implemented (see CG-F012). Re-run on a device that reports "
+        "shader-f16, or cast the input to float32 before the op.");
   }
   return dtype_to_wgsl(dtype);
 }
