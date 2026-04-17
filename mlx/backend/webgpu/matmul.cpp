@@ -88,8 +88,9 @@ std::string make_gemv_kernel(
     const std::string& dtype,
     bool a_transposed,
     bool b_transposed,
-    bool use_sg,
+    int subgroup_size,
     bool b_packed_bf16 = false) {
+  const bool use_sg = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_sg) {
@@ -197,7 +198,7 @@ std::string make_gemv_kernel(
         /*subgroup_builtin=*/"subgroupAdd",
         /*reduce_op=*/"sum_op",
         /*workgroup_size=*/256,
-        /*subgroup_size=*/32);
+        /*subgroup_size=*/static_cast<uint32_t>(subgroup_size));
   } else {
     s << "  shared_acc[tid] = acc;\n"
       << "  workgroupBarrier();\n";
@@ -241,10 +242,11 @@ std::string make_gemv_multi_col_kernel(
     const std::string& dtype,
     bool a_transposed,
     bool b_transposed,
-    bool use_sg,
+    int subgroup_size,
     uint32_t cols_per_wg,
     bool n_aligned,
     bool b_packed_bf16 = false) {
+  const bool use_sg = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_sg) {
@@ -399,32 +401,31 @@ std::string make_gemv_multi_col_kernel(
 
   // cols_per_wg parallel workgroup reductions, fused into the same barriers.
   if (use_sg) {
+    const uint32_t sg = static_cast<uint32_t>(subgroup_size);
+    const uint32_t num_partials = 128u / sg; // 128-thread workgroup
     for (uint32_t i = 0; i < cols_per_wg; ++i) {
       s << "  var sg" << i << " = subgroupAdd(acc" << i << ");\n";
     }
-    s << "  let sg_id = tid / 32u;\n"
+    s << "  let sg_id = tid / " << sg << "u;\n"
       << "  if (subgroupElect()) {\n";
     for (uint32_t i = 0; i < cols_per_wg; ++i) {
       s << "    shared_" << i << "[sg_id] = sg" << i << ";\n";
     }
     s << "  }\n"
       << "  workgroupBarrier();\n";
-    // 128 threads / 32 subgroup = 4 subgroups. Reduce 4 values per shared
-    // array.
-    s << "  if (tid < 2u) {\n";
-    for (uint32_t i = 0; i < cols_per_wg; ++i) {
-      s << "    shared_" << i << "[tid] = shared_" << i << "[tid] + shared_"
-        << i << "[tid + 2u];\n";
+    // Tree-reduce the `num_partials` subgroup results across shared memory.
+    // num_partials = 128 / subgroup_size: 4 (sg=32), 2 (sg=64), 8 (sg=16),
+    // 16 (sg=8), 1 (sg=128). Emit a codegen-time loop so the WGSL is
+    // correct for every detected subgroup_size, not just sg=32.
+    for (uint32_t stride = num_partials >> 1; stride >= 1; stride >>= 1) {
+      s << "  if (tid < " << stride << "u) {\n";
+      for (uint32_t i = 0; i < cols_per_wg; ++i) {
+        s << "    shared_" << i << "[tid] = shared_" << i
+          << "[tid] + shared_" << i << "[tid + " << stride << "u];\n";
+      }
+      s << "  }\n"
+        << "  workgroupBarrier();\n";
     }
-    s << "  }\n"
-      << "  workgroupBarrier();\n"
-      << "  if (tid < 1u) {\n";
-    for (uint32_t i = 0; i < cols_per_wg; ++i) {
-      s << "    shared_" << i << "[tid] = shared_" << i << "[tid] + shared_"
-        << i << "[tid + 1u];\n";
-    }
-    s << "  }\n"
-      << "  workgroupBarrier();\n";
   } else {
     for (uint32_t i = 0; i < cols_per_wg; ++i) {
       s << "  shared_" << i << "[tid] = acc" << i << ";\n";
@@ -668,7 +669,9 @@ static void dispatch_matmul(
     const Stream& s) {
   auto& dev = wgpu::device();
   const char* wgsl_type = wgpu::dtype_to_wgsl_safe(out.dtype());
-  const bool use_sg = (kind == MatmulKind::GEMV) && dev.has_subgroups();
+  // Only GEMV uses subgroup intrinsics; GEMM has its own 16x16-tile reduction.
+  const int sg =
+      (kind == MatmulKind::GEMV) ? wgpu::effective_subgroup_size() : 0;
 
   // Use the multi-col GEMV kernel when N is large enough to produce enough
   // workgroups for GPU saturation. For very small N we use the single-col
@@ -722,9 +725,11 @@ static void dispatch_matmul(
   if (b_packed_bf16) {
     entry_name += "_bf16p";
   }
-  if (use_sg) {
-    entry_name += "_sg";
-  }
+  // subgroup_suffix() returns "_sg<N>" when the subgroup path is enabled,
+  // empty otherwise. Partitions the pipeline cache by detected lane count
+  // so a pipeline compiled for 32-lane hardware is never reused on a
+  // 64-lane device.
+  entry_name += wgpu::subgroup_suffix();
   if (n_aligned) {
     entry_name += "_al";
   }
@@ -745,7 +750,7 @@ static void dispatch_matmul(
                     wgsl_type,
                     a_transposed,
                     b_transposed,
-                    use_sg,
+                    sg,
                     cols_per_wg,
                     n_aligned,
                     b_packed_bf16)
@@ -754,7 +759,7 @@ static void dispatch_matmul(
                     wgsl_type,
                     a_transposed,
                     b_transposed,
-                    use_sg,
+                    sg,
                     b_packed_bf16);
         }
         return make_gemm_kernel(

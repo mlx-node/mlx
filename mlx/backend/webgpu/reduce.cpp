@@ -200,8 +200,9 @@ std::string make_all_reduce_kernel(
     const std::string& acc_type,
     const std::string& out_type,
     const ReduceOpInfo& info,
-    bool use_subgroups = false,
+    int subgroup_size = 0,
     const std::string& subgroup_builtin = "") {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -256,7 +257,9 @@ std::string make_all_reduce_kernel(
     << "\n";
 
   if (use_subgroups && !subgroup_builtin.empty()) {
-    wgpu::emit_subgroup_reduction(s, "acc", "shared_data", subgroup_builtin, "reduce_op");
+    wgpu::emit_subgroup_reduction(
+        s, "acc", "shared_data", subgroup_builtin, "reduce_op",
+        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size));
   } else {
     s << "  // Store to shared memory\n"
       << "  shared_data[tid] = acc;\n"
@@ -302,8 +305,9 @@ std::string make_row_reduce_kernel(
     const std::string& out_type,
     const ReduceOpInfo& info,
     bool general,
-    bool use_subgroups = false,
+    int subgroup_size = 0,
     const std::string& subgroup_builtin = "") {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -427,7 +431,9 @@ std::string make_row_reduce_kernel(
   s << "\n";
 
   if (use_subgroups && !subgroup_builtin.empty()) {
-    wgpu::emit_subgroup_reduction(s, "acc", "shared_data", subgroup_builtin, "reduce_op");
+    wgpu::emit_subgroup_reduction(
+        s, "acc", "shared_data", subgroup_builtin, "reduce_op",
+        wgpu::WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size));
   } else {
     s << "  // Store to shared memory\n"
       << "  shared_data[tid] = acc;\n"
@@ -705,8 +711,8 @@ void gpu_all_reduce(
 
   // Check subgroup support
   const char* sg_builtin = get_subgroup_builtin(reduce_type);
-  bool use_sg = dev.has_subgroups() && sg_builtin[0] != '\0';
-  std::string sg_suffix = use_sg ? "_sg" : "";
+  int sg = (sg_builtin[0] != '\0') ? wgpu::effective_subgroup_size() : 0;
+  std::string sg_suffix = (sg > 0) ? wgpu::subgroup_suffix() : "";
 
   // ContiguousAllReduce guarantees size() == data_size()
   uint32_t input_size = static_cast<uint32_t>(in.size());
@@ -724,7 +730,7 @@ void gpu_all_reduce(
       entry_name,
       [&]() {
         return make_all_reduce_kernel(
-            entry_name, in_type, acc_type, out_type, info, use_sg, sg_builtin);
+            entry_name, in_type, acc_type, out_type, info, sg, sg_builtin);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -771,7 +777,7 @@ void gpu_all_reduce(
         entry2,
         [&]() {
           return make_all_reduce_kernel(
-              entry2, out_type, acc_type, out_type, info, use_sg, sg_builtin);
+              entry2, out_type, acc_type, out_type, info, sg, sg_builtin);
         });
     auto pe2 =
         dev.get_or_create_pipeline(entry2, shader2, entry2.c_str());
@@ -851,8 +857,8 @@ void gpu_row_reduce(
 
   // Check subgroup support
   const char* sg_builtin = get_subgroup_builtin(reduce_type);
-  bool use_sg = dev.has_subgroups() && sg_builtin[0] != '\0';
-  std::string sg_suffix = use_sg ? "_sg" : "";
+  int sg = (sg_builtin[0] != '\0') ? wgpu::effective_subgroup_size() : 0;
+  std::string sg_suffix = (sg > 0) ? wgpu::subgroup_suffix() : "";
 
   assert(!plan.shape.empty());
   uint32_t row_size = static_cast<uint32_t>(plan.shape.back());
@@ -869,7 +875,7 @@ void gpu_row_reduce(
       [&]() {
         return make_row_reduce_kernel(
             entry_name, in_type, acc_type, out_type, info, general,
-            use_sg, sg_builtin);
+            sg, sg_builtin);
       });
   auto pe =
       dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
