@@ -120,6 +120,141 @@ std::string make_arg_reduce_kernel(
   return s.str();
 }
 
+// ---------------------------------------------------------------------------
+// WGSL kernel generation: row-parallel arg_reduce (last-axis fast path)
+// ---------------------------------------------------------------------------
+//
+// RED-F010: The per-output-element kernel above runs a serial scan across
+// the reduction axis. On the sampling critical path (argmax over logits of
+// shape [1, vocab=151936]) that's a single thread doing a 151K-element scan
+// while the rest of the workgroup sits idle.
+//
+// This variant dispatches one workgroup per output row and performs a
+// workgroup-wide tree reduction on (value, index) pairs in shared memory.
+// We use two parallel shared arrays (struct-of-arrays) rather than a packed
+// struct to keep the inner `combine` step a simple conditional swap.
+//
+// Gated by the host to:
+//   - last-axis reduction (axis_stride == 1)
+//   - row-contiguous input (so `row * axis_size + i` is the correct offset)
+//   - reduction_size > 1024 (below this the per-output kernel wins on
+//     launch overhead)
+//
+// For every other shape we fall back to the existing per-thread-per-output
+// kernel — it's simple, correct, and already fast enough for small axes.
+
+std::string make_row_arg_reduce_kernel(
+    const std::string& entry_name,
+    const std::string& in_type,
+    bool is_argmax) {
+  std::ostringstream s;
+
+  if (in_type == "f16") {
+    s << "enable f16;\n";
+  }
+  s << "\n";
+
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+
+  // Simple uniform: just axis_size and num_rows. Row layout is
+  // [num_rows, axis_size] contiguous — no strides needed.
+  s << "struct RowArgReduceParams {\n"
+    << "  data: vec4<u32>,\n"  // [axis_size, num_rows, pad, pad]
+    << "}\n\n";
+
+  s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
+    << ">;\n"
+    << "@group(0) @binding(1) var<storage, read_write> output: array<u32>;\n"
+    << "@group(0) @binding(2) var<uniform> params: RowArgReduceParams;\n\n";
+
+  // Struct-of-arrays shared storage: one tree-reduce merges both streams.
+  s << "var<workgroup> shared_vals: array<" << in_type
+    << ", WORKGROUP_SIZE>;\n";
+  s << "var<workgroup> shared_idxs: array<u32, WORKGROUP_SIZE>;\n\n";
+
+  // For argmax the pair (b_val, b_idx) beats (a_val, a_idx) iff
+  // b_val > a_val OR (b_val == a_val AND b_idx < a_idx). The index tie-break
+  // picks the LOWER index on equality — matching the serial kernel's
+  // strict `>` / `<` semantics (first occurrence wins).
+  const char* strict_cmp = is_argmax ? ">" : "<";
+  // Identity for the per-thread accumulator so unseen threads (tid >=
+  // axis_size) always lose the strict val comparison during the tree reduce.
+  // Per-dtype so the float path uses -FLT_MAX and the integer paths use the
+  // type's extremum (written as a signed / unsigned literal WGSL accepts).
+  // f16 extrema (±65504) stay in-range; f32 uses -FLT_MAX.
+  std::string identity_val;
+  if (in_type == "f32") {
+    identity_val = is_argmax ? "-3.402823e+38" : "3.402823e+38";
+  } else if (in_type == "f16") {
+    identity_val = is_argmax ? "-65504.0" : "65504.0";
+  } else if (in_type == "i32") {
+    identity_val = is_argmax ? "-2147483648" : "2147483647";
+  } else {
+    // u32 (also covers the bool-->u32 remap above)
+    identity_val = is_argmax ? "0u" : "4294967295u";
+  }
+
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << "  let axis_size = params.data.x;\n"
+    << "  let tid = lid.x;\n"
+    << "  let row = wg_id.x;\n"
+    << "  let row_start = row * axis_size;\n"
+    << "\n"
+    << "  // Seed with the reduce identity so threads with tid >= axis_size\n"
+    << "  // carry a value that always loses the strict comparison below.\n"
+    << "  var best_val: " << in_type << " = " << in_type << "("
+    << identity_val << ");\n"
+    << "  var best_idx: u32 = 4294967295u;\n"
+    << "  if (tid < axis_size) {\n"
+    << "    best_val = input[row_start + tid];\n"
+    << "    best_idx = tid;\n"
+    << "  }\n"
+    << "  for (var i: u32 = tid + WORKGROUP_SIZE; i < axis_size;\n"
+    << "       i = i + WORKGROUP_SIZE) {\n"
+    << "    let v = input[row_start + i];\n"
+    << "    if (v " << strict_cmp << " best_val) {\n"
+    << "      best_val = v;\n"
+    << "      best_idx = i;\n"
+    << "    }\n"
+    << "  }\n"
+    << "\n"
+    << "  shared_vals[tid] = best_val;\n"
+    << "  shared_idxs[tid] = best_idx;\n"
+    << "  workgroupBarrier();\n\n";
+
+  // Tree reduction with tie-break on index (prefer lower index).
+  for (uint32_t stride = wgpu::WORKGROUP_SIZE / 2; stride >= 1; stride /= 2) {
+    s << "  if (tid < " << stride << "u) {\n"
+      << "    let o_val = shared_vals[tid + " << stride << "u];\n"
+      << "    let o_idx = shared_idxs[tid + " << stride << "u];\n"
+      << "    let m_val = shared_vals[tid];\n"
+      << "    let m_idx = shared_idxs[tid];\n"
+      << "    let take_o = (o_val " << strict_cmp << " m_val)\n"
+      << "        || (o_val == m_val && o_idx < m_idx);\n"
+      << "    if (take_o) {\n"
+      << "      shared_vals[tid] = o_val;\n"
+      << "      shared_idxs[tid] = o_idx;\n"
+      << "    }\n"
+      << "  }\n"
+      << "  workgroupBarrier();\n";
+  }
+
+  s << "  if (tid == 0u) {\n"
+    << "    output[row] = shared_idxs[0];\n"
+    << "  }\n"
+    << "}\n";
+
+  return s.str();
+}
+
+// Uniform for the row-parallel arg_reduce fast path.
+struct RowArgReduceParams {
+  uint32_t data[4]; // [axis_size, num_rows, pad, pad]
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -146,6 +281,70 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Get the WGSL type for the input
   const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   std::string in_type = (std::string(in_wgsl) == "bool") ? "u32" : in_wgsl;
+
+  // RED-F010 fast-path gate: last-axis reduction + contiguous row layout +
+  // zero offset + large enough reduction size to amortize the
+  // workgroup-per-row launch cost. In that regime the per-output kernel
+  // serializes a 151K-element scan onto a single thread; here we spread it
+  // across the whole workgroup. The offset guard matches the other
+  // webgpu kernels that index `input[row*axis+i]` directly — `wgpu_buffer`
+  // returns the raw WebGPU handle without applying `array::offset()`.
+  const int ndim_in = in.ndim();
+  const bool axis_is_last = (axis_ == ndim_in - 1);
+  const uint32_t axis_size_u = static_cast<uint32_t>(in.shape(axis_));
+  const auto axis_stride_i = in.strides()[axis_];
+  const bool last_axis_contig = axis_is_last && axis_stride_i == 1 &&
+      in.flags().row_contiguous && in.offset() == 0;
+  constexpr uint32_t kRowParallelMinAxis = 1024u;
+  const bool use_row_parallel =
+      last_axis_contig && axis_size_u > kRowParallelMinAxis;
+
+  if (use_row_parallel) {
+    // Build a distinct pipeline cache entry so the fused-row variant never
+    // collides with the per-output scalar kernel under the same dtype.
+    std::string op_name = is_argmax ? "argmax" : "argmin";
+    std::string entry_name = op_name + "_row_" + in_type;
+
+    WGPUShaderModule shader = dev.get_or_create_shader_module(
+        entry_name, [&]() {
+          return make_row_arg_reduce_kernel(entry_name, in_type, is_argmax);
+        });
+    auto pe =
+        dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
+
+    encoder.set_input_array(in);
+    encoder.set_output_array(out);
+
+    const uint32_t num_rows = static_cast<uint32_t>(out.size());
+
+    RowArgReduceParams params{};
+    params.data[0] = axis_size_u;
+    params.data[1] = num_rows;
+
+    auto& pool = wgpu::device().uniform_pool();
+    WGPUBuffer uniform_buf = pool.acquire(
+        wgpu::device().gpu_queue(), &params, sizeof(RowArgReduceParams));
+
+    WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
+    WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+    uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
+    uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+
+    WGPUBindGroup bg = wgpu::create_bind_group(
+        pe.layout,
+        {{in_buf, in_buf_size},
+         {out_buf, out_buf_size},
+         {uniform_buf, sizeof(RowArgReduceParams)}});
+
+    // One workgroup per row.
+    encoder.dispatch_compute(pe.pipeline, bg, num_rows);
+
+    wgpuBindGroupRelease(bg);
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
+    return;
+  }
 
   // Prepare shape/strides with the reduction axis removed
   auto shape = in.shape();
