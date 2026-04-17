@@ -23,15 +23,12 @@ namespace mlx::core {
 namespace {
 
 // Uniform buffer layout for RandomBits kernel.
-// SPEC-F032: keys are passed as a storage buffer binding (not host-read)
-// so the kernel works correctly when keys live GPU-side (e.g. after
-// `random.split`). We plumb element offsets into the key buffer so this
-// supports both row-contiguous and strided key arrays.
+// We pass the key pair plus sizing information.
 struct RandomBitsParams {
-  uint32_t key0_offset;  // element index into keys storage buffer for key0
-  uint32_t key1_offset;  // element index into keys storage buffer for key1
-  uint32_t half_size;    // number of threads (each produces 2 u32 outputs)
-  uint32_t odd;          // 1 if out_per_key is odd, 0 otherwise
+  uint32_t key0;
+  uint32_t key1;
+  uint32_t half_size;   // number of threads (each produces 2 u32 outputs)
+  uint32_t odd;         // 1 if out_per_key is odd, 0 otherwise
   uint32_t bytes_per_key;
   uint32_t _pad0;
   uint32_t _pad1;
@@ -52,8 +49,8 @@ std::string make_random_bits_kernel(const std::string& entry_name) {
 
   s << R"(
 struct RandomBitsParams {
-  key0_offset: u32,
-  key1_offset: u32,
+  key0: u32,
+  key1: u32,
   half_size: u32,
   odd: u32,
   bytes_per_key: u32,
@@ -64,7 +61,6 @@ struct RandomBitsParams {
 
 @group(0) @binding(0) var<storage, read_write> output: array<u32>;
 @group(0) @binding(1) var<uniform> params: RandomBitsParams;
-@group(0) @binding(2) var<storage, read> keys: array<u32>;
 
 // Threefry 2x32 hash function (20 rounds).
 // Rotation constants for 2x32: two sets of 4 rotations each,
@@ -148,14 +144,9 @@ fn threefry2x32(key0: u32, key1: u32, ctr0: u32, ctr1: u32) -> vec2<u32> {
     << "\n"
     << "  if (tid >= total_threads) { return; }\n"
     << "\n"
-    << "  // Load the key pair from GPU memory. Avoids the stale-host-read\n"
-    << "  // bug (SPEC-F032) when the key array was produced on GPU.\n"
-    << "  let key0 = keys[params.key0_offset];\n"
-    << "  let key1 = keys[params.key1_offset];\n"
-    << "\n"
     << "  let drop_last = (odd != 0u) && (tid == half_size);\n"
     << "  let ctr1 = select(tid + total_threads, 0u, drop_last);\n"
-    << "  let bits = threefry2x32(key0, key1, tid, ctr1);\n"
+    << "  let bits = threefry2x32(params.key0, params.key1, tid, ctr1);\n"
     << "\n"
     << "  // Write first u32 output\n"
     << "  output[tid] = bits.x;\n"
@@ -209,43 +200,35 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_input_array(keys);
   encoder.set_output_array(out);
 
+  // Read key data from CPU
+  auto kptr = keys.data<uint32_t>();
+
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
   uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
-  WGPUBuffer keys_buf = wgpu::wgpu_buffer(keys);
-  uint64_t keys_buf_size = wgpuBufferGetSize(keys_buf);
 
   auto& pool = dev.uniform_pool();
 
   // Process each key. In the common case (num_keys=1), this loop runs once.
   for (size_t k = 0; k < num_keys; ++k) {
+    // Get the key pair for this key index
     size_t kidx = 2 * k;
-
-    // SPEC-F032: Compute element offsets into the keys storage buffer
-    // instead of dereferencing host-side. This keeps random generation
-    // correct when keys live GPU-side (e.g. after `random.split`) and
-    // avoids a hidden GPU->CPU synchronization.
-    //
-    // Convert the keys array's byte offset to an element offset and add
-    // the per-key element index. For non-contiguous key arrays we walk
-    // the strides via elem_to_loc.
-    uint64_t keys_elem_base = static_cast<uint64_t>(keys.offset()) /
-        static_cast<uint64_t>(keys.itemsize());
-    uint64_t k0_elem, k1_elem;
+    uint32_t key0, key1;
     if (keys.flags().row_contiguous) {
-      k0_elem = keys_elem_base + static_cast<uint64_t>(kidx);
-      k1_elem = keys_elem_base + static_cast<uint64_t>(kidx + 1);
+      key0 = kptr[kidx];
+      key1 = kptr[kidx + 1];
     } else {
-      auto k0_rel = elem_to_loc(
+      // Handle non-contiguous keys via elem_to_loc
+      auto k1_elem = elem_to_loc(
           static_cast<int>(kidx), keys.shape(), keys.strides());
-      auto k1_rel = elem_to_loc(
+      auto k2_elem = elem_to_loc(
           static_cast<int>(kidx + 1), keys.shape(), keys.strides());
-      k0_elem = keys_elem_base + static_cast<uint64_t>(k0_rel);
-      k1_elem = keys_elem_base + static_cast<uint64_t>(k1_rel);
+      key0 = kptr[k1_elem];
+      key1 = kptr[k2_elem];
     }
 
     RandomBitsParams params{};
-    params.key0_offset = static_cast<uint32_t>(k0_elem);
-    params.key1_offset = static_cast<uint32_t>(k1_elem);
+    params.key0 = key0;
+    params.key1 = key1;
     params.half_size = static_cast<uint32_t>(half_size);
     params.odd = odd ? 1u : 0u;
     params.bytes_per_key = static_cast<uint32_t>(bytes_per_key);
@@ -277,8 +260,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
         {{out_buf, out_buf_size},
-         {uniform_buf, sizeof(RandomBitsParams)},
-         {keys_buf, keys_buf_size}});
+         {uniform_buf, sizeof(RandomBitsParams)}});
 
     uint32_t total_threads = static_cast<uint32_t>(half_size + (odd ? 1 : 0));
     uint32_t num_workgroups =

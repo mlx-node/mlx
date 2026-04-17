@@ -31,51 +31,17 @@ void concatenate_gpu(
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
 
   auto strides = out.strides();
-
-  // SPEC-F025: Detect when each input's slice of the output is itself
-  // row-contiguous. This happens when the concat axis is effectively the
-  // outermost non-trivial dim — i.e. all dims before `axis` have size 1.
-  // In that case `out.strides()` restricted to the slice shape matches
-  // make_contiguous_strides(inputs[i].shape()), so the slice occupies a
-  // contiguous range in the output buffer. Downstream copy_gpu_inplace
-  // can then take the Vector / same-dtype byte-copy fast path
-  // (SPEC-F026) instead of the general strided kernel.
-  bool slice_row_contig = true;
-  for (int d = 0; d < axis; ++d) {
-    if (out.shape(d) != 1) {
-      slice_row_contig = false;
-      break;
-    }
-  }
-
-  // Flags for the slice view. For the row-contiguous case we can
-  // advertise it so downstream fast paths can see through the view;
-  // otherwise keep the pre-existing pessimistic flags (correct for
-  // all layouts, just slower).
-  auto slice_flags = out.flags();
-  if (!slice_row_contig) {
-    slice_flags.row_contiguous = false;
-    slice_flags.col_contiguous = false;
-    slice_flags.contiguous = false;
-  }
+  auto flags = out.flags();
+  flags.row_contiguous = false;
+  flags.col_contiguous = false;
+  flags.contiguous = false;
 
   for (int i = 0; i < static_cast<int>(inputs.size()); i++) {
     array out_slice(inputs[i].shape(), out.dtype(), nullptr, {});
     size_t data_offset = strides[axis] * sizes[i];
     out_slice.copy_shared_buffer(
-        out, strides, slice_flags, out_slice.size(), data_offset);
-
-    // SPEC-F026: KV-cache-append style concats (e.g. along seq axis with
-    // outer dims of size 1) hit this shortcut: a contiguous input feeding
-    // a contiguous dest slice is a straight byte copy, no need for the
-    // GeneralGeneral strided-copy kernel. copy_gpu_inplace's Vector path
-    // already has a copy_buffer_to_buffer fast path when dtypes match.
-    const auto& in_i = inputs[i];
-    bool vector_ok = slice_row_contig &&
-        in_i.flags().row_contiguous && in_i.size() == in_i.data_size() &&
-        in_i.dtype() == out.dtype();
-    CopyType ctype = vector_ok ? CopyType::Vector : CopyType::GeneralGeneral;
-    copy_gpu_inplace(in_i, out_slice, ctype, s);
+        out, strides, flags, out_slice.size(), data_offset);
+    copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
   }
 }
 
