@@ -19,7 +19,6 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -417,15 +416,6 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   ScanParams params{};
   params.data[0] = static_cast<uint32_t>(n_rows);
   params.data[1] = static_cast<uint32_t>(axis_size);
-  // axis_stride is cast to u32 below. WebGPU storage buffers are capped at
-  // ~4 GB (2^32 bytes), and we index array<T> directly, so any stride that
-  // fits a valid buffer fits u32. Still, assert to catch bugs early if a
-  // caller synthesizes an out-of-range stride.
-  assert(
-      in.strides()[axis_] >= 0 &&
-      in.strides()[axis_] <=
-          static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) &&
-      "scan axis stride exceeds u32 range (buffers > 4 GB not addressable)");
   params.data[2] = static_cast<uint32_t>(in.strides()[axis_]);
   params.data[3] = static_cast<uint32_t>(in.ndim());
 

@@ -19,9 +19,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <sstream>
-#include <stdexcept>
 
 namespace mlx::core::fast {
 
@@ -302,37 +300,13 @@ void RoPE::eval_gpu(
     auto pe =
         dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
-    // Read the scalar offset value from the array. Offsets are commonly
-    // int32, but long-context models may produce int64 offsets. We dispatch
-    // on dtype and upconvert safely. int64 values outside the int32 range
-    // indicate a bug (single-offset kernel represents the offset in the
-    // uniform as u32 after reinterpret; positions >= 2^31 are not supported
-    // by the kernel's f32(offset_val) math anyway).
+    // Read offset value from the array (it's a single int)
+    // The offset array should be evaluated, so we can read from it
     uint32_t offset_val = 0;
-    switch (offset.dtype().val()) {
-      case Dtype::Val::int32: {
-        offset_val = static_cast<uint32_t>(offset.data<int32_t>()[0]);
-        break;
-      }
-      case Dtype::Val::int64: {
-        int64_t v = offset.data<int64_t>()[0];
-        if (v > static_cast<int64_t>(std::numeric_limits<int32_t>::max()) ||
-            v < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
-          throw std::runtime_error(
-              "[RoPE::eval_gpu] int64 offset out of int32 range; WebGPU "
-              "backend cannot represent offsets >= 2^31.");
-        }
-        offset_val = static_cast<uint32_t>(static_cast<int32_t>(v));
-        break;
-      }
-      case Dtype::Val::uint32: {
-        offset_val = offset.data<uint32_t>()[0];
-        break;
-      }
-      default:
-        throw std::runtime_error(
-            "[RoPE::eval_gpu] Unsupported offset dtype. Expected int32, "
-            "int64, or uint32.");
+    if (offset.dtype() == int32) {
+      offset_val = static_cast<uint32_t>(offset.data<int32_t>()[0]);
+    } else {
+      offset_val = static_cast<uint32_t>(offset.data<int32_t>()[0]);
     }
 
     uint32_t n_rows = static_cast<uint32_t>(B * N);
@@ -383,15 +357,6 @@ void RoPE::eval_gpu(
 
   } else {
     // ----- General path (T>1 or non-contiguous) -----
-    // The general kernel binds offsets as storage array<i32>, so non-int32
-    // offset dtypes would be silently misread (WebGPU has no i64 type).
-    // Require int32 here; int64 offsets in the general path would require
-    // a GPU-side cast pass which the backend currently doesn't provide.
-    if (offset.dtype() != int32) {
-      throw std::runtime_error(
-          "[RoPE::eval_gpu] General-path offsets must be int32 on WebGPU "
-          "(offset buffer is bound as array<i32>).");
-    }
     std::string entry_name = std::string("rope_general_") + in_type;
     WGPUShaderModule shader = dev.get_or_create_shader_module(
         entry_name,

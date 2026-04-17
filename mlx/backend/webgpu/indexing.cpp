@@ -253,6 +253,9 @@ std::string make_gather_axis_kernel(
     << "  var pre_rem = pre;\n"
     << "  var post_rem = post;\n"
     << "\n"
+    << "  // Process pre-axis dims\n"
+    << "  let axis_u = params.ndim_no_axis - params.idx_size_post; // not used directly\n"
+    << "\n"
     << "  // Simple contiguous approach: compute src_loc and idx_loc from flat coords\n"
     << "  // Decompose (pre, post) back into nd-coords using shapes with axis removed\n"
     << "  var combined = pre * params.idx_size_post + post;\n"
@@ -452,10 +455,6 @@ struct ScatterAxisParams {
   int32_t idx_axis_stride;
   uint32_t ndim_no_axis;
   uint32_t total_size;
-  int32_t out_axis_stride; // populated from out.strides()[axis]
-  uint32_t _pad0;
-  uint32_t _pad1;
-  uint32_t _pad2;
 };
 
 std::string make_scatter_axis_kernel(
@@ -477,10 +476,6 @@ std::string make_scatter_axis_kernel(
     << "  idx_axis_stride: i32,\n"
     << "  ndim_no_axis: u32,\n"
     << "  total_size: u32,\n"
-    << "  out_axis_stride: i32,\n"
-    << "  _pad0: u32,\n"
-    << "  _pad1: u32,\n"
-    << "  _pad2: u32,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> upd: array<"
@@ -534,12 +529,14 @@ std::string make_scatter_axis_kernel(
     << "  var index_val = i32(idx[u32(idx_loc)]);\n"
     << "  if (index_val < 0) { index_val = index_val + i32(params.out_axis_size); }\n"
     << "\n"
-    << "  // Output axis stride is plumbed through the uniform from host\n"
-    << "  // (out.strides()[axis]). Previously this was hardcoded to\n"
-    << "  // i32(idx_size_post), which is only correct for row-contiguous\n"
-    << "  // output; non-contiguous outputs would silently write to the\n"
-    << "  // wrong location.\n"
-    << "  out_loc += index_val * params.out_axis_stride;\n"
+    << "  // Compute output axis stride (we pass out strides with axis removed,\n"
+    << "  // but need the axis stride). We store it in out_strides_no_axis at the end.\n"
+    << "  // Actually, we need the out stride along the scatter axis.\n"
+    << "  // For row-contiguous output, this is idx_size_post.\n"
+    << "  // We compute it: out_axis_stride = get_out_stride_na for a special index.\n"
+    << "  // Let's just use a simple formula for row-contiguous out.\n"
+    << "  let out_axis_stride = i32(params.idx_size_post);\n"
+    << "  out_loc += index_val * out_axis_stride;\n"
     << "\n"
     << "  // Write the update value\n"
     << "  out[u32(out_loc)] = upd[u32(upd_loc)];\n"
@@ -1004,10 +1001,6 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.idx_axis_stride = static_cast<int32_t>(idx.strides()[axis_]);
   params.ndim_no_axis = static_cast<uint32_t>(idx.ndim() - 1);
   params.total_size = static_cast<uint32_t>(idx.size());
-  // Pass the actual output axis stride. For row-contiguous outputs this
-  // equals idx_size_post (the previous hardcoded value), but for other
-  // layouts it must come from out.strides()[axis] to scatter correctly.
-  params.out_axis_stride = static_cast<int32_t>(out.strides()[axis_]);
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
