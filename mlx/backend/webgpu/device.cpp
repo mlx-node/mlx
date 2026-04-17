@@ -109,34 +109,58 @@ WGPUBuffer UniformBufferPool::acquire(
     WGPUQueue queue,
     const void* data,
     size_t size) {
-  size_t aligned = align_size(size);
+  // DEV-F008: target bucket is the smallest power-of-two >= max(size, 256).
+  // On a miss we create the buffer at exactly that bucket size; on a hit we
+  // may walk up to the next non-empty bucket so a larger buffer can satisfy
+  // a smaller request.
+  const size_t target = bucket_for(size);
   WGPUBuffer buf = nullptr;
+  size_t chosen_bucket = 0;
 
+  // DEV-F007: single locked scope covers both the free-list scan and the
+  // buf_sizes_ insert on miss. The miss path still has to call
+  // wgpuDeviceCreateBuffer under the lock — acceptable because misses are
+  // rare (hot path is all hits) and serializing device-create calls is
+  // cheaper than taking the mutex twice per miss.
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = free_lists_.find(aligned);
-    if (it != free_lists_.end() && !it->second.empty()) {
-      buf = it->second.back();
-      it->second.pop_back();
+    // Walk from the target bucket upward looking for a free buffer. Bucket
+    // sizes are powers of two; we stop at the first non-empty bucket.
+    for (size_t b = target; b > 0; b <<= 1) {
+      auto it = free_lists_.find(b);
+      if (it != free_lists_.end() && !it->second.empty()) {
+        buf = it->second.back();
+        it->second.pop_back();
+        chosen_bucket = b;
+        break;
+      }
+      // Cap walk-up at a generous ceiling to avoid infinite loop on overflow
+      // and to keep this predictable; 64 MiB is well above any uniform we
+      // would ever create.
+      if (b >= (1u << 26)) {
+        break;
+      }
     }
-  }
 
-  if (!buf) {
-    // Create a new buffer with Uniform | CopyDst usage
-    WGPUBufferDescriptor desc = {};
-    desc.size = aligned;
-    desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-    desc.mappedAtCreation = false;
-    buf = wgpuDeviceCreateBuffer(device().gpu_device(), &desc);
     if (!buf) {
-      throw std::runtime_error(
-          "[WebGPU] Failed to create uniform buffer for pool");
+      // Miss: create at the target bucket size. Uniform | CopyDst usage.
+      WGPUBufferDescriptor desc = {};
+      desc.size = target;
+      desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+      desc.mappedAtCreation = false;
+      buf = wgpuDeviceCreateBuffer(device().gpu_device(), &desc);
+      if (!buf) {
+        throw std::runtime_error(
+            "[WebGPU] Failed to create uniform buffer for pool");
+      }
+      buf_sizes_[buf] = target;
+      chosen_bucket = target;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    buf_sizes_[buf] = aligned;
   }
+  (void)chosen_bucket; // reserved for debug logging; silenced under NDEBUG.
 
-  // Write data into the buffer
+  // Write data into the buffer. queueWriteBuffer is free to be called
+  // outside the lock — WebGPU queues serialize their own submissions.
   wgpuQueueWriteBuffer(queue, buf, 0, data, size);
   return buf;
 }
@@ -146,12 +170,35 @@ void UniformBufferPool::release(WGPUBuffer buf) {
   auto it = buf_sizes_.find(buf);
   if (it != buf_sizes_.end()) {
     free_lists_[it->second].push_back(buf);
+    return;
+  }
+  // DEV-F009: release on an unknown buffer is a bookkeeping bug — either the
+  // buffer was never acquired from this pool or buf_sizes_ lost track of it.
+  // In debug builds we assert so the bug surfaces immediately; in release we
+  // log once (process-wide) to keep the signal without spamming stderr.
+  assert(false && "UniformBufferPool::release: unknown buffer");
+  static std::atomic<bool> warned{false};
+  bool expected = false;
+  if (warned.compare_exchange_strong(expected, true)) {
+    fprintf(
+        stderr,
+        "[WebGPU] UniformBufferPool::release: unknown buffer %p "
+        "(further occurrences suppressed)\n",
+        static_cast<void*>(buf));
   }
 }
 
 UniformBufferPool::~UniformBufferPool() {
-  for (auto& [size, bufs] : free_lists_) {
-    for (auto buf : bufs) {
+  // DEV-F010: walk buf_sizes_ (every buffer ever allocated by this pool)
+  // rather than just free_lists_ (only returned buffers). Previously any
+  // buffer checked out at shutdown leaked its GPU-side allocation because
+  // the destructor saw an empty free-list entry. In practice the pool is
+  // only destroyed with the singleton Device at process exit, but being
+  // explicit here lets the matching assert-clean path (below) fire if a
+  // caller misuses release().
+  for (auto& [buf, size] : buf_sizes_) {
+    (void)size;
+    if (buf) {
       wgpuBufferDestroy(buf);
       wgpuBufferRelease(buf);
     }
@@ -959,8 +1006,41 @@ WGPUBuffer wgpu_buffer(const array& arr) {
     throw std::runtime_error("[WebGPU] wgpu_buffer: null buffer");
   }
 
-  // Track dtype for download conversion in raw_ptr()
+  // Track dtype for download conversion in raw_ptr(). This write is
+  // load-bearing on both the fast path and the cold path — it must not be
+  // elided even when nothing else changes (the same buffer may back arrays
+  // of different dtypes across reuses).
   buf->dtype_val = arr.dtype().val();
+
+  // DEV-F016: fast-path early return for the compute-output hot path.
+  //
+  // The overwhelmingly common case is "buffer already sized and clean":
+  //   * GPU-output buffers are pre-sized via wgpu_alloc_size(out) ==
+  //     nelements * wgpu_itemsize, so needed <= buf->size is already true.
+  //   * No pending CPU upload (cpu_dirty=false, cpu_ptr=nullptr).
+  //   * Not a packed-bf16 or CPU-raw bf16/bool buffer (those use the slice
+  //     safety path which needs cpu_bytes accounting).
+  //
+  // Under these conditions we can skip every conditional below: a single
+  // integer comparison and return. This path fires per matmul per layer per
+  // token, so it MUST stay branch-light.
+  //
+  // Correctness audit of skipped logic:
+  //   * recreate branch — guarded by needed > buf->size, which we falsify
+  //     before entering the fast path.
+  //   * upload-if-dirty branch — guarded by cpu_dirty && cpu_ptr, falsified.
+  //   * safety upload branch — guarded by !gpu_has_data && cpu_ptr, falsified
+  //     (cpu_ptr is nullptr).
+  //   * dtype_val write — performed above, unconditionally.
+  if (buf->storage_mode != StorageMode::PackedBf16 &&
+      !buf->cpu_dirty && buf->cpu_ptr == nullptr &&
+      buf->gpu_has_data) {
+    const size_t needed_fast =
+        arr.data_size() * wgpu_itemsize(arr.dtype());
+    if (needed_fast <= buf->size) {
+      return buf->buffer;
+    }
+  }
 
   // NOTE: there is deliberately no auto-opt-in to StorageMode::PackedBf16
   // here. The packed path is only reachable through explicit "weight upload"
@@ -1086,8 +1166,27 @@ WGPUBuffer wgpu_buffer(const array& arr) {
 
 CommandEncoder::CommandEncoder(Device& d)
     : device_(d), worker_(std::make_unique<Worker>()) {
-  max_ops_per_commit_ = env::max_ops_per_buffer(512);
-  max_mb_per_commit_ = env::max_mb_per_buffer(512);
+  // DEV-F002: commit thresholds. Defaults tuned for the WebGPU backend
+  // independently of the Metal/CUDA families (which use 20–50 ops and
+  // 40–50 MB per family). The previous WebGPU defaults of 512/512 folded
+  // an entire token's worth of dispatches (~200) into a single submission,
+  // with zero CPU/GPU pipelining across layers; 32/16 starts pipelining
+  // without over-submitting (RPC overhead per commit remains non-trivial).
+  //
+  // Override path:
+  //   * MLX_WEBGPU_MAX_OPS_PER_COMMIT / MLX_WEBGPU_MAX_MB_PER_COMMIT take
+  //     precedence — WebGPU-specific.
+  //   * MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER still override if the
+  //     WebGPU-specific ones aren't set, to match the existing idiom
+  //     (env::max_ops_per_buffer / env::max_mb_per_buffer).
+  static const int kDefaultMaxOps = 32;
+  static const int kDefaultMaxMB = 16;
+  int ops_default =
+      env::get_var("MLX_WEBGPU_MAX_OPS_PER_COMMIT", kDefaultMaxOps);
+  int mb_default =
+      env::get_var("MLX_WEBGPU_MAX_MB_PER_COMMIT", kDefaultMaxMB);
+  max_ops_per_commit_ = env::max_ops_per_buffer(ops_default);
+  max_mb_per_commit_ = env::max_mb_per_buffer(mb_default);
 }
 
 CommandEncoder::~CommandEncoder() {
@@ -1133,6 +1232,14 @@ void CommandEncoder::ensure_active() {
     if (!compute_pass_) {
       throw std::runtime_error("[WebGPU] Failed to create compute pass");
     }
+    // DEV-F003: reset pipeline + bind-group caches on pass-begin, not
+    // pass-end. setPipeline / setBindGroup are pass-scoped commands, so the
+    // first dispatch in a new pass MUST re-emit them; resetting here (rather
+    // than in end_compute_pass) makes the reset tightly paired with the
+    // pass-begin so the cache cannot leak stale state across a
+    // pass-boundary.
+    last_pipeline_ = nullptr;
+    last_bind_group_ = nullptr;
   }
 }
 
@@ -1144,9 +1251,10 @@ void CommandEncoder::end_compute_pass() {
     wgpuComputePassEncoderEnd(compute_pass_);
     wgpuComputePassEncoderRelease(compute_pass_);
     compute_pass_ = nullptr;
-    // Reset cached state — new compute pass needs fresh setPipeline/setBindGroup
-    last_pipeline_ = nullptr;
-    last_bind_group_ = nullptr;
+    // DEV-F003: caches are NOT cleared here — see ensure_active(). They are
+    // pass-scope-invalid by construction (no setPipeline/setBindGroup can
+    // fire without an open pass), but the reset belongs next to the
+    // pass-begin for the invariant to be obvious.
   }
 }
 
@@ -1158,14 +1266,22 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
-  // Skip redundant setPipeline if same as last dispatch
+  // DEV-F003: skip redundant setPipeline within the current pass.
   if (pipeline != last_pipeline_) {
     wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
     last_pipeline_ = pipeline;
   }
+  // Multi-BG path: bind-group cache only tracks group 0 (the convention
+  // for this backend); higher groups are re-emitted unconditionally.
   for (uint32_t i = 0; i < bind_groups.size(); ++i) {
+    if (i == 0 && bind_groups[i] == last_bind_group_) {
+      continue;
+    }
     wgpuComputePassEncoderSetBindGroup(
         compute_pass_, i, bind_groups[i], 0, nullptr);
+    if (i == 0) {
+      last_bind_group_ = bind_groups[i];
+    }
   }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   // DEV-F021: op_count_total_ drives needs_commit(), so it is ALWAYS
@@ -1180,6 +1296,14 @@ void CommandEncoder::dispatch_compute(
   // storage within a single compute pass. Ending the pass after each dispatch
   // ensures each operation gets its own synchronization scope.
   end_compute_pass();
+  // DEV-F001: auto-commit when the encoder exceeds its per-commit budget so
+  // the GPU can start executing the queued work while the CPU is still
+  // recording the next batch. The pass is already ended above, so there is
+  // no mid-pass commit hazard; the next dispatch_compute() will lazily open
+  // a fresh encoder via ensure_active().
+  if (needs_commit()) {
+    commit();
+  }
 }
 
 void CommandEncoder::dispatch_compute(
@@ -1190,9 +1314,20 @@ void CommandEncoder::dispatch_compute(
     uint32_t z) {
   ensure_active();
 
-  wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
-  wgpuComputePassEncoderSetBindGroup(
-      compute_pass_, 0, bind_group, 0, nullptr);
+  // DEV-F003: skip redundant setPipeline / setBindGroup within the current
+  // pass. Previously this overload always emitted both; the cache is now
+  // encoder-scope and paired with pass-begin reset so the first dispatch of
+  // every pass still emits both commands (required — setPipeline /
+  // setBindGroup are pass-scoped in WebGPU).
+  if (pipeline != last_pipeline_) {
+    wgpuComputePassEncoderSetPipeline(compute_pass_, pipeline);
+    last_pipeline_ = pipeline;
+  }
+  if (bind_group != last_bind_group_) {
+    wgpuComputePassEncoderSetBindGroup(
+        compute_pass_, 0, bind_group, 0, nullptr);
+    last_bind_group_ = bind_group;
+  }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
   // DEV-F021: op_count_total_ drives needs_commit(), so it is ALWAYS
   // incremented. op_count_kernels_ is observability-only (per-opcode
@@ -1203,6 +1338,10 @@ void CommandEncoder::dispatch_compute(
   WGPU_PROFILE_BUMP(g_total_dispatches);
   // End compute pass after each dispatch (same reason as above)
   end_compute_pass();
+  // DEV-F001: see comment on the multi-BG overload.
+  if (needs_commit()) {
+    commit();
+  }
 }
 
 void CommandEncoder::copy_buffer_to_buffer(
@@ -1235,6 +1374,12 @@ void CommandEncoder::copy_buffer_to_buffer(
   // bytes_tracked_ was already bumped by set_input_array /
   // set_output_array upstream in copy_gpu_inplace.
   op_count_total_++;
+  // DEV-F001: fold the auto-commit into the copy fast path too. The
+  // compute pass is already ended above (copy_buffer_to_buffer cannot
+  // run inside a pass), so this is a clean submit boundary.
+  if (needs_commit()) {
+    commit();
+  }
 }
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
