@@ -19,7 +19,7 @@ void Worker::add_task(std::function<void()> task) {
   pending_tasks_.push_back(std::move(task));
 }
 
-void Worker::commit(WGPUQueue queue) {
+void Worker::commit(WGPUQueue /*queue*/) {
   // Run tasks synchronously — can't defer to callback because
   // synchronize() blocks on f.wait() preventing POLL from running.
   Tasks tasks;
@@ -34,9 +34,13 @@ void Worker::commit(WGPUQueue queue) {
     }
   }
 
-  // Still notify gpu-worker that work was submitted (for its lifecycle)
-  auto noop = [](WGPUQueueWorkDoneStatus, void*) {};
-  wgpuQueueOnSubmittedWorkDone(queue, noop, nullptr);
+  // Previously we also emitted a no-op wgpuQueueOnSubmittedWorkDone here as a
+  // "lifecycle notification" to the gpu-worker. Nothing on the JS side drained
+  // those callbacks (POLL is never issued in the WASI path — poll_instance()
+  // is a no-op under __wasm__), so they piled up into gpuDoneBuf until its
+  // 512-slot ring overflowed. The callback payload is nullptr/no-op anyway —
+  // dropping it was harmless, but the RPC traffic (one per commit × dozens of
+  // commits per token) was real overhead. Removed.
 }
 
 #else
