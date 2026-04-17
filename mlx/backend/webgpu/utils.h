@@ -351,14 +351,67 @@ inline void emit_unrolled_reduction(
   }
 }
 
+// NOTE: effective_subgroup_size() and subgroup_suffix() call device(), which
+// is declared in "mlx/backend/webgpu/device.h". Because these are `inline`
+// their bodies are only parsed at instantiation — every translation unit
+// that calls them already includes device.h (same pattern as the existing
+// create_uniform_buffer / create_bind_group inlines above, which call
+// `device().gpu_device()` without utils.h itself including device.h).
+
+// Returns the subgroup_size to use in WGSL emit helpers. 0 = disabled
+// (either the device has no Subgroups feature, the probe kernel failed,
+// or the device reports a varying size across invocations). Callers that
+// see 0 MUST take the tree-reduction path.
+//
+// The conservative "min != max → disabled" policy is deliberate: this
+// helper only returns a non-zero value when the device guarantees a
+// single fixed subgroup size for all invocations, which is the contract
+// emit_subgroup_reduction's constant-folded WGSL assumes.
+inline int effective_subgroup_size() {
+  auto& dev = device();
+  if (!dev.has_subgroups()) return 0;
+  uint32_t lo = dev.subgroup_size_min();
+  uint32_t hi = dev.subgroup_size_max();
+  if (lo == 0 || hi == 0 || lo != hi) return 0;
+  return static_cast<int>(lo);
+}
+
+// Append to pipeline-cache entry names when the kernel's WGSL depends on
+// the detected subgroup size (i.e. emits subgroup builtins). Returns the
+// empty string when the subgroup path is disabled.
+//
+// Callers currently append "_sg" manually when has_subgroups() is true; that
+// is insufficient because a cached pipeline compiled for subgroup_size=32
+// must NOT be reused on a device where we later detected subgroup_size=64.
+// Part B will swap all call sites from `"_sg"` to `subgroup_suffix()` so the
+// cache keys per detected subgroup size.
+inline std::string subgroup_suffix() {
+  int sg = effective_subgroup_size();
+  if (sg == 0) return "";
+  return "_sg" + std::to_string(sg);
+}
+
 // Emit a subgroup-accelerated reduction.
 // Uses subgroup intrinsics for the bottom levels, then a small tree
 // reduction across subgroup results in shared memory.
+//
 // subgroup_builtin: e.g. "subgroupAdd", "subgroupMax", "subgroupMin"
-// acc_var: the per-thread accumulator variable name
-// shared_name: the workgroup shared array
-// reduce_op: WGSL binary function name for the tree phase
-// subgroup_size: assumed subgroup size (typically 32)
+// acc_var:          the per-thread accumulator variable name
+// shared_name:      the workgroup shared array
+// reduce_op:        WGSL binary function name for the tree phase
+// subgroup_size:    the device-detected subgroup size from
+//                   effective_subgroup_size(). MUST match the actual runtime
+//                   subgroupSize on the device the pipeline executes on —
+//                   otherwise the tree-reduction step reads uninitialized
+//                   slots in `shared_name` and returns garbage. The default
+//                   of 32 is only correct on Apple Silicon / NVIDIA / WARP-32
+//                   hardware; AMD is 64 and Intel is 8/16/32. Part B will
+//                   remove this default and make all callers pass the
+//                   detected size explicitly. Do NOT add new callers that
+//                   rely on the default.
+//   num_subgroups is emitted as a constant, so the WGSL is the same number
+//   of tree-reduce iterations regardless of device — the pipeline must be
+//   cache-keyed per subgroup_size (see subgroup_suffix() below).
 inline void emit_subgroup_reduction(
     std::ostringstream& s,
     const std::string& acc_var,
@@ -366,7 +419,7 @@ inline void emit_subgroup_reduction(
     const std::string& subgroup_builtin,
     const std::string& reduce_op,
     uint32_t workgroup_size = WORKGROUP_SIZE,
-    uint32_t subgroup_size = 32,
+    uint32_t subgroup_size = 32, // TODO(Part B): remove default.
     const std::string& prefix = "") {
   uint32_t num_subgroups = workgroup_size / subgroup_size;
 
