@@ -446,11 +446,11 @@ void Device::probe_subgroup_size() {
   wgpuComputePassEncoderRelease(pass);
 
   WGPUCommandBuffer cmd_buf = wgpuCommandEncoderFinish(encoder, nullptr);
-  wgpuCommandEncoderRelease(encoder);
   if (!cmd_buf) {
     fprintf(stderr,
             "[WebGPU] subgroup-size probe: command finish failed; "
             "disabling subgroup path.\n");
+    wgpuCommandEncoderRelease(encoder);
     wgpuBindGroupRelease(bind_group);
     wgpuBindGroupLayoutRelease(bgl);
     wgpuComputePipelineRelease(pipeline);
@@ -459,8 +459,15 @@ void Device::probe_subgroup_size() {
     wgpuBufferRelease(out_buf);
     return;
   }
+  // ORDER MATTERS on the JS bridge: wgpuCommandEncoderFinish is buffered
+  // and the actual teardown happens inside FUSED_SUBMIT. Calling encoder
+  // release BEFORE submit fires a real CMD_ENCODER_RELEASE RPC that tears
+  // down the handle, leaving the subsequent FUSED_SUBMIT holding an
+  // undefined encoder. Release AFTER submit → bridge detects
+  // handle == lastFusedEncoder and no-ops.
   wgpuQueueSubmit(queue_, 1, &cmd_buf);
   wgpuCommandBufferRelease(cmd_buf);
+  wgpuCommandEncoderRelease(encoder);
 
   // --- 5. Copy result into a MapRead staging buffer and read it back. ---
   WGPUBufferDescriptor stg_desc = {};
@@ -499,11 +506,13 @@ void Device::probe_subgroup_size() {
   }
   wgpuCommandEncoderCopyBufferToBuffer(copy_enc, out_buf, 0, staging, 0, 4);
   WGPUCommandBuffer copy_cmd = wgpuCommandEncoderFinish(copy_enc, nullptr);
-  wgpuCommandEncoderRelease(copy_enc);
   if (copy_cmd) {
+    // Same finish-buffered-on-JS-bridge ordering: submit BEFORE release so
+    // FUSED_SUBMIT sees the encoder handle, then the release is a no-op.
     wgpuQueueSubmit(queue_, 1, &copy_cmd);
     wgpuCommandBufferRelease(copy_cmd);
   }
+  wgpuCommandEncoderRelease(copy_enc);
 
   // Blocking mapAsync — same condvar + poll_instance pattern as allocator.cpp.
   struct MapData {
