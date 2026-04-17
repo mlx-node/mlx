@@ -172,18 +172,22 @@ std::string make_sdpa_vector_kernel(
     << ") var<uniform> params: SdpaParams;\n\n";
 
   // Workgroup shared memory:
-  //   - shared_red  : scratch for Phase A reductions (max then sum, reused)
-  //   - shared_scale: Phase A outputs (m, s) broadcast to all threads
-  //   - For Phase B we stream scores through shared memory too, reusing
-  //     shared_red as "shared_exp" so Phase B doesn't need to recompute scores.
-  //     BUT: shared_red has only WORKGROUP_SIZE slots (128), and L can be
-  //     much larger, so this optimisation doesn't apply generally. Instead
-  //     Phase B recomputes dot(Q, K[l]) — 2x K traffic, but simple.
-  //   - shared_q    : Q vector cached once at workgroup start (D floats).
+  //   - shared_red    : scratch for Phase A reductions (max then sum, reused)
+  //   - shared_m/inv_s: Phase A outputs (m, s) broadcast to all threads
+  //   - shared_q      : Q vector cached once at workgroup start (D floats).
+  //   - shared_scores : SDPA-F005 score cache. Sized to WORKGROUP_SIZE so
+  //                     Phase A's first iteration (l = tid) can publish its
+  //                     score for Phase B's chunk 0 to reuse, saving a
+  //                     dot(Q, K[l]) recompute for the first WG scores.
+  //                     For L > WG, Phase A's later iterations and Phase
+  //                     B's later chunks fall through to the recompute path.
+  //                     On the hot single-pass workload (L <= WG = 128)
+  //                     that's 100% of lanes cached.
   s << "var<workgroup> shared_red: array<f32, WORKGROUP_SIZE>;\n";
   s << "var<workgroup> shared_m: f32;\n";
   s << "var<workgroup> shared_inv_s: f32;\n";
-  s << "var<workgroup> shared_q: array<f32, D>;\n\n";
+  s << "var<workgroup> shared_q: array<f32, D>;\n";
+  s << "var<workgroup> shared_scores: array<f32, WORKGROUP_SIZE>;\n\n";
 
   // Helper ops for the shared-memory tree reduction.
   s << "fn max_op(a: f32, b: f32) -> f32 { return max(a, b); }\n";
@@ -232,6 +236,9 @@ std::string make_sdpa_vector_kernel(
     << "\n";
 
   // Phase A-1: compute max of scores over L.
+  // SDPA-F005: first iteration (l = tid, l < WG) also publishes its score
+  // into shared_scores so Phase B's chunk 0 can reload it instead of
+  // recomputing dot(Q, K[l]).
   s << "  // Phase A-1: compute per-thread partial max over L (stride WG).\n"
     << "  var thread_max: f32 = f32(-3.402823e+38);\n"
     << "  for (var l: u32 = tid; l < L; l = l + WORKGROUP_SIZE) {\n"
@@ -244,7 +251,10 @@ std::string make_sdpa_vector_kernel(
   if (has_mask) {
     s << "    score = score + f32(mask[mask_base + l]);\n";
   }
-  s << "    thread_max = max(thread_max, score);\n"
+  s << "    if (l < WORKGROUP_SIZE) {\n"
+    << "      shared_scores[l] = score;\n"
+    << "    }\n"
+    << "    thread_max = max(thread_max, score);\n"
     << "  }\n"
     << "\n";
 
@@ -285,6 +295,10 @@ std::string make_sdpa_vector_kernel(
   // then normalize and write O[d] = o_acc[d] / row_sum. Each thread owns
   // D_PER_THREAD accumulators for lanes {tid, tid+WG, ..., tid+(DPT-1)*WG}.
   s << "  // Phase B: single-pass chunked weight cache + V accumulation.\n"
+    << "  // SDPA-F005: chunk 0 (chunk_start == 0) reloads scores cached by\n"
+    << "  // Phase A into shared_scores, skipping the dot(Q, K[l]) recompute.\n"
+    << "  // Later chunks (L > WG) still recompute since their scores were\n"
+    << "  // not cached.\n"
     << "  var o_acc: array<f32, D_PER_THREAD>;\n"
     << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
     << "    o_acc[dd] = 0.0;\n"
@@ -295,16 +309,21 @@ std::string make_sdpa_vector_kernel(
     << "    let l = chunk_start + tid;\n"
     << "    var weight: f32 = 0.0;\n"
     << "    if (l < L) {\n"
-    << "      var acc: f32 = 0.0;\n"
-    << "      let k_row = kv_base + l * D;\n"
-    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
-    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
-    << "      }\n"
-    << "      var score = acc * scale;\n";
+    << "      var score: f32 = 0.0;\n"
+    << "      if (chunk_start == 0u) {\n"
+    << "        score = shared_scores[tid];\n"
+    << "      } else {\n"
+    << "        var acc: f32 = 0.0;\n"
+    << "        let k_row = kv_base + l * D;\n"
+    << "        for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "          acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
+    << "        }\n"
+    << "        score = acc * scale;\n";
   if (has_mask) {
-    s << "      score = score + f32(mask[mask_base + l]);\n";
+    s << "        score = score + f32(mask[mask_base + l]);\n";
   }
-  s << "      weight = exp(score - row_max);\n"
+  s << "      }\n"
+    << "      weight = exp(score - row_max);\n"
     << "    }\n"
     << "    shared_red[tid] = weight;\n"
     << "    thread_sum = thread_sum + weight;\n"
@@ -455,10 +474,15 @@ std::string make_sdpa_vector_2pass_1_kernel(
   s << "@group(0) @binding(" << binding++
     << ") var<uniform> params: SdpaParams;\n\n";
 
-  // Shared memory
+  // Shared memory. SDPA-F004: shared_scores caches Phase A's per-lane
+  // attention scores so Phase B reads them back instead of recomputing
+  // dot(Q, K[l]). BLOCK_L == WORKGROUP_SIZE guarantees Phase A visits at
+  // most one score per thread, so shared_scores[tid] holds the thread's
+  // single score exactly.
   s << "var<workgroup> shared_red: array<f32, WORKGROUP_SIZE>;\n";
   s << "var<workgroup> shared_m: f32;\n";
-  s << "var<workgroup> shared_q: array<f32, D>;\n\n";
+  s << "var<workgroup> shared_q: array<f32, D>;\n";
+  s << "var<workgroup> shared_scores: array<f32, BLOCK_L>;\n\n";
 
   s << "fn max_op(a: f32, b: f32) -> f32 { return max(a, b); }\n";
   s << "fn sum_op(a: f32, b: f32) -> f32 { return a + b; }\n\n";
@@ -508,19 +532,27 @@ std::string make_sdpa_vector_2pass_1_kernel(
     << "\n";
 
   // Phase A: compute max of scores over [block_start, block_end).
+  // SDPA-F004: cache each score in shared_scores so Phase B can skip the
+  // dot(Q, K[l]) recompute. Since BLOCK_L == WORKGROUP_SIZE, the loop body
+  // runs at most once per thread (l = block_start + tid), so
+  // shared_scores[tid] is a safe 1:1 slot for the thread's score.
   s << "  // Phase A: per-thread partial max over [block_start, block_end).\n"
     << "  var thread_max: f32 = f32(-3.402823e+38);\n"
-    << "  for (var l: u32 = block_start + tid; l < block_end; l = l + WORKGROUP_SIZE) {\n"
-    << "    var acc: f32 = 0.0;\n"
-    << "    let k_row = kv_base + l * D;\n"
-    << "    for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
-    << "      acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
-    << "    }\n"
-    << "    var score = acc * scale;\n";
+    << "  {\n"
+    << "    let l: u32 = block_start + tid;\n"
+    << "    if (l < block_end) {\n"
+    << "      var acc: f32 = 0.0;\n"
+    << "      let k_row = kv_base + l * D;\n"
+    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
+    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
+    << "      }\n"
+    << "      var score = acc * scale;\n";
   if (has_mask) {
-    s << "    score = score + f32(mask[mask_base + l]);\n";
+    s << "      score = score + f32(mask[mask_base + l]);\n";
   }
-  s << "    thread_max = max(thread_max, score);\n"
+  s << "      shared_scores[tid] = score;\n"
+    << "      thread_max = score;\n"
+    << "    }\n"
     << "  }\n"
     << "\n";
 
@@ -542,49 +574,38 @@ std::string make_sdpa_vector_2pass_1_kernel(
     << "\n";
 
   // Phase B: compute weights and accumulate V, over [block_start, block_end).
+  // SDPA-F004: reads cached scores from shared_scores (populated by Phase A)
+  // instead of recomputing dot(Q, K[l]). Since BLOCK_L == WORKGROUP_SIZE,
+  // there is exactly one chunk and the chunk-stride loop collapses.
   s << "  // Phase B: weight compute + V accumulation over [block_start, block_end).\n"
     << "  var o_acc: array<f32, D_PER_THREAD>;\n"
     << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
     << "    o_acc[dd] = 0.0;\n"
     << "  }\n"
     << "  var thread_sum: f32 = 0.0;\n"
-    << "  for (var chunk_start: u32 = block_start; chunk_start < block_end;\n"
-    << "       chunk_start = chunk_start + WORKGROUP_SIZE) {\n"
-    << "    let l = chunk_start + tid;\n"
+    << "  {\n"
+    << "    let l = block_start + tid;\n"
     << "    var weight: f32 = 0.0;\n"
     << "    if (l < block_end) {\n"
-    << "      var acc: f32 = 0.0;\n"
-    << "      let k_row = kv_base + l * D;\n"
-    << "      for (var d: u32 = 0u; d < D; d = d + 1u) {\n"
-    << "        acc = acc + shared_q[d] * f32(k[k_row + d]);\n"
-    << "      }\n"
-    << "      var score = acc * scale;\n";
-  if (has_mask) {
-    s << "      score = score + f32(mask[mask_base + l]);\n";
-  }
-  s << "      weight = exp(score - block_max);\n"
+    << "      weight = exp(shared_scores[tid] - block_max);\n"
     << "    }\n"
     << "    shared_red[tid] = weight;\n"
-    << "    thread_sum = thread_sum + weight;\n"
+    << "    thread_sum = weight;\n"
     << "    workgroupBarrier();\n"
     << "\n"
     << "    // V accumulation for D_PER_THREAD output lanes per thread.\n";
   if (d_per_thread == 1) {
     s << "    if (tid < D) {\n"
-      << "      var chunk_end_v: u32 = chunk_start + WORKGROUP_SIZE;\n"
-      << "      if (chunk_end_v > block_end) { chunk_end_v = block_end; }\n"
-      << "      for (var l_inner: u32 = chunk_start; l_inner < chunk_end_v;\n"
+      << "      for (var l_inner: u32 = block_start; l_inner < block_end;\n"
       << "           l_inner = l_inner + 1u) {\n"
-      << "        let w_val = shared_red[l_inner - chunk_start];\n"
+      << "        let w_val = shared_red[l_inner - block_start];\n"
       << "        o_acc[0] = o_acc[0] + w_val * f32(v[kv_base + l_inner * D + tid]);\n"
       << "      }\n"
       << "    }\n";
   } else {
-    s << "    var chunk_end_v: u32 = chunk_start + WORKGROUP_SIZE;\n"
-      << "    if (chunk_end_v > block_end) { chunk_end_v = block_end; }\n"
-      << "    for (var l_inner: u32 = chunk_start; l_inner < chunk_end_v;\n"
+    s << "    for (var l_inner: u32 = block_start; l_inner < block_end;\n"
       << "         l_inner = l_inner + 1u) {\n"
-      << "      let w_val = shared_red[l_inner - chunk_start];\n"
+      << "      let w_val = shared_red[l_inner - block_start];\n"
       << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
       << "        let d = tid + dd * WORKGROUP_SIZE;\n"
       << "        if (d < D) {\n"
@@ -682,7 +703,12 @@ std::string make_sdpa_vector_2pass_2_kernel(
   // Shared memory for reductions.
   s << "var<workgroup> shared_red: array<f32, WORKGROUP_SIZE>;\n";
   s << "var<workgroup> shared_global_max: f32;\n";
-  s << "var<workgroup> shared_global_sum: f32;\n\n";
+  s << "var<workgroup> shared_global_sum: f32;\n";
+  // SDPA-F003: cache per-block reweight factors + reweighted sums so Step 3
+  // reloads them instead of recomputing exp() and rereading partial_maxs/
+  // partial_sums from global memory. Sized to WORKGROUP_SIZE; when nblocks
+  // exceeds that the kernel falls through to the recompute path in Step 3.
+  s << "var<workgroup> shared_factors: array<f32, WORKGROUP_SIZE>;\n\n";
 
   s << "fn max_op(a: f32, b: f32) -> f32 { return max(a, b); }\n";
   s << "fn sum_op(a: f32, b: f32) -> f32 { return a + b; }\n\n";
@@ -722,13 +748,19 @@ std::string make_sdpa_vector_2pass_2_kernel(
     << "  let global_max = shared_global_max;\n"
     << "\n";
 
-  // Step 2: compute reweighted global sum.
+  // Step 2: compute reweighted global sum. Also cache per-block factors in
+  // shared memory (SDPA-F003) so Step 3 doesn't recompute exp or re-read
+  // partial_maxs from global memory. Cache is valid when nblocks <= WG.
   s << "  // Step 2: compute reweighted global sum.\n"
     << "  var thread_sum: f32 = 0.0;\n"
+    << "  let factors_cached: bool = nblocks <= WORKGROUP_SIZE;\n"
     << "  for (var i: u32 = tid; i < nblocks; i = i + WORKGROUP_SIZE) {\n"
     << "    let idx = bh * nblocks + i;\n"
     << "    let factor = exp(partial_maxs[idx] - global_max);\n"
     << "    thread_sum = thread_sum + factor * partial_sums[idx];\n"
+    << "    if (factors_cached) {\n"
+    << "      shared_factors[i] = factor;\n"
+    << "    }\n"
     << "  }\n"
     << "\n";
 
@@ -745,24 +777,47 @@ std::string make_sdpa_vector_2pass_2_kernel(
   s << "  if (tid == 0u) { shared_global_sum = shared_red[0]; }\n"
     << "  workgroupBarrier();\n"
     << "  let global_sum = shared_global_sum;\n"
-    << "  let inv_sum = 1.0 / global_sum;\n"
+    << "  // SDPA-F001: all-masked rows have global_sum == 0 (every block\n"
+    << "  // contributed 0 to thread_sum because block_max was -inf and all\n"
+    << "  // weights became exp(-inf - -inf) == NaN treated as 0 via\n"
+    << "  // partial_sums[idx] == 0). Guard against +Inf / NaN in the output\n"
+    << "  // by emitting 0 for those rows. select() is branchless on the hot\n"
+    << "  // path (normal rows hit the true branch with no penalty).\n"
+    << "  let inv_sum = select(0.0, 1.0 / global_sum, global_sum > 0.0);\n"
     << "\n";
 
   // Step 3: accumulate reweighted O across all blocks.
+  // SDPA-F003: when nblocks <= WORKGROUP_SIZE, read factor from shared
+  // cache written in Step 2 (factors_cached branch). This eliminates the
+  // redundant exp() and the second read of partial_maxs per block. For
+  // nblocks > WG (L > ~16k) we fall through to recomputation.
   s << "  // Step 3: accumulate reweighted O across all blocks.\n"
     << "  var o_acc: array<f32, D_PER_THREAD>;\n"
     << "  for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
     << "    o_acc[dd] = 0.0;\n"
     << "  }\n"
     << "\n"
-    << "  for (var i: u32 = 0u; i < nblocks; i = i + 1u) {\n"
-    << "    let idx = bh * nblocks + i;\n"
-    << "    let factor = exp(partial_maxs[idx] - global_max);\n"
-    << "    let o_base_partial = bh * nblocks * D + i * D;\n"
-    << "    for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
-    << "      let d = tid + dd * WORKGROUP_SIZE;\n"
-    << "      if (d < D) {\n"
-    << "        o_acc[dd] = o_acc[dd] + factor * intermediate_o[o_base_partial + d];\n"
+    << "  if (factors_cached) {\n"
+    << "    for (var i: u32 = 0u; i < nblocks; i = i + 1u) {\n"
+    << "      let factor = shared_factors[i];\n"
+    << "      let o_base_partial = bh * nblocks * D + i * D;\n"
+    << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "        let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "        if (d < D) {\n"
+    << "          o_acc[dd] = o_acc[dd] + factor * intermediate_o[o_base_partial + d];\n"
+    << "        }\n"
+    << "      }\n"
+    << "    }\n"
+    << "  } else {\n"
+    << "    for (var i: u32 = 0u; i < nblocks; i = i + 1u) {\n"
+    << "      let idx = bh * nblocks + i;\n"
+    << "      let factor = exp(partial_maxs[idx] - global_max);\n"
+    << "      let o_base_partial = bh * nblocks * D + i * D;\n"
+    << "      for (var dd: u32 = 0u; dd < D_PER_THREAD; dd = dd + 1u) {\n"
+    << "        let d = tid + dd * WORKGROUP_SIZE;\n"
+    << "        if (d < D) {\n"
+    << "          o_acc[dd] = o_acc[dd] + factor * intermediate_o[o_base_partial + d];\n"
+    << "        }\n"
     << "      }\n"
     << "    }\n"
     << "  }\n"
@@ -1025,20 +1080,21 @@ std::string make_sdpa_tile_kernel(
     << "\n";
 
   // Step 3: per-row online softmax update.
-  // Each thread scans its own row once and computes row_max locally.
-  // The first lane of each row (tk == 0) updates the shared m_i/l_i/rescale.
-  // All threads then read the shared rescale to update their O_accum
-  // registers and read the updated m_i to compute P = exp(S - m_new).
-  s << "    // Per-row scalar reduction over BK=" << BK << " S values.\n"
-    << "    // All threads in a row compute the same row_max independently.\n"
-    << "    var row_max_block: f32 = NEG_INF;\n"
-    << "    for (var j: u32 = 0u; j < BK; j = j + 1u) {\n"
-    << "      row_max_block = max(row_max_block, S_smem[tq * BK + j]);\n"
-    << "    }\n"
-    << "    // FlashAttention online softmax rescale. Row lead (tk == 0)\n"
-    << "    // writes the shared running state so every thread in the row\n"
-    << "    // can read a consistent rescale factor and m_new below.\n"
+  // SDPA-F006: the row-max + row-sum scan used to run on all BK=8 threads
+  // in a row (each producing the same row_max_block). Now only the row
+  // lead (tk == 0) computes both row_max_block and row_sum_block and
+  // publishes them through rescale_smem (running state) and m_i/l_i
+  // (running state). A single workgroupBarrier below makes those publishes
+  // visible to the other BK-1 threads per row before they consume m_new +
+  // rescale. Eliminates ~8x redundant scalar ALU work on the prefill path.
+  s << "    // Per-row scalar reduction over BK=" << BK << " S values is done\n"
+    << "    // ONLY by the row lead (tk == 0); results are broadcast via\n"
+    << "    // rescale_smem and m_i below.\n"
     << "    if (tk == 0u) {\n"
+    << "      var row_max_block: f32 = NEG_INF;\n"
+    << "      for (var j: u32 = 0u; j < BK; j = j + 1u) {\n"
+    << "        row_max_block = max(row_max_block, S_smem[tq * BK + j]);\n"
+    << "      }\n"
     << "      let m_old = m_i[tq];\n"
     << "      let m_new = max(m_old, row_max_block);\n"
     << "      let rescale = exp(m_old - m_new);\n"
@@ -1395,16 +1451,22 @@ void ScaledDotProductAttention::eval_gpu(
       WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
       WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
+      // SDPA-F010: pass 0 as the binding size sentinel — the JS-side bridge
+      // interprets size == 0 as "bind whole buffer from offset 0", which is
+      // exactly what we want for Q/K/V/mask/O (all full-buffer bindings).
+      // Saves 5-6 wgpuBufferGetSize RPCs per SDPA dispatch. The uniform
+      // binding keeps its explicit size (sizeof(SdpaParams)) because the
+      // backing buffer is pool-managed and may be larger than the payload.
       std::vector<std::pair<WGPUBuffer, uint64_t>> bg_entries;
       bg_entries.reserve(has_mask ? 6 : 5);
-      bg_entries.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
-      bg_entries.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
-      bg_entries.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+      bg_entries.emplace_back(q_buf, 0u);
+      bg_entries.emplace_back(k_buf, 0u);
+      bg_entries.emplace_back(v_buf, 0u);
       if (has_mask) {
         WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
-        bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+        bg_entries.emplace_back(mask_buf, 0u);
       }
-      bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+      bg_entries.emplace_back(out_buf, 0u);
       bg_entries.emplace_back(uniform_buf, sizeof(SdpaParams));
 
       WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
@@ -1476,19 +1538,21 @@ void ScaledDotProductAttention::eval_gpu(
       WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
       // Pass 1 bind group: q, k, v, [mask], intermediate_o, partial_maxs,
-      //                    partial_sums, params
+      //                    partial_sums, params.
+      // SDPA-F010: size == 0 sentinel → whole-buffer binding, avoiding the
+      // per-binding wgpuBufferGetSize RPCs.
       std::vector<std::pair<WGPUBuffer, uint64_t>> p1_bg;
       p1_bg.reserve(has_mask ? 8 : 7);
-      p1_bg.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
-      p1_bg.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
-      p1_bg.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+      p1_bg.emplace_back(q_buf, 0u);
+      p1_bg.emplace_back(k_buf, 0u);
+      p1_bg.emplace_back(v_buf, 0u);
       if (has_mask) {
         WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
-        p1_bg.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+        p1_bg.emplace_back(mask_buf, 0u);
       }
-      p1_bg.emplace_back(inter_o_buf, wgpuBufferGetSize(inter_o_buf));
-      p1_bg.emplace_back(inter_maxs_buf, wgpuBufferGetSize(inter_maxs_buf));
-      p1_bg.emplace_back(inter_sums_buf, wgpuBufferGetSize(inter_sums_buf));
+      p1_bg.emplace_back(inter_o_buf, 0u);
+      p1_bg.emplace_back(inter_maxs_buf, 0u);
+      p1_bg.emplace_back(inter_sums_buf, 0u);
       p1_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
 
       WGPUBindGroup p1_bg_obj = wgpu::create_bind_group(p1_pe.layout, p1_bg);
@@ -1512,13 +1576,14 @@ void ScaledDotProductAttention::eval_gpu(
           dev.get_or_create_pipeline(p2_name, p2_shader, p2_name.c_str());
 
       // Pass 2 bind group: intermediate_o, partial_maxs, partial_sums,
-      //                    output, params (reuse same uniform)
+      //                    output, params (reuse same uniform).
+      // SDPA-F010: whole-buffer sentinel for storage bindings.
       std::vector<std::pair<WGPUBuffer, uint64_t>> p2_bg;
       p2_bg.reserve(5);
-      p2_bg.emplace_back(inter_o_buf, wgpuBufferGetSize(inter_o_buf));
-      p2_bg.emplace_back(inter_maxs_buf, wgpuBufferGetSize(inter_maxs_buf));
-      p2_bg.emplace_back(inter_sums_buf, wgpuBufferGetSize(inter_sums_buf));
-      p2_bg.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+      p2_bg.emplace_back(inter_o_buf, 0u);
+      p2_bg.emplace_back(inter_maxs_buf, 0u);
+      p2_bg.emplace_back(inter_sums_buf, 0u);
+      p2_bg.emplace_back(out_buf, 0u);
       p2_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
 
       WGPUBindGroup p2_bg_obj = wgpu::create_bind_group(p2_pe.layout, p2_bg);
@@ -1604,16 +1669,19 @@ void ScaledDotProductAttention::eval_gpu(
   WGPUBuffer v_buf = wgpu::wgpu_buffer(v_c);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
+  // SDPA-F010: whole-buffer sentinel (0) saves 5-6 wgpuBufferGetSize RPCs
+  // per tile dispatch; full-buffer binding is correct for all non-uniform
+  // slots.
   std::vector<std::pair<WGPUBuffer, uint64_t>> bg_entries;
   bg_entries.reserve(has_mask ? 6 : 5);
-  bg_entries.emplace_back(q_buf, wgpuBufferGetSize(q_buf));
-  bg_entries.emplace_back(k_buf, wgpuBufferGetSize(k_buf));
-  bg_entries.emplace_back(v_buf, wgpuBufferGetSize(v_buf));
+  bg_entries.emplace_back(q_buf, 0u);
+  bg_entries.emplace_back(k_buf, 0u);
+  bg_entries.emplace_back(v_buf, 0u);
   if (has_mask) {
     WGPUBuffer mask_buf = wgpu::wgpu_buffer(*mask_c_opt);
-    bg_entries.emplace_back(mask_buf, wgpuBufferGetSize(mask_buf));
+    bg_entries.emplace_back(mask_buf, 0u);
   }
-  bg_entries.emplace_back(out_buf, wgpuBufferGetSize(out_buf));
+  bg_entries.emplace_back(out_buf, 0u);
   bg_entries.emplace_back(uniform_buf, sizeof(SdpaTileParams));
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
