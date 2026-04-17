@@ -73,6 +73,10 @@ std::string make_arange_kernel(
     << "  if (idx >= params.size) { return; }\n";
 
   if (is_integer) {
+    // SPEC-F035: integer arange is computed in i32. The caller must ensure
+    // start + step * (size - 1) fits in int32; values beyond 2^31-1 will
+    // wrap around silently. 32-bit indices are the only option here (WGSL
+    // has no native i64).
     s << "  let val = params.start + params.step * i32(idx);\n"
       << "  out[idx] = " << out_type << "(val);\n";
   } else {
