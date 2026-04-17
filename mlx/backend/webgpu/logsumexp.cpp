@@ -132,6 +132,15 @@ void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   const auto& in_orig = inputs[0];
 
+  // RED-F016: scalar input has no "last axis" — indexing strides()/shape()
+  // below would be UB on a 0-D array. logsumexp of a single scalar is
+  // degenerate; reject with a clear error rather than silently reading past
+  // the end of empty vectors.
+  if (in_orig.ndim() == 0) {
+    throw std::invalid_argument(
+        "[LogSumExp::eval_gpu] LogSumExp requires a non-scalar input; got ndim==0.");
+  }
+
   // Ensure the last dimension is contiguous (stride-1) before reduction.
   array in = in_orig;
   bool needs_copy =
