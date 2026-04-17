@@ -1,4 +1,12 @@
 // Copyright 2026 Apple Inc.
+//
+// DEV-F023: WEBGPU_PROFILE gates the per-dispatch observability atomics
+// (g_total_dispatches / g_total_pass_ends / op_count_kernels_ +
+// op_count_total_). Default is ON for dev builds — CMake defines
+// WEBGPU_PROFILE=1 unless the user explicitly passes
+// -DWEBGPU_PROFILE=0 (benchmark builds). When the flag is 0, the
+// WGPU_PROFILE_BUMP / WGPU_PROFILE_STORE macros below expand to nothing
+// and the hot path has zero atomic ops from this instrumentation.
 
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
@@ -15,6 +23,23 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+
+#ifndef WEBGPU_PROFILE
+// Default: profiling on. Benchmark builds opt out with -DWEBGPU_PROFILE=0.
+#define WEBGPU_PROFILE 1
+#endif
+
+#if WEBGPU_PROFILE
+#define WGPU_PROFILE_BUMP(counter) \
+  (counter).fetch_add(1, std::memory_order_relaxed)
+#define WGPU_PROFILE_STORE(counter, value) \
+  (counter).store((value), std::memory_order_relaxed)
+#define WGPU_PROFILE_INC(plain_counter) (++(plain_counter))
+#else
+#define WGPU_PROFILE_BUMP(counter) ((void)0)
+#define WGPU_PROFILE_STORE(counter, value) ((void)0)
+#define WGPU_PROFILE_INC(plain_counter) ((void)0)
+#endif
 
 namespace mlx::core::wgpu {
 
@@ -38,16 +63,42 @@ static std::atomic<uint64_t> g_total_dispatches{0};
 static std::atomic<uint64_t> g_total_pass_ends{0};
 
 uint64_t get_total_dispatches() {
+#if WEBGPU_PROFILE
   return g_total_dispatches.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
 }
 
 uint64_t get_total_pass_ends() {
+#if WEBGPU_PROFILE
   return g_total_pass_ends.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
 }
 
 void reset_dispatch_stats() {
+#if WEBGPU_PROFILE
   g_total_dispatches.store(0, std::memory_order_relaxed);
   g_total_pass_ends.store(0, std::memory_order_relaxed);
+#endif
+}
+
+// DEV-F017: device-error observability counters. Set from the uncaptured
+// error + device-lost callbacks installed on Device::device_; read via
+// wgpu_get_error_state(). These live at the process level for the same
+// reason the dispatch counters do — the FFI reader should not walk
+// Device::encoders_ or touch a possibly-dead WGPUDevice handle.
+static std::atomic<uint64_t> g_uncaptured_error_count{0};
+static std::atomic<bool> g_device_lost_flag{false};
+
+DeviceErrorState wgpu_get_error_state() {
+  DeviceErrorState s;
+  s.uncaptured_count =
+      g_uncaptured_error_count.load(std::memory_order_relaxed);
+  s.device_lost = g_device_lost_flag.load(std::memory_order_relaxed);
+  return s;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -266,11 +317,17 @@ Device::Device() {
   has_shader_f16_ = has_f16;
   has_subgroups_ = has_sg;
 
-  // Set error callback on device
+  // Set error callback on device.
+  //
+  // DEV-F017: bump g_uncaptured_error_count so callers can detect that
+  // the device has produced a validation/out-of-memory error without
+  // having to scrape stderr. Still log — the message is the only
+  // human-readable signal Dawn/wgpu-native surface.
   wgpuDeviceSetUncapturedErrorCallback(
       device_,
       [](WGPUErrorType type, char const* message, void* /* userdata */) {
         if (type != WGPUErrorType_NoError) {
+          g_uncaptured_error_count.fetch_add(1, std::memory_order_relaxed);
           fprintf(
               stderr,
               "[WebGPU] Uncaptured error (%d): %s\n",
@@ -280,13 +337,19 @@ Device::Device() {
       },
       nullptr);
 
-  // Set device lost callback
+  // Set device lost callback.
+  //
+  // DEV-F017: flip g_device_lost_flag on any non-Destroyed loss reason so a
+  // backgrounded tab (Chromium evicts GPUDevice on memory pressure) can be
+  // detected without stderr grepping. Destroyed is expected at shutdown
+  // and does not set the flag.
   wgpuDeviceSetDeviceLostCallback(
       device_,
       [](WGPUDeviceLostReason reason,
          char const* message,
          void* /* userdata */) {
         if (reason != WGPUDeviceLostReason_Destroyed) {
+          g_device_lost_flag.store(true, std::memory_order_relaxed);
           fprintf(
               stderr,
               "[WebGPU] Device lost: %s\n",
@@ -622,6 +685,68 @@ CommandEncoder& Device::get_command_encoder(Stream s) {
   return *it->second;
 }
 
+// DEV-F024: Dawn + wgpu-native expose wgpuDevicePushErrorScope /
+// wgpuDevicePopErrorScope; the bundled minimal webgpu.h used for the
+// WASI bridge (WEBGPU_BACKEND_WASI_IMPORT) does not. When available, we
+// wrap pipeline + shader creation with a Validation scope and surface
+// the captured message in the thrown runtime_error — mirroring the
+// Phase 6c bind-group diagnostic pattern that turned opaque "Failed
+// to create bind group" errors into labeled, actionable messages.
+//
+// The scope path is additive: creation still throws on failure, but
+// now the thrown text contains the WGSL validation message (plus the
+// cache key as a label for Chromium DevTools). Unlabeled call sites
+// keep working; unsupported-target builds fall through to the plain
+// "[WebGPU] Failed to create ..." text.
+#if defined(WEBGPU_BACKEND_DAWN) || defined(WEBGPU_BACKEND_WGPU)
+#define WGPU_HAVE_ERROR_SCOPE 1
+#else
+#define WGPU_HAVE_ERROR_SCOPE 0
+#endif
+
+#if WGPU_HAVE_ERROR_SCOPE
+namespace {
+struct ErrorScopeCapture {
+  std::string message;
+  bool captured{false};
+  std::mutex mtx;
+  std::condition_variable cv;
+  bool done{false};
+};
+
+// Synchronous pop: Dawn / wgpu-native deliver the callback either inline
+// or after an instance tick. We poll the instance until `done` flips to
+// match the adapter/device-request pattern already used above.
+std::string pop_error_scope_blocking(WGPUDevice device, WGPUInstance inst) {
+  ErrorScopeCapture cap;
+  wgpuDevicePopErrorScope(
+      device,
+      [](WGPUErrorType type, char const* message, void* userdata) {
+        auto* c = static_cast<ErrorScopeCapture*>(userdata);
+        {
+          std::lock_guard<std::mutex> lk(c->mtx);
+          if (type != WGPUErrorType_NoError) {
+            c->captured = true;
+            c->message = message ? message : "";
+          }
+          c->done = true;
+        }
+        c->cv.notify_one();
+      },
+      &cap);
+  {
+    std::unique_lock<std::mutex> lk(cap.mtx);
+    while (!cap.done) {
+      lk.unlock();
+      poll_instance(inst);
+      lk.lock();
+    }
+  }
+  return cap.captured ? cap.message : std::string{};
+}
+} // namespace
+#endif
+
 Device::PipelineEntry Device::get_or_create_pipeline(
     const std::string& key,
     WGPUShaderModule shader_module,
@@ -633,16 +758,38 @@ Device::PipelineEntry Device::get_or_create_pipeline(
   }
 
   WGPUComputePipelineDescriptor pipeline_desc = {};
+  pipeline_desc.label = key.c_str();
   pipeline_desc.compute.module = shader_module;
   pipeline_desc.compute.entryPoint = entry_point;
   pipeline_desc.layout = nullptr; // auto layout
 
+#if WGPU_HAVE_ERROR_SCOPE
+  wgpuDevicePushErrorScope(device_, WGPUErrorFilter_Validation);
+#endif
   WGPUComputePipeline pipeline =
       wgpuDeviceCreateComputePipeline(device_, &pipeline_desc);
+#if WGPU_HAVE_ERROR_SCOPE
+  std::string validation_msg = pop_error_scope_blocking(device_, instance_);
+#endif
   if (!pipeline) {
-    throw std::runtime_error(
-        "[WebGPU] Failed to create compute pipeline: " + key);
+    std::string msg = "[WebGPU] Failed to create compute pipeline: " + key;
+#if WGPU_HAVE_ERROR_SCOPE
+    if (!validation_msg.empty()) {
+      msg += " — " + validation_msg;
+    }
+#endif
+    throw std::runtime_error(msg);
   }
+#if WGPU_HAVE_ERROR_SCOPE
+  // Pipeline returned non-null but validation still reported an error —
+  // surface it instead of silently caching a broken pipeline.
+  if (!validation_msg.empty()) {
+    wgpuComputePipelineRelease(pipeline);
+    throw std::runtime_error(
+        "[WebGPU] Compute pipeline validation failed for " + key + ": " +
+        validation_msg);
+  }
+#endif
 
   WGPUBindGroupLayout layout =
       wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
@@ -676,11 +823,30 @@ WGPUShaderModule Device::get_or_create_shader_module(
   desc.nextInChain = &wgsl_desc.chain;
   desc.label = key.c_str();
 
+#if WGPU_HAVE_ERROR_SCOPE
+  wgpuDevicePushErrorScope(device_, WGPUErrorFilter_Validation);
+#endif
   WGPUShaderModule mod = wgpuDeviceCreateShaderModule(device_, &desc);
+#if WGPU_HAVE_ERROR_SCOPE
+  std::string validation_msg = pop_error_scope_blocking(device_, instance_);
+#endif
   if (!mod) {
-    throw std::runtime_error(
-        "[WebGPU] Failed to create shader module: " + key);
+    std::string msg = "[WebGPU] Failed to create shader module: " + key;
+#if WGPU_HAVE_ERROR_SCOPE
+    if (!validation_msg.empty()) {
+      msg += " — " + validation_msg;
+    }
+#endif
+    throw std::runtime_error(msg);
   }
+#if WGPU_HAVE_ERROR_SCOPE
+  if (!validation_msg.empty()) {
+    wgpuShaderModuleRelease(mod);
+    throw std::runtime_error(
+        "[WebGPU] Shader module validation failed for " + key + ": " +
+        validation_msg);
+  }
+#endif
 
   shader_cache_[key] = mod;
   return mod;
@@ -973,8 +1139,8 @@ void CommandEncoder::ensure_active() {
 void CommandEncoder::end_compute_pass() {
   if (compute_pass_) {
     // Phase 0 instrumentation: count actual pass-end events (i.e., only
-    // when we had an open pass). See g_total_pass_ends above.
-    g_total_pass_ends.fetch_add(1, std::memory_order_relaxed);
+    // when we had an open pass). DEV-F023 gates the bump on WEBGPU_PROFILE.
+    WGPU_PROFILE_BUMP(g_total_pass_ends);
     wgpuComputePassEncoderEnd(compute_pass_);
     wgpuComputePassEncoderRelease(compute_pass_);
     compute_pass_ = nullptr;
@@ -1002,9 +1168,13 @@ void CommandEncoder::dispatch_compute(
         compute_pass_, i, bind_groups[i], 0, nullptr);
   }
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
-  op_count_++;
+  // DEV-F021: op_count_total_ drives needs_commit(), so it is ALWAYS
+  // incremented. op_count_kernels_ is observability-only (per-opcode
+  // reporting), so it is gated behind WEBGPU_PROFILE (DEV-F023).
+  op_count_total_++;
+  WGPU_PROFILE_INC(op_count_kernels_);
   // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
-  g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
+  WGPU_PROFILE_BUMP(g_total_dispatches);
   // End compute pass after each dispatch to avoid WebGPU buffer aliasing
   // violations. WebGPU disallows a buffer being both read-only and read-write
   // storage within a single compute pass. Ending the pass after each dispatch
@@ -1024,9 +1194,13 @@ void CommandEncoder::dispatch_compute(
   wgpuComputePassEncoderSetBindGroup(
       compute_pass_, 0, bind_group, 0, nullptr);
   wgpuComputePassEncoderDispatchWorkgroups(compute_pass_, x, y, z);
-  op_count_++;
+  // DEV-F021: op_count_total_ drives needs_commit(), so it is ALWAYS
+  // incremented. op_count_kernels_ is observability-only (per-opcode
+  // reporting), so it is gated behind WEBGPU_PROFILE (DEV-F023).
+  op_count_total_++;
+  WGPU_PROFILE_INC(op_count_kernels_);
   // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
-  g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
+  WGPU_PROFILE_BUMP(g_total_dispatches);
   // End compute pass after each dispatch (same reason as above)
   end_compute_pass();
 }
@@ -1054,12 +1228,13 @@ void CommandEncoder::copy_buffer_to_buffer(
   }
   wgpuCommandEncoderCopyBufferToBuffer(
       encoder_, src, src_offset, dst, dst_offset, size);
-  // Count as an op so needs_commit() still flushes at the right time, but
-  // deliberately NOT as a shader dispatch — Phase 0's g_total_dispatches
-  // tracks kernel launches only. The whole point of this fast path is that
-  // no shader ran. bytes_tracked_ was already bumped by set_input_array /
+  // DEV-F021: count toward op_count_total_ (always) so needs_commit()
+  // still flushes at the right time, but deliberately NOT toward
+  // op_count_kernels_ (no shader ran). Phase 0's g_total_dispatches
+  // tracks kernel launches only, so it stays unincremented here.
+  // bytes_tracked_ was already bumped by set_input_array /
   // set_output_array upstream in copy_gpu_inplace.
-  op_count_++;
+  op_count_total_++;
 }
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
@@ -1067,7 +1242,10 @@ void CommandEncoder::add_completed_handler(std::function<void()> task) {
 }
 
 bool CommandEncoder::needs_commit() {
-  return (op_count_ > max_ops_per_commit_) ||
+  // DEV-F021: commit threshold is driven by the combined op count
+  // (dispatches + native copies) because each command the encoder emits
+  // contributes to the GPU command-buffer cost, not just kernels.
+  return (op_count_total_ > max_ops_per_commit_) ||
       ((bytes_tracked_ >> 20) > static_cast<size_t>(max_mb_per_commit_));
 }
 
@@ -1076,7 +1254,7 @@ void CommandEncoder::commit() {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
 
-  if (op_count_ > 0 && encoder_) {
+  if (op_count_total_ > 0 && encoder_) {
     // End compute pass
     end_compute_pass();
 
@@ -1097,7 +1275,8 @@ void CommandEncoder::commit() {
   // Put completion handlers in a batch.
   worker_->commit(device_.gpu_queue());
 
-  op_count_ = 0;
+  op_count_kernels_ = 0;
+  op_count_total_ = 0;
   bytes_tracked_ = 0;
 }
 
