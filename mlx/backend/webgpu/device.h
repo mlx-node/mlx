@@ -146,6 +146,17 @@ class Device {
   bool has_shader_f16() const { return has_shader_f16_; }
   bool has_subgroups() const { return has_subgroups_; }
 
+  // Detected subgroup size from a WGSL probe kernel run at device creation.
+  // Both fields are 0 when the device has no Subgroups feature OR when the
+  // probe failed. The probe executes the kernel with workgroup_size(1), so it
+  // samples a single invocation's `subgroupSize` builtin and stores that value
+  // in both min and max; a device that varies subgroup size across invocations
+  // will still report a single sample here (callers should disable the
+  // subgroup code path via effective_subgroup_size() if tighter guarantees are
+  // needed).
+  uint32_t subgroup_size_min() const { return subgroup_size_min_; }
+  uint32_t subgroup_size_max() const { return subgroup_size_max_; }
+
   CommandEncoder& get_command_encoder(Stream s);
 
   // Commit all pending command encoders (flush GPU work before readback)
@@ -173,12 +184,19 @@ class Device {
       const std::function<std::string()>& source_builder);
 
  private:
+  // Dispatch a tiny WGSL compute kernel that reads `subgroupSize` and
+  // stores the result into subgroup_size_min_/_max_. No-op (leaves both
+  // fields at 0) if has_subgroups_ is false or any probe step fails.
+  void probe_subgroup_size();
+
   WGPUInstance instance_{nullptr};
   WGPUAdapter adapter_{nullptr};
   WGPUDevice device_{nullptr};
   WGPUQueue queue_{nullptr};
   bool has_shader_f16_{false};
   bool has_subgroups_{false};
+  uint32_t subgroup_size_min_{0};
+  uint32_t subgroup_size_max_{0};
 
   std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;
   std::mutex encoder_mutex_;
