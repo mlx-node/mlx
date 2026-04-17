@@ -366,15 +366,19 @@ std::string build_compiled_kernel(
       in_tmps.push_back("tmp_" + namer.get_name(inp));
     }
 
-    // The `in_type` used for expression lookup is derived from the first
-    // input of the step (binary ops use this to decide between float/int
-    // variants). For mixed-type binaries MLX promotes inputs before the
-    // compile pass, so a single in_type is representative.
-    std::string in_type_hint;
-    if (!step.inputs().empty()) {
-      in_type_hint = wgpu::dtype_to_wgsl_safe(step.inputs()[0].dtype());
-    } else {
-      in_type_hint = step_wgsl_type;
+    // CEL-F009: previously this picked `step.inputs()[0].dtype()`. That
+    // mis-dispatches Select (inputs[0] is a bool mask) and any op where
+    // the first tape input is a bool/u32 comparison result — the lookup
+    // table in op_exprs.h would pick an integer code path for what is
+    // actually a float compute. We now prefer the first non-bool input's
+    // dtype for the hint, falling back to the step's own output dtype.
+    // MLX promotes mixed-type binaries before the compile pass, so this
+    // single representative type is safe to feed to get_binary_op_expr.
+    std::string in_type_hint = step_wgsl_type;
+    for (const auto& inp : step.inputs()) {
+      if (inp.dtype() == bool_) continue;
+      in_type_hint = wgpu::dtype_to_wgsl_safe(inp.dtype());
+      break;
     }
 
     std::string expr = build_tape_expression(
@@ -463,7 +467,34 @@ void Compiled::eval_gpu(
 
   // Pipeline cache key — encodes variant + ndim. Same tape with different
   // contiguity or different dim-count gets a distinct pipeline.
+  //
+  // CEL-F005: kernel_lib_ upstream is hashed over `kindof(dtype) +
+  // itemsize(dtype)` per input/output. That collapses bfloat16 and float16
+  // (both float-kind, both 2 bytes on CPU) even though they map to
+  // *different* WGSL types on WebGPU (bf16 widens to f32 with a
+  // value-preserving upload; f16 becomes `f16` when shader-f16 is enabled).
+  // Without a distinguishing suffix, a Compiled node that first ran with
+  // bf16 inputs would reuse its pipeline on the next f16 invocation, and
+  // vice versa — either the WGSL validator rejects it or (worse) the
+  // kernel silently runs with the wrong type. We append a per-input and
+  // per-output dtype_val fingerprint so every dtype combination gets its
+  // own pipeline key. This does NOT touch kernel_lib_ upstream; the
+  // fingerprint is local to the WebGPU-side entry_name used for caching.
   std::string entry_name = kernel_lib_;
+  entry_name += "_dt";
+  for (size_t i = 0; i < inputs_.size(); ++i) {
+    if (is_constant_(i)) continue;
+    entry_name += "_i" +
+        std::to_string(static_cast<int>(inputs_[i].dtype().val()));
+  }
+  for (const auto& t : tape_) {
+    entry_name += "_t" +
+        std::to_string(static_cast<int>(t.dtype().val()));
+  }
+  for (const auto& o : outputs_) {
+    entry_name += "_o" +
+        std::to_string(static_cast<int>(o.dtype().val()));
+  }
   if (contiguous) {
     entry_name += "_c";
   } else {
