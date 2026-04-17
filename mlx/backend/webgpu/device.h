@@ -87,13 +87,7 @@ class CommandEncoder {
 
   WGPUCommandEncoder encoder_{nullptr};
   WGPUComputePassEncoder compute_pass_{nullptr};
-  // DEV-F021: op_count_ was conflated across shader dispatches and the
-  // native copy_buffer_to_buffer fast path. Split into two counters:
-  //   * op_count_kernels_ — shader dispatches only, for per-opcode reporting.
-  //   * op_count_total_   — all ops (dispatches + copies), drives
-  //                         needs_commit()'s max_ops_per_commit_ threshold.
-  int op_count_kernels_{0};
-  int op_count_total_{0};
+  int op_count_{0};
   int max_ops_per_commit_;
   int max_mb_per_commit_;
   size_t bytes_tracked_{0};
@@ -211,24 +205,8 @@ void flush_all_encoders();
 // atomics incremented inside CommandEncoder::dispatch_compute /
 // end_compute_pass; they are read + reset from the FFI bridge in mlx-sys
 // so the browser can expose `?profile=1` metrics to the demo page.
-//
-// DEV-F023: the atomics themselves are gated behind the WEBGPU_PROFILE
-// compile-time flag (see device.cpp). When the flag is off, the getters
-// return 0 and the setter is a no-op; when on, they work as before. The
-// FFI bridge always links against these symbols, so the signatures stay
-// stable either way.
 uint64_t get_total_dispatches();
 uint64_t get_total_pass_ends();
 void reset_dispatch_stats();
-
-// DEV-F017: device-error observability. The uncaptured-error + device-lost
-// callbacks bump two global atomics so callers (JS/Rust via the FFI bridge)
-// can detect a dead GPUDevice without having to scrape stderr. A tab that
-// lost its device would otherwise keep issuing RPCs on a defunct handle.
-struct DeviceErrorState {
-  uint64_t uncaptured_count;
-  bool device_lost;
-};
-DeviceErrorState wgpu_get_error_state();
 
 } // namespace mlx::core::wgpu
