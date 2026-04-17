@@ -67,7 +67,8 @@
 //   group(0) binding(N+1): params      (uniform)
 //
 // Pipeline cache key: "sdpa_v_" + dtype + "_D" + D + (has_mask ? "_m" : "")
-//                     + (has_subgroups ? "_sg" : "").
+//                     + subgroup_suffix()  (empty or "_sg<N>" for the
+//                     detected subgroup size).
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/gpu/copy.h"
@@ -120,7 +121,8 @@ std::string make_sdpa_vector_kernel(
     const std::string& dtype,
     uint32_t D,
     bool has_mask,
-    bool use_subgroups) {
+    int subgroup_size) {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -254,7 +256,7 @@ std::string make_sdpa_vector_kernel(
         "subgroupMax",
         "max_op",
         SDPA_WORKGROUP_SIZE,
-        32,
+        static_cast<uint32_t>(subgroup_size),
         "mx");
   } else {
     s << "  shared_red[tid] = thread_max;\n"
@@ -350,7 +352,7 @@ std::string make_sdpa_vector_kernel(
         "subgroupAdd",
         "sum_op",
         SDPA_WORKGROUP_SIZE,
-        32,
+        static_cast<uint32_t>(subgroup_size),
         "sm");
   } else {
     s << "  shared_red[tid] = thread_sum;\n"
@@ -400,7 +402,8 @@ std::string make_sdpa_vector_2pass_1_kernel(
     const std::string& dtype,
     uint32_t D,
     bool has_mask,
-    bool use_subgroups) {
+    int subgroup_size) {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -525,7 +528,7 @@ std::string make_sdpa_vector_2pass_1_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_max", "shared_red", "subgroupMax", "max_op",
-        SDPA_WORKGROUP_SIZE, 32, "mx");
+        SDPA_WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "mx");
   } else {
     s << "  shared_red[tid] = thread_max;\n"
       << "  workgroupBarrier();\n";
@@ -598,7 +601,7 @@ std::string make_sdpa_vector_2pass_1_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_sum", "shared_red", "subgroupAdd", "sum_op",
-        SDPA_WORKGROUP_SIZE, 32, "sm");
+        SDPA_WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "sm");
   } else {
     s << "  shared_red[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n";
@@ -632,7 +635,8 @@ std::string make_sdpa_vector_2pass_2_kernel(
     const std::string& entry_name,
     const std::string& dtype,
     uint32_t D,
-    bool use_subgroups) {
+    int subgroup_size) {
+  const bool use_subgroups = subgroup_size > 0;
   std::ostringstream s;
 
   if (use_subgroups) {
@@ -706,7 +710,7 @@ std::string make_sdpa_vector_2pass_2_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_max", "shared_red", "subgroupMax", "max_op",
-        SDPA_WORKGROUP_SIZE, 32, "mx");
+        SDPA_WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "mx");
   } else {
     s << "  shared_red[tid] = thread_max;\n"
       << "  workgroupBarrier();\n";
@@ -731,7 +735,7 @@ std::string make_sdpa_vector_2pass_2_kernel(
   if (use_subgroups) {
     wgpu::emit_subgroup_reduction(
         s, "thread_sum", "shared_red", "subgroupAdd", "sum_op",
-        SDPA_WORKGROUP_SIZE, 32, "sm");
+        SDPA_WORKGROUP_SIZE, static_cast<uint32_t>(subgroup_size), "sm");
   } else {
     s << "  shared_red[tid] = thread_sum;\n"
       << "  workgroupBarrier();\n";
@@ -1334,8 +1338,8 @@ void ScaledDotProductAttention::eval_gpu(
   // Branch on Tq: vector (Tq==1) vs tile (Tq>1).
   if (Tq == 1) {
     // ---------------- Vector kernel path (decode, Tq==1) ----------------
-    bool use_sg = dev.has_subgroups();
-    std::string sg_suffix = use_sg ? "_sg" : "";
+    int sg = wgpu::effective_subgroup_size();
+    std::string sg_suffix = wgpu::subgroup_suffix();
     std::string mask_suffix = has_mask ? "_m" : "";
 
     uint32_t nblocks = (L + SDPA_BLOCK_L - 1u) / SDPA_BLOCK_L;
@@ -1366,7 +1370,7 @@ void ScaledDotProductAttention::eval_gpu(
             std::cerr << "[MLX-KERNEL] " << entry_name << std::endl;
 #endif
             return make_sdpa_vector_kernel(
-                entry_name, dtype, D, has_mask, use_sg);
+                entry_name, dtype, D, has_mask, sg);
           });
       auto pe =
           dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
@@ -1443,7 +1447,7 @@ void ScaledDotProductAttention::eval_gpu(
             std::cerr << "[MLX-KERNEL] " << p1_name << std::endl;
 #endif
             return make_sdpa_vector_2pass_1_kernel(
-                p1_name, dtype, D, has_mask, use_sg);
+                p1_name, dtype, D, has_mask, sg);
           });
       auto p1_pe =
           dev.get_or_create_pipeline(p1_name, p1_shader, p1_name.c_str());
@@ -1502,7 +1506,7 @@ void ScaledDotProductAttention::eval_gpu(
             std::cerr << "[MLX-KERNEL] " << p2_name << std::endl;
 #endif
             return make_sdpa_vector_2pass_2_kernel(
-                p2_name, dtype, D, use_sg);
+                p2_name, dtype, D, sg);
           });
       auto p2_pe =
           dev.get_or_create_pipeline(p2_name, p2_shader, p2_name.c_str());
