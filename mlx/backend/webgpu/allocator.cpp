@@ -52,6 +52,14 @@ bool sdpa_fallback_forced() {
 // (via the FFI bridge in mlx_array_ops.cpp), so the first wgpu_buffer() call
 // uploads via the packed path. A no-op if any precondition fails — safe to
 // call unconditionally from a constructor.
+//
+// ALLOC-F006: the read of gpu_has_data / cpu_dirty / cpu_ptr AND the write
+// to storage_mode both run under allocator::mutex_. This prevents a
+// torn-flip race with another thread that is simultaneously mutating the
+// same WebGPUBuffer (e.g. the allocator free path that recycles to cache).
+// The happens-before with any GPU compute that later dispatches against
+// this buffer is provided by the encoder's commit/submit barrier, which
+// always follows the storage_mode write on the caller's timeline.
 bool try_opt_in_packed_bf16(array& arr, size_t min_elements) {
   if (!packed_bf16_enabled()) {
     return false;
@@ -66,6 +74,7 @@ bool try_opt_in_packed_bf16(array& arr, size_t min_elements) {
   if (!wbuf) {
     return false;
   }
+  std::lock_guard<std::mutex> lock(allocator().mutex_);
   // Only flip on buffers that are still in "upload-pending" state — never
   // touch a buffer that has already been used as a GPU compute input/output.
   if (wbuf->gpu_has_data) {
@@ -92,6 +101,9 @@ bool mark_buffer_packed_bf16(array& arr) {
   if (!wbuf) {
     return false;
   }
+  // ALLOC-F006: serialize with any concurrent flip / reset. See the rationale
+  // comment on try_opt_in_packed_bf16 above.
+  std::lock_guard<std::mutex> lock(allocator().mutex_);
   wbuf->storage_mode = StorageMode::PackedBf16;
   return true;
 }
@@ -109,7 +121,17 @@ WebGPUAllocator::WebGPUAllocator()
 
 Buffer WebGPUAllocator::malloc(size_t size) {
   if (size == 0) {
-    return Buffer{new WebGPUBuffer{nullptr, 0, nullptr}};
+    // ALLOC-F010: zero-size sentinel. The caller gets a WebGPUBuffer whose
+    // size==0 / buffer==nullptr signals "no GPU allocation was performed".
+    // The `free` path recognises this by `buf->size == 0` and deletes the
+    // shell without touching the (absent) WGPUBuffer. Using designated
+    // initializers (rather than positional) so the intent is explicit and
+    // adding a future field to WebGPUBuffer doesn't silently shift the
+    // positional semantics here.
+    return Buffer{new WebGPUBuffer{
+        .buffer = nullptr,
+        .size = 0,
+        .cpu_ptr = nullptr}};
   }
 
   // Remember the caller's requested (unrounded) byte count. This is the
@@ -136,6 +158,11 @@ Buffer WebGPUAllocator::malloc(size_t size) {
     // Reset state for reused buffer. storage_mode MUST be reset — otherwise
     // a buffer previously used as PackedBf16 leaks its mode to unrelated
     // future allocations, corrupting subsequent uploads and readback logic.
+    //
+    // ALLOC-F002: cpu_ptr is also asserted null on cache insert, so in
+    // practice the std::free here is a no-op — kept as a belt-and-braces
+    // cleanup in case an insert path regresses and forgets to drop its CPU
+    // shadow.
     if (buf->cpu_ptr) {
       std::free(buf->cpu_ptr);
       buf->cpu_ptr = nullptr;
@@ -182,13 +209,24 @@ Buffer WebGPUAllocator::malloc(size_t size) {
       throw std::runtime_error(msg.str());
     }
 
-    buf = new WebGPUBuffer{gpu_buf, size, nullptr, false, false};
-    // Record the caller's intended CPU byte count. See comment above in the
-    // cache-reuse branch for rationale. For bf16/bool, the GPU-side element
-    // size (4B) is wider than the CPU-side size (2B/1B) — storing the
-    // unrounded CPU request here keeps wgpu_buffer()'s bf16 sizing and
-    // upload_with_conversion's pack loop consistent with the caller's data.
-    buf->cpu_bytes = requested_size;
+    // ALLOC-F003: use designated initializers so the field order in
+    // WebGPUBuffer can evolve without silently shifting the semantics of
+    // this brace-init. The previous positional form set
+    //   {buffer, size, cpu_ptr, cpu_dirty, gpu_has_data}
+    // which broke as soon as cpu_bytes was inserted before cpu_dirty.
+    buf = new WebGPUBuffer{
+        .buffer = gpu_buf,
+        .size = size,
+        .cpu_ptr = nullptr,
+        // Record the caller's intended CPU byte count. See comment above
+        // in the cache-reuse branch for rationale. For bf16/bool, the
+        // GPU-side element size (4B) is wider than the CPU-side size
+        // (2B/1B) — storing the unrounded CPU request here keeps
+        // wgpu_buffer()'s bf16 sizing and upload_with_conversion's pack
+        // loop consistent with the caller's data.
+        .cpu_bytes = requested_size,
+        .cpu_dirty = false,
+        .gpu_has_data = false};
     lock.lock();
   }
 
@@ -224,6 +262,18 @@ void WebGPUAllocator::free(Buffer buffer) {
   }
 
   if (get_cache_memory() < max_pool_size_) {
+    // ALLOC-F002: normalize bookkeeping fields at cache-insert time so
+    // a cached buffer never carries stale per-allocation metadata. This
+    // is symmetric with the reset-on-reuse block in malloc() above.
+    // Telemetry or future eviction policy that inspects a cached buffer
+    // then sees predictable defaults instead of the previous tenant's
+    // dtype/mode.
+    assert(buf->cpu_ptr == nullptr); // guaranteed by the branch above
+    buf->cpu_bytes = 0;
+    buf->cpu_dirty = false;
+    buf->gpu_has_data = false;
+    buf->dtype_val = Dtype::Val::float32;
+    buf->storage_mode = StorageMode::Upconverted;
     buffer_cache_.recycle_to_cache(buf);
   } else {
     free_wgpu_buffer(buf);
@@ -451,6 +501,10 @@ void* Buffer::raw_ptr() {
   std::memcpy(cpu_data, mapped, wbuf.size);
 
   // Convert from GPU format to CPU format for types with wider GPU representation
+  // ALLOC-F008: after the forward-safe in-place contraction, realloc the CPU
+  // shadow down to the logical byte count. Holding onto the full GPU-sized
+  // allocation (2x for bf16, 4x for bool) wastes heap capacity for the
+  // lifetime of the array, which on WASM is scarce.
   if (wbuf.dtype_val == Dtype::Val::bfloat16) {
     // Contract f32 (4 bytes) -> bf16 (2 bytes) in-place (forward safe: 4B->2B)
     size_t n = wbuf.size / 4;
@@ -459,6 +513,12 @@ void* Buffer::raw_ptr() {
     for (size_t i = 0; i < n; i++) {
       dst[i] = static_cast<bfloat16_t>(src[i]);
     }
+    size_t logical = n * sizeof(bfloat16_t);
+    if (logical > 0 && logical < wbuf.size) {
+      void* shrunk = std::realloc(cpu_data, logical);
+      if (shrunk) cpu_data = shrunk;
+      // realloc failure: keep the oversized block. It's still correct.
+    }
   } else if (wbuf.dtype_val == Dtype::Val::bool_) {
     // Contract u32 (4 bytes) -> bool (1 byte) in-place (forward safe: 4B->1B)
     size_t n = wbuf.size / 4;
@@ -466,6 +526,11 @@ void* Buffer::raw_ptr() {
     auto* dst = static_cast<uint8_t*>(cpu_data);
     for (size_t i = 0; i < n; i++) {
       dst[i] = src[i] ? 1 : 0;
+    }
+    size_t logical = n; // 1 byte / element
+    if (logical > 0 && logical < wbuf.size) {
+      void* shrunk = std::realloc(cpu_data, logical);
+      if (shrunk) cpu_data = shrunk;
     }
   }
 

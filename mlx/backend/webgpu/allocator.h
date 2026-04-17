@@ -33,8 +33,8 @@ enum class StorageMode : uint8_t {
 // The dtype_val field tracks the array's dtype for upload/download format
 // conversion between CPU types (bool=1B, bf16=2B) and GPU types (u32=4B, f32=4B).
 struct WebGPUBuffer {
-  WGPUBuffer buffer;
-  size_t size;
+  WGPUBuffer buffer{nullptr};
+  size_t size{0};
   void* cpu_ptr{nullptr};  // Non-null after raw_ptr() readback
   // Byte size of the CPU-side allocation at `cpu_ptr`. Captured when the
   // allocation is made so that `upload_with_conversion` can always upload
@@ -96,6 +96,17 @@ class WebGPUAllocator : public allocator::Allocator {
  private:
   WebGPUAllocator();
   friend WebGPUAllocator& allocator();
+
+  // ALLOC-F006: try_opt_in_packed_bf16 / mark_buffer_packed_bf16 mutate
+  // storage_mode on a WebGPUBuffer that may be concurrently inspected by
+  // an in-flight GPU compute dispatch. They acquire mutex_ to serialize
+  // that flip against any other bookkeeping read/write. The actual GPU
+  // happens-before is provided by the subsequent encoder commit/submit
+  // (wgpuQueueSubmit orders preceding memory ops ahead of the dispatch).
+  friend bool try_opt_in_packed_bf16(
+      mlx::core::array& arr,
+      size_t min_elements);
+  friend bool mark_buffer_packed_bf16(mlx::core::array& arr);
 
   void free_wgpu_buffer(WebGPUBuffer* buf);
 
