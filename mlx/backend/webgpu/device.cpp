@@ -1014,11 +1014,10 @@ void CommandEncoder::dispatch_compute(
   op_count_++;
   // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
   g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
-  // End compute pass after each dispatch to avoid WebGPU buffer aliasing
-  // violations. WebGPU disallows a buffer being both read-only and read-write
-  // storage within a single compute pass. Ending the pass after each dispatch
-  // ensures each operation gets its own synchronization scope.
-  end_compute_pass();
+  // Keep compute pass open across dispatches. WebGPU validates buffer aliasing
+  // per-dispatch usage scope, not per-pass, so consecutive dispatches that
+  // don't alias within a single dispatch are safe in the same pass. The pass
+  // is ended when necessary (copy_buffer_to_buffer, commit, destructor).
 }
 
 void CommandEncoder::dispatch_compute(
@@ -1036,8 +1035,7 @@ void CommandEncoder::dispatch_compute(
   op_count_++;
   // Phase 0 instrumentation: cumulative dispatches across all encoders/commits.
   g_total_dispatches.fetch_add(1, std::memory_order_relaxed);
-  // End compute pass after each dispatch (same reason as above)
-  end_compute_pass();
+  // Keep compute pass open across dispatches (same reason as above).
 }
 
 void CommandEncoder::copy_buffer_to_buffer(
