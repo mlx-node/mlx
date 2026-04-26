@@ -422,10 +422,6 @@ void RoPE::eval_gpu(
     params.data3[2] = static_cast<uint32_t>(mat_size);
     params.data3[3] = 0;
 
-    encoder.set_input_array(read_from_out ? out : in);
-    encoder.set_input_array(offset);
-    encoder.set_output_array(out);
-
     auto& pool = wgpu::device().uniform_pool();
     WGPUBuffer uniform_buf = pool.acquire(
         wgpu::device().gpu_queue(), &params, sizeof(RoPEGeneralParams));
@@ -468,6 +464,9 @@ void RoPE::eval_gpu(
           dims_half * static_cast<uint32_t>(T) * static_cast<uint32_t>(B * N);
       uint32_t n_workgroups =
           (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+      encoder.set_input_array(temp);
+      encoder.set_input_array(offset);
+      encoder.set_output_array(out);
       encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
 
       wgpuBindGroupRelease(bg);
@@ -490,6 +489,9 @@ void RoPE::eval_gpu(
           dims_half * static_cast<uint32_t>(T) * static_cast<uint32_t>(B * N);
       uint32_t n_workgroups =
           (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+      encoder.set_input_array(in);
+      encoder.set_input_array(offset);
+      encoder.set_output_array(out);
       encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
 
       wgpuBindGroupRelease(bg);

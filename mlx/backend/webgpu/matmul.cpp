@@ -1272,6 +1272,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
     encoder.set_input_array(c_contig);
+    encoder.set_output_array(out);
 
     // Create epilogue params
     struct EpilogueParams {
