@@ -1400,15 +1400,6 @@ void ScaledDotProductAttention::eval_gpu(
 
     uint32_t nblocks = (L + SDPA_BLOCK_L - 1u) / SDPA_BLOCK_L;
 
-    // Register inputs/outputs with the encoder for bookkeeping.
-    encoder.set_input_array(q_c);
-    encoder.set_input_array(k_c);
-    encoder.set_input_array(v_c);
-    if (has_mask) {
-      encoder.set_input_array(*mask_c_opt);
-    }
-    encoder.set_output_array(out);
-
     auto& pool = dev.uniform_pool();
 
     // Prefer the single-pass vector kernel when splitting L would not meaningfully
@@ -1471,6 +1462,13 @@ void ScaledDotProductAttention::eval_gpu(
 
       WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bg_entries);
 
+      encoder.set_input_array(q_c);
+      encoder.set_input_array(k_c);
+      encoder.set_input_array(v_c);
+      if (has_mask) {
+        encoder.set_input_array(*mask_c_opt);
+      }
+      encoder.set_output_array(out);
       encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
 
       wgpuBindGroupRelease(bg);
@@ -1556,6 +1554,15 @@ void ScaledDotProductAttention::eval_gpu(
       p1_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
 
       WGPUBindGroup p1_bg_obj = wgpu::create_bind_group(p1_pe.layout, p1_bg);
+      encoder.set_input_array(q_c);
+      encoder.set_input_array(k_c);
+      encoder.set_input_array(v_c);
+      if (has_mask) {
+        encoder.set_input_array(*mask_c_opt);
+      }
+      encoder.set_output_array(inter_o);
+      encoder.set_output_array(inter_maxs);
+      encoder.set_output_array(inter_sums);
       encoder.dispatch_compute(
           p1_pe.pipeline, p1_bg_obj, BH * nblocks, 1u, 1u);
       wgpuBindGroupRelease(p1_bg_obj);
@@ -1585,8 +1592,11 @@ void ScaledDotProductAttention::eval_gpu(
       p2_bg.emplace_back(inter_sums_buf, 0u);
       p2_bg.emplace_back(out_buf, 0u);
       p2_bg.emplace_back(uniform_buf, sizeof(SdpaParams));
-
       WGPUBindGroup p2_bg_obj = wgpu::create_bind_group(p2_pe.layout, p2_bg);
+      encoder.set_input_array(inter_o);
+      encoder.set_input_array(inter_maxs);
+      encoder.set_input_array(inter_sums);
+      encoder.set_output_array(out);
       encoder.dispatch_compute(p2_pe.pipeline, p2_bg_obj, BH, 1u, 1u);
       wgpuBindGroupRelease(p2_bg_obj);
 
