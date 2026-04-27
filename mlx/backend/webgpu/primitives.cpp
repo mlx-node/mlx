@@ -49,7 +49,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 // Gather, GatherAxis — implemented in indexing.cpp
 // Scatter, ScatterAxis — implemented in indexing.cpp
 // Select — implemented in ternary.cpp
-// QuantizedMatmul, QQMatmul — implemented in quantized.cpp
+// QuantizedMatmul, GatherQMM, fast::Quantize, QQMatmul — implemented in quantized.cpp
 // Reduce — implemented in reduce.cpp
 // Softmax — implemented in softmax.cpp
 
@@ -59,7 +59,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 //   ExpandDims, Flatten, Full, NumberOfElements, Pad, Reshape, Slice,
 //   Split, Squeeze, StopGradient, Transpose, Unflatten, View
 
-NO_GPU(ArgPartition)
+// ArgPartition — implemented in sort.cpp
 // ArgReduce — implemented in arg_reduce.cpp
 // ArgSort — implemented in sort.cpp
 NO_GPU(BitwiseBinary)
@@ -70,7 +70,6 @@ NO_GPU(Conjugate)
 NO_GPU_MULTI(DivMod)
 NO_GPU(FFT)
 NO_GPU(GatherMM)
-NO_GPU(GatherQMM)
 NO_GPU(Hadamard)
 NO_GPU(Imag)
 NO_GPU(Load)
@@ -100,7 +99,6 @@ NO_GPU_MULTI(RMSNormVJP)
 // ScaledDotProductAttention — implemented in sdpa.cpp
 NO_GPU_MULTI(ScaledDotProductAttentionVJP)
 NO_GPU_MULTI(ConvertFP8)
-NO_GPU_MULTI(Quantize)
 NO_GPU_MULTI(CustomKernel)
 } // namespace fast
 

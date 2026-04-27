@@ -380,6 +380,19 @@ void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 // ---------------------------------------------------------------------------
+// ArgPartition::eval_gpu
+// ---------------------------------------------------------------------------
+
+void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // WebGPU does not have a dedicated partition kernel yet. A full argsort is
+  // semantically valid for argpartition users because the requested partition
+  // slice still contains the same ordered side of the axis. Qwen MoE only
+  // needs top-k over <=256 experts, so this keeps the path on-GPU without
+  // changing native backends.
+  eval_sort_gpu(inputs, out, axis_, /* argsort = */ true);
+}
+
+// ---------------------------------------------------------------------------
 // ArgSort::eval_gpu
 // ---------------------------------------------------------------------------
 
