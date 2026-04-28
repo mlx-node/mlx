@@ -670,7 +670,7 @@ void gpu_init_reduce(
       pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
@@ -753,8 +753,8 @@ void gpu_all_reduce(
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer inter_buf = wgpu::wgpu_buffer(intermediate);
-    uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-    uint64_t inter_buf_size = wgpuBufferGetSize(inter_buf);
+    uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+    uint64_t inter_buf_size = wgpu::wgpu_bind_size(intermediate);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
@@ -791,7 +791,7 @@ void gpu_all_reduce(
         pool.acquire(wgpu::device().gpu_queue(), &params2, sizeof(AllReduceParams));
 
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-    uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+    uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
     WGPUBindGroup bg2 = wgpu::create_bind_group(
         pe2.layout,
@@ -815,8 +815,8 @@ void gpu_all_reduce(
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-    uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-    uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+    uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+    uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
@@ -935,8 +935,8 @@ void gpu_row_reduce(
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
@@ -1056,8 +1056,8 @@ void gpu_col_reduce(
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,

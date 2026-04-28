@@ -190,8 +190,8 @@ void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,

@@ -430,9 +430,9 @@ void RMSNorm::eval_gpu(
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t x_buf_size = wgpuBufferGetSize(x_buf);
-  uint64_t w_buf_size = wgpuBufferGetSize(w_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t x_buf_size = wgpu::wgpu_bind_size(x);
+  uint64_t w_buf_size = wgpu::wgpu_bind_size(w);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
@@ -584,9 +584,9 @@ void LayerNorm::eval_gpu(
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t x_buf_size = wgpuBufferGetSize(x_buf);
-  uint64_t w_buf_size = wgpuBufferGetSize(w_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t x_buf_size = wgpu::wgpu_bind_size(x);
+  uint64_t w_buf_size = wgpu::wgpu_bind_size(w);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   // Build bind group entries: input, weight, [bias], output, uniform
   std::vector<std::pair<WGPUBuffer, uint64_t>> bindings;
@@ -594,7 +594,7 @@ void LayerNorm::eval_gpu(
   bindings.push_back({w_buf, w_buf_size});
   if (has_bias) {
     WGPUBuffer b_buf = wgpu::wgpu_buffer(inputs[2]);
-    uint64_t b_buf_size = wgpuBufferGetSize(b_buf);
+    uint64_t b_buf_size = wgpu::wgpu_bind_size(inputs[2]);
     bindings.push_back({b_buf, b_buf_size});
   }
   bindings.push_back({out_buf, out_buf_size});

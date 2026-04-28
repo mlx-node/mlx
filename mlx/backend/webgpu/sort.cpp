@@ -326,8 +326,8 @@ void eval_sort_gpu(
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(sort_out);
-  uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(sort_out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,

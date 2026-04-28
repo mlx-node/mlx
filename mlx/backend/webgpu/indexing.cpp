@@ -711,15 +711,15 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer src_buf = wgpu::wgpu_buffer(src);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-  bind_entries.push_back({src_buf, wgpuBufferGetSize(src_buf)});
-  bind_entries.push_back({out_buf, wgpuBufferGetSize(out_buf)});
+  bind_entries.push_back({src_buf, wgpu::wgpu_bind_size(src)});
+  bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(GatherParams)});
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});
 
   for (int i = 0; i < nidx; ++i) {
     WGPUBuffer idx_buf = wgpu::wgpu_buffer(inputs[i + 1]);
-    bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
+    bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(inputs[i + 1])});
   }
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
@@ -825,9 +825,9 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
   std::vector<std::pair<WGPUBuffer, uint64_t>> bind_entries;
-  bind_entries.push_back({src_buf, wgpuBufferGetSize(src_buf)});
-  bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
-  bind_entries.push_back({out_buf, wgpuBufferGetSize(out_buf)});
+  bind_entries.push_back({src_buf, wgpu::wgpu_bind_size(src)});
+  bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(idx)});
+  bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(GatherAxisParams)});
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});
@@ -920,15 +920,15 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer upd_buf = wgpu::wgpu_buffer(upd);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
-  bind_entries.push_back({upd_buf, wgpuBufferGetSize(upd_buf)});
-  bind_entries.push_back({out_buf, wgpuBufferGetSize(out_buf)});
+  bind_entries.push_back({upd_buf, wgpu::wgpu_bind_size(upd)});
+  bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(ScatterParams)});
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});
 
   for (int i = 0; i < nidx; ++i) {
     WGPUBuffer idx_buf = wgpu::wgpu_buffer(inputs[i + 1]);
-    bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
+    bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(inputs[i + 1])});
   }
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
@@ -1048,9 +1048,9 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
 
   std::vector<std::pair<WGPUBuffer, uint64_t>> bind_entries;
-  bind_entries.push_back({upd_buf, wgpuBufferGetSize(upd_buf)});
-  bind_entries.push_back({idx_buf, wgpuBufferGetSize(idx_buf)});
-  bind_entries.push_back({out_buf, wgpuBufferGetSize(out_buf)});
+  bind_entries.push_back({upd_buf, wgpu::wgpu_bind_size(upd)});
+  bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(idx)});
+  bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(ScatterAxisParams)});
   bind_entries.push_back(
       {meta_buf, meta.size() * sizeof(int32_t)});

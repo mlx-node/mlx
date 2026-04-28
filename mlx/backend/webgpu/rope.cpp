@@ -360,8 +360,8 @@ void RoPE::eval_gpu(
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-    uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-    uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+    uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+    uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
@@ -448,10 +448,10 @@ void RoPE::eval_gpu(
       encoder.add_temporary(temp);
 
       WGPUBuffer temp_buf = wgpu::wgpu_buffer(temp);
-      uint64_t temp_buf_size = wgpuBufferGetSize(temp_buf);
+      uint64_t temp_buf_size = wgpu::wgpu_bind_size(temp);
       out_buf = wgpu::wgpu_buffer(out);
-      uint64_t out_buf_size2 = wgpuBufferGetSize(out_buf);
-      uint64_t offset_buf_size = wgpuBufferGetSize(offset_buf);
+      uint64_t out_buf_size2 = wgpu::wgpu_bind_size(out);
+      uint64_t offset_buf_size = wgpu::wgpu_bind_size(offset);
 
       WGPUBindGroup bg = wgpu::create_bind_group(
           pe.layout,
@@ -473,10 +473,10 @@ void RoPE::eval_gpu(
     } else {
       // input != output, straightforward binding
       WGPUBuffer in_buf2 = wgpu::wgpu_buffer(in);
-      uint64_t in_buf_size = wgpuBufferGetSize(in_buf2);
+      uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
       out_buf = wgpu::wgpu_buffer(out);
-      uint64_t out_buf_size2 = wgpuBufferGetSize(out_buf);
-      uint64_t offset_buf_size = wgpuBufferGetSize(offset_buf);
+      uint64_t out_buf_size2 = wgpu::wgpu_bind_size(out);
+      uint64_t offset_buf_size = wgpu::wgpu_bind_size(offset);
 
       WGPUBindGroup bg = wgpu::create_bind_group(
           pe.layout,

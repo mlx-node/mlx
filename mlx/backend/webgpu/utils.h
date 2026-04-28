@@ -255,6 +255,35 @@ inline uint64_t wgpu_data_size(const array& arr) {
   return static_cast<uint64_t>(arr.data_size()) * wgpu_itemsize(arr.dtype());
 }
 
+// Compute a bind-group range large enough for a shader that indexes from the
+// start of the underlying buffer and applies arr.offset() in element units.
+// Avoids a wgpuBufferGetSize round trip on the browser bridge hot path.
+inline uint64_t wgpu_bind_size(const array& arr) {
+  const auto* wbuf = static_cast<const WebGPUBuffer*>(arr.buffer().ptr());
+  if (wbuf && wbuf->size > 0) {
+    return static_cast<uint64_t>(wbuf->size);
+  }
+
+  const uint64_t elem_offset =
+      static_cast<uint64_t>(arr.offset()) / static_cast<uint64_t>(arr.itemsize());
+  uint64_t max_elem = elem_offset;
+  for (int i = 0; i < arr.ndim(); ++i) {
+    if (arr.shape(i) == 0) {
+      return 0;
+    }
+    const auto stride = arr.strides()[i];
+    if (stride > 0) {
+      max_elem += static_cast<uint64_t>(arr.shape(i) - 1) *
+          static_cast<uint64_t>(stride);
+    }
+  }
+  const uint64_t elem_end = max_elem + 1;
+  if (wbuf && wbuf->storage_mode == StorageMode::PackedBf16) {
+    return ((elem_end + 1) / 2) * 4;
+  }
+  return elem_end * wgpu_itemsize(arr.dtype());
+}
+
 // Map MLX dtype to WGSL type name string.
 inline const char* dtype_to_wgsl(Dtype dtype) {
   switch (dtype.val()) {
