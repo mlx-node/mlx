@@ -892,9 +892,9 @@ static void dispatch_matmul(
   // storage mode is visible before kernel selection.
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
-      {{a_buf, wgpuBufferGetSize(a_buf)},
-       {b_buf, wgpuBufferGetSize(b_buf)},
-       {out_buf, wgpuBufferGetSize(out_buf)},
+      {{a_buf, wgpu::wgpu_bind_size(a)},
+       {b_buf, wgpu::wgpu_bind_size(b)},
+       {out_buf, wgpu::wgpu_bind_size(out)},
        {uniform_buf, sizeof(MatmulParams)}});
 
   if (kind == MatmulKind::GEMV) {
@@ -1295,8 +1295,8 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
-        {{c_buf, wgpuBufferGetSize(c_buf)},
-         {out_buf, wgpuBufferGetSize(out_buf)},
+        {{c_buf, wgpu::wgpu_bind_size(c_contig)},
+         {out_buf, wgpu::wgpu_bind_size(out)},
          {uniform_buf, sizeof(EpilogueParams)}});
 
     uint32_t num_workgroups =

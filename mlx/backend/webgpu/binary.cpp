@@ -319,9 +319,9 @@ void binary_op_gpu_dispatch(
   WGPUBuffer a_buf = wgpu::wgpu_buffer(a);
   WGPUBuffer b_buf = wgpu::wgpu_buffer(b);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t a_buf_size = wgpuBufferGetSize(a_buf);
-  uint64_t b_buf_size = wgpuBufferGetSize(b_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t a_buf_size = wgpu::wgpu_bind_size(a);
+  uint64_t b_buf_size = wgpu::wgpu_bind_size(b);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,

@@ -264,10 +264,10 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
-      {{cond_buf, wgpuBufferGetSize(cond_buf)},
-       {b_buf, wgpuBufferGetSize(b_buf)},
-       {c_buf, wgpuBufferGetSize(c_buf)},
-       {out_buf, wgpuBufferGetSize(out_buf)},
+      {{cond_buf, wgpu::wgpu_bind_size(cond)},
+       {b_buf, wgpu::wgpu_bind_size(b)},
+       {c_buf, wgpu::wgpu_bind_size(c)},
+       {out_buf, wgpu::wgpu_bind_size(out)},
        {uniform_buf, sizeof(TernaryParams)}});
 
   uint32_t num_workgroups =

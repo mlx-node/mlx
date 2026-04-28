@@ -138,7 +138,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   // Both param structs have the same size (16 bytes)
   size_t params_size =

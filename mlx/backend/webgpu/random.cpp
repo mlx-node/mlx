@@ -210,9 +210,9 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_output_array(out);
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
   WGPUBuffer keys_buf = wgpu::wgpu_buffer(keys);
-  uint64_t keys_buf_size = wgpuBufferGetSize(keys_buf);
+  uint64_t keys_buf_size = wgpu::wgpu_bind_size(keys);
 
   auto& pool = dev.uniform_pool();
 

@@ -613,12 +613,12 @@ void Compiled::eval_gpu(
     const auto& x = inputs[i];
     encoder.set_input_array(x);
     WGPUBuffer buf = wgpu::wgpu_buffer(x);
-    bg_entries.emplace_back(buf, wgpuBufferGetSize(buf));
+    bg_entries.emplace_back(buf, wgpu::wgpu_bind_size(x));
   }
   for (auto& o : outputs) {
     encoder.set_output_array(o);
     WGPUBuffer buf = wgpu::wgpu_buffer(o);
-    bg_entries.emplace_back(buf, wgpuBufferGetSize(buf));
+    bg_entries.emplace_back(buf, wgpu::wgpu_bind_size(o));
   }
   bg_entries.emplace_back(uniform_buf, sizeof(CompiledParams));
   if (strides_buf) {

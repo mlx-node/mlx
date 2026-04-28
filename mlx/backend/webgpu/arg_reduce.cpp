@@ -27,6 +27,7 @@ struct ArgReduceParams {
   uint32_t shape_1[4];    // shape[4..7]
   int32_t in_strides_0[4];  // input strides[0..3] (with axis removed)
   int32_t in_strides_1[4];  // input strides[4..7]
+  uint32_t extra[4];      // [input_offset, pad, pad, pad]
 };
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,7 @@ std::string make_arg_reduce_kernel(
     << "  shape_1: vec4<u32>,\n"
     << "  in_strides_0: vec4<i32>,\n"
     << "  in_strides_1: vec4<i32>,\n"
+    << "  extra: vec4<u32>,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
@@ -99,7 +101,9 @@ std::string make_arg_reduce_kernel(
   // Compute the base input offset from the output index
   s << "  var base_offset: u32 = 0u;\n"
     << "  if (ndim > 0u) {\n"
-    << "    base_offset = elem_to_loc(out_idx, ndim);\n"
+    << "    base_offset = params.extra.x + elem_to_loc(out_idx, ndim);\n"
+    << "  } else {\n"
+    << "    base_offset = params.extra.x;\n"
     << "  }\n"
     << "\n";
 
@@ -159,7 +163,7 @@ std::string make_row_arg_reduce_kernel(
   // Simple uniform: just axis_size and num_rows. Row layout is
   // [num_rows, axis_size] contiguous — no strides needed.
   s << "struct RowArgReduceParams {\n"
-    << "  data: vec4<u32>,\n"  // [axis_size, num_rows, pad, pad]
+    << "  data: vec4<u32>,\n"  // [axis_size, num_rows, input_offset, pad]
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
@@ -201,7 +205,7 @@ std::string make_row_arg_reduce_kernel(
     << "  let axis_size = params.data.x;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
-    << "  let row_start = row * axis_size;\n"
+    << "  let row_start = params.data.z + row * axis_size;\n"
     << "\n"
     << "  // Seed with the reduce identity so threads with tid >= axis_size\n"
     << "  // carry a value that always loses the strict comparison below.\n"
@@ -252,7 +256,7 @@ std::string make_row_arg_reduce_kernel(
 
 // Uniform for the row-parallel arg_reduce fast path.
 struct RowArgReduceParams {
-  uint32_t data[4]; // [axis_size, num_rows, pad, pad]
+  uint32_t data[4]; // [axis_size, num_rows, input_offset, pad]
 };
 
 } // namespace
@@ -288,13 +292,14 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   // serializes a 151K-element scan onto a single thread; here we spread it
   // across the whole workgroup. The offset guard matches the other
   // webgpu kernels that index `input[row*axis+i]` directly — `wgpu_buffer`
-  // returns the raw WebGPU handle without applying `array::offset()`.
+  // returns the raw WebGPU handle without applying `array::offset()`, so the
+  // shader adds the array offset explicitly.
   const int ndim_in = in.ndim();
   const bool axis_is_last = (axis_ == ndim_in - 1);
   const uint32_t axis_size_u = static_cast<uint32_t>(in.shape(axis_));
   const auto axis_stride_i = in.strides()[axis_];
   const bool last_axis_contig = axis_is_last && axis_stride_i == 1 &&
-      in.flags().row_contiguous && in.offset() == 0;
+      in.flags().row_contiguous;
   constexpr uint32_t kRowParallelMinAxis = 1024u;
   const bool use_row_parallel =
       last_axis_contig && axis_size_u > kRowParallelMinAxis;
@@ -320,6 +325,8 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
     RowArgReduceParams params{};
     params.data[0] = axis_size_u;
     params.data[1] = num_rows;
+    params.data[2] =
+        static_cast<uint32_t>(in.offset() / in.itemsize());
 
     auto& pool = wgpu::device().uniform_pool();
     WGPUBuffer uniform_buf = pool.acquire(
@@ -327,8 +334,8 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-    uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-    uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+    uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+    uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
@@ -376,6 +383,7 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.data[1] = axis_size;
   params.data[2] = axis_stride;
   params.data[3] = ndim;
+  params.extra[0] = static_cast<uint32_t>(in.offset() / in.itemsize());
 
   for (uint32_t i = 0; i < ndim && i < wgpu::MAX_NDIM; ++i) {
     if (i < 4) {
@@ -393,8 +401,8 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
-  uint64_t in_buf_size = wgpuBufferGetSize(in_buf);
-  uint64_t out_buf_size = wgpuBufferGetSize(out_buf);
+  uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
+  uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
       pe.layout,
