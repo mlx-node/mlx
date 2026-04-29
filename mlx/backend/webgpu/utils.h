@@ -47,6 +47,13 @@ inline std::string wgsl_linear_thread_id() {
       "}\n\n");
 }
 
+inline std::string wgsl_linear_workgroup_id() {
+  return std::string(
+      "fn linear_workgroup_id(wg_id: vec3u, nwg: vec3u) -> u32 {\n"
+      "  return (wg_id.z * nwg.y + wg_id.y) * nwg.x + wg_id.x;\n"
+      "}\n\n");
+}
+
 // Return the GPU-side element size for a dtype.
 // WGSL has no 8-bit or 16-bit integer storage, so:
 //   bool    -> u32 (4 bytes)

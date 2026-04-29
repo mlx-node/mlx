@@ -53,7 +53,7 @@ constexpr uint32_t ARGSORT_ELEMS_PER_THREAD =
 // ---------------------------------------------------------------------------
 
 struct SortParams {
-  uint32_t data[4]; // [axis_size, n_padded, pad, pad]
+  uint32_t data[4]; // [axis_size, n_padded, num_rows, pad]
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +85,7 @@ std::string make_sort_kernel(
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
   s << "const ELEMS_PER_THREAD: u32 = " << elems_per_thread << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct SortParams {\n"
     << "  data: vec4<u32>,\n"
@@ -126,11 +127,14 @@ std::string make_sort_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
     << "  let n_padded = params.data.y;\n"
+    << "  let num_rows = params.data.z;\n"
     << "  let tid = lid.x;\n"
-    << "  let row = wg_id.x;\n"
+    << "  let row = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (row >= num_rows) { return; }\n"
     << "  let row_start = row * axis_size;\n"
     << "\n";
 
@@ -311,6 +315,7 @@ void eval_sort_gpu(
   SortParams params{};
   params.data[0] = axis_size;
   params.data[1] = n_padded;
+  params.data[2] = static_cast<uint32_t>(n_rows);
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
@@ -340,7 +345,9 @@ void eval_sort_gpu(
        {uniform_buf, sizeof(SortParams)}});
 
   // One workgroup per row
-  encoder.dispatch_compute(pe.pipeline, bg, static_cast<uint32_t>(n_rows));
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(static_cast<uint32_t>(n_rows), "[WebGPU sort]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

@@ -29,7 +29,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct SoftmaxParams {
-  uint32_t data[4]; // [axis_size, input_offset, output_offset, pad]
+  uint32_t data[4]; // [axis_size, input_offset, output_offset, num_rows]
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ std::string make_softmax_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct SoftmaxParams {\n"
     << "  data: vec4<u32>,\n"
@@ -77,12 +78,15 @@ std::string make_softmax_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
     << "  let tid = lid.x;\n"
-    << "  let row = wg_id.x;\n"
+    << "  let row = linear_workgroup_id(wg_id, nwg);\n"
     << "  let input_offset = params.data.y;\n"
     << "  let output_offset = params.data.z;\n"
+    << "  let num_rows = params.data.w;\n"
+    << "  if (row >= num_rows) { return; }\n"
     << "  let row_start = row * axis_size;\n"
     << "\n"
     << "  // Phase 1: Compute max via parallel reduction\n"
@@ -212,6 +216,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.data[0] = static_cast<uint32_t>(axis_size);
   params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
   params.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
+  params.data[3] = static_cast<uint32_t>(n_rows);
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
@@ -229,8 +234,9 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
        {uniform_buf, sizeof(SoftmaxParams)}});
 
   // One workgroup per row
-  encoder.dispatch_compute(
-      pe.pipeline, bg, static_cast<uint32_t>(n_rows));
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(static_cast<uint32_t>(n_rows), "[WebGPU softmax]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

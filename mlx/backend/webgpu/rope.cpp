@@ -118,6 +118,7 @@ std::string make_rope_single_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   // Params struct
   s << "struct RoPEParams {\n"
@@ -137,7 +138,9 @@ std::string make_rope_single_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let dims_half = params.data.x;\n"
     << "  let D = params.data.y;\n"
     << "  let n_rows = params.data.z;\n"
@@ -152,7 +155,7 @@ std::string make_rope_single_kernel(
     << "\n"
     << "  // Each thread handles one pair in one row\n"
     << "  // Linearize gid into (pair_idx, row)\n"
-    << "  let thread_id = gid.x;\n"
+    << "  let thread_id = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let pair_idx = thread_id % dims_half;\n"
     << "  let row = thread_id / dims_half;\n"
     << "\n"
@@ -209,6 +212,7 @@ std::string make_rope_general_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   // Params struct
   s << "struct RoPEParams {\n"
@@ -229,7 +233,9 @@ std::string make_rope_general_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let dims_half = params.data.x;\n"
     << "  let D = params.data.y;\n"
     << "  let N = params.data.z;\n"
@@ -246,7 +252,7 @@ std::string make_rope_general_kernel(
     << "  let offset_base = params.data4.z;\n"
     << "\n"
     << "  // Linearize thread_id into (pair_idx, t, head_batch)\n"
-    << "  let thread_id = gid.x;\n"
+    << "  let thread_id = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let pair_idx = thread_id % dims_half;\n"
     << "  let remainder = thread_id / dims_half;\n"
     << "  let t = remainder % T;\n"
@@ -425,7 +431,9 @@ void RoPE::eval_gpu(
     uint32_t total_threads = dims_half * n_rows;
     uint32_t n_workgroups =
         (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-    encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
+    auto [wg_x, wg_y] =
+        wgpu::get_2d_grid(n_workgroups, "[WebGPU rope_single]");
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
     wgpuBindGroupRelease(bg);
     encoder.add_completed_handler([uniform_buf]() {
@@ -518,7 +526,9 @@ void RoPE::eval_gpu(
       encoder.set_input_array(temp);
       encoder.set_input_array(offset);
       encoder.set_output_array(out);
-      encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
+      auto [wg_x, wg_y] =
+          wgpu::get_2d_grid(n_workgroups, "[WebGPU rope_general]");
+      encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
       wgpuBindGroupRelease(bg);
     } else {
@@ -543,7 +553,9 @@ void RoPE::eval_gpu(
       encoder.set_input_array(in);
       encoder.set_input_array(offset);
       encoder.set_output_array(out);
-      encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
+      auto [wg_x, wg_y] =
+          wgpu::get_2d_grid(n_workgroups, "[WebGPU rope_general]");
+      encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
       wgpuBindGroupRelease(bg);
     }

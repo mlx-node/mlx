@@ -47,6 +47,7 @@ std::string make_conv1d_depthwise_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct Conv1DParams {\n"
     << "  data: vec4<u32>,\n"
@@ -65,7 +66,9 @@ std::string make_conv1d_depthwise_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let out_size = params.data.x;\n"
     << "  let in_channels = params.data.y;\n"
     << "  let kernel_size = params.data.z;\n"
@@ -78,7 +81,7 @@ std::string make_conv1d_depthwise_kernel(
     << "  let dilation = params.data3.y;\n"
     << "  let flip = params.data3.z;\n"
     << "\n"
-    << "  let out_idx = gid.x;\n"
+    << "  let out_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (out_idx >= out_size) { return; }\n"
     << "\n"
     << "  // Decompose flat output index -> [batch, out_t, channel]\n"
@@ -125,6 +128,7 @@ std::string make_conv1d_general_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct Conv1DParams {\n"
     << "  data: vec4<u32>,\n"
@@ -155,7 +159,9 @@ std::string make_conv1d_general_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let out_size = params.data.x;\n"
     << "  let in_channels = params.data.y;\n"
     << "  let kernel_size = params.data.z;\n"
@@ -168,7 +174,7 @@ std::string make_conv1d_general_kernel(
     << "  let dilation = params.data3.y;\n"
     << "  let flip = params.data3.z;\n"
     << "\n"
-    << "  let out_idx = gid.x;\n"
+    << "  let out_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (out_idx >= out_size) { return; }\n"
     << "\n"
     << "  // Output shape: [B, T_out, C_out]\n"
@@ -330,7 +336,8 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Dispatch one thread per output element
   uint32_t num_workgroups =
       (out_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU conv]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

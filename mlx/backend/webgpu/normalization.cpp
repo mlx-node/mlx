@@ -40,6 +40,7 @@ namespace {
 
 struct RMSNormParams {
   uint32_t data[4]; // [axis_size, w_stride, eps_bits, w_offset]
+  uint32_t extra[4]; // [num_rows, pad, pad, pad]
 };
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ struct RMSNormParams {
 
 struct LayerNormParams {
   uint32_t data[4]; // [axis_size, w_stride, eps_bits, b_stride]
-  uint32_t offsets[4]; // [w_offset, b_offset, pad, pad]
+  uint32_t offsets[4]; // [w_offset, b_offset, num_rows, pad]
 };
 
 uint32_t shader_elem_offset(const array& arr, const char* op_name) {
@@ -89,9 +90,11 @@ std::string make_rmsnorm_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct RMSNormParams {\n"
     << "  data: vec4<u32>,\n"
+    << "  extra: vec4<u32>,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
@@ -121,13 +124,16 @@ std::string make_rmsnorm_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
     << "  let w_stride = params.data.y;\n"
     << "  let eps = bitcast<f32>(params.data.z);\n"
     << "  let w_offset = params.data.w;\n"
+    << "  let num_rows = params.extra.x;\n"
     << "  let tid = lid.x;\n"
-    << "  let row = wg_id.x;\n"
+    << "  let row = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (row >= num_rows) { return; }\n"
     << "  let row_start = row * axis_size;\n"
     << "\n"
     << "  // Phase 1: Compute sum of squares via parallel reduction\n"
@@ -201,6 +207,7 @@ std::string make_layernorm_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct LayerNormParams {\n"
     << "  data: vec4<u32>,\n"
@@ -246,15 +253,18 @@ std::string make_layernorm_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
     << "  let w_stride = params.data.y;\n"
     << "  let eps = bitcast<f32>(params.data.z);\n"
     << "  let b_stride = params.data.w;\n"
     << "  let w_offset = params.offsets.x;\n"
     << "  let b_offset = params.offsets.y;\n"
+    << "  let num_rows = params.offsets.z;\n"
     << "  let tid = lid.x;\n"
-    << "  let row = wg_id.x;\n"
+    << "  let row = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (row >= num_rows) { return; }\n"
     << "  let row_start = row * axis_size;\n"
     << "\n";
 
@@ -444,6 +454,7 @@ void RMSNorm::eval_gpu(
   std::memcpy(&eps_bits, &eps_val, sizeof(eps_bits));
   params.data[2] = eps_bits;
   params.data[3] = shader_elem_offset(w, "RMSNorm");
+  params.extra[0] = static_cast<uint32_t>(n_rows);
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
@@ -464,8 +475,9 @@ void RMSNorm::eval_gpu(
        {uniform_buf, sizeof(RMSNormParams)}});
 
   // One workgroup per row
-  encoder.dispatch_compute(
-      pe.pipeline, bg, static_cast<uint32_t>(n_rows));
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(static_cast<uint32_t>(n_rows), "[WebGPU rmsnorm]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
@@ -600,7 +612,7 @@ void LayerNorm::eval_gpu(
   params.data[3] = b_stride;
   params.offsets[0] = shader_elem_offset(w, "LayerNorm");
   params.offsets[1] = has_bias ? shader_elem_offset(inputs[2], "LayerNorm") : 0;
-  params.offsets[2] = 0;
+  params.offsets[2] = static_cast<uint32_t>(n_rows);
   params.offsets[3] = 0;
 
   auto& pool = wgpu::device().uniform_pool();
@@ -629,8 +641,9 @@ void LayerNorm::eval_gpu(
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bindings);
 
   // One workgroup per row
-  encoder.dispatch_compute(
-      pe.pipeline, bg, static_cast<uint32_t>(n_rows));
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(static_cast<uint32_t>(n_rows), "[WebGPU layernorm]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

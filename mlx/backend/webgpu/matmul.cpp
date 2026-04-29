@@ -1241,6 +1241,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       src << "enable f16;\n\n";
     }
 
+    src << "const WORKGROUP_SIZE: u32 = " << GEMV_WORKGROUP_SIZE << "u;\n\n";
+    src << wgpu::wgsl_linear_thread_id();
+
     src << "struct EpilogueParams {\n"
         << "  size: u32,\n"
         << "  alpha: f32,\n"
@@ -1254,10 +1257,12 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         << wgsl_type << ">;\n"
         << "@group(0) @binding(2) var<uniform> params: EpilogueParams;\n\n";
 
-    src << "@compute @workgroup_size(256)\n"
+    src << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
         << "fn " << entry_name
-        << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-        << "  let idx = gid.x;\n"
+        << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+        << " @builtin(local_invocation_id) lid: vec3u,\n"
+        << " @builtin(num_workgroups) nwg: vec3u) {\n"
+        << "  let idx = linear_thread_id(wg_id, lid, nwg);\n"
         << "  if (idx >= params.size) { return; }\n"
         << "  let matmul_val = f32(out_buf[idx]);\n"
         << "  let c_val = f32(c_in[idx]);\n"
@@ -1301,7 +1306,9 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     uint32_t num_workgroups =
         (ep.size + GEMV_WORKGROUP_SIZE - 1) / GEMV_WORKGROUP_SIZE;
-    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+    auto [wg_x, wg_y] =
+        wgpu::get_2d_grid(num_workgroups, "[WebGPU addmm_epilogue]");
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
     wgpuBindGroupRelease(bg);
     encoder.add_completed_handler([uniform_buf]() {

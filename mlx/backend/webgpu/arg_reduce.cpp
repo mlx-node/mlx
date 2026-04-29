@@ -46,6 +46,7 @@ std::string make_arg_reduce_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct ArgReduceParams {\n"
     << "  data: vec4<u32>,\n"
@@ -88,13 +89,15 @@ std::string make_arg_reduce_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let out_size = params.data.x;\n"
     << "  let axis_size = params.data.y;\n"
     << "  let axis_stride = params.data.z;\n"
     << "  let ndim = params.data.w;\n"
     << "\n"
-    << "  let out_idx = gid.x;\n"
+    << "  let out_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (out_idx >= out_size) { return; }\n"
     << "\n";
 
@@ -159,6 +162,7 @@ std::string make_row_arg_reduce_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   // Simple uniform: just axis_size and num_rows. Row layout is
   // [num_rows, axis_size] contiguous — no strides needed.
@@ -201,10 +205,13 @@ std::string make_row_arg_reduce_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
+    << "  let num_rows = params.data.y;\n"
     << "  let tid = lid.x;\n"
-    << "  let row = wg_id.x;\n"
+    << "  let row = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (row >= num_rows) { return; }\n"
     << "  let row_start = params.data.z + row * axis_size;\n"
     << "\n"
     << "  // Seed with the reduce identity so threads with tid >= axis_size\n"
@@ -344,7 +351,9 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
          {uniform_buf, sizeof(RowArgReduceParams)}});
 
     // One workgroup per row.
-    encoder.dispatch_compute(pe.pipeline, bg, num_rows);
+    auto [wg_x, wg_y] =
+        wgpu::get_2d_grid(num_rows, "[WebGPU row_arg_reduce]");
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
     wgpuBindGroupRelease(bg);
     encoder.add_completed_handler([uniform_buf]() {
@@ -414,7 +423,9 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   uint32_t num_workgroups =
       (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU arg_reduce]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
