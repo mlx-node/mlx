@@ -107,12 +107,21 @@ fn elem_to_loc_out(idx: u32, ndim: u32) -> u32 {
   return u32(loc);
 }
 
+fn linear_thread_id(wg_id: vec3u, lid: vec3u, nwg: vec3u) -> u32 {
+  let wg_linear = (wg_id.z * nwg.y + wg_id.y) * nwg.x + wg_id.x;
+  return wg_linear * WORKGROUP_SIZE + lid.x;
+}
+
 // ============================================================================
 // copy_s: Scalar broadcast - fill all output elements with src[in_offset].
 // ============================================================================
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn copy_s(@builtin(global_invocation_id) gid: vec3u) {
-  let base = gid.x * N_READS;
+fn copy_s(
+  @builtin(workgroup_id) wg_id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u
+) {
+  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;
   let size = params.size_ndim_offsets.x;
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
@@ -129,8 +138,12 @@ fn copy_s(@builtin(global_invocation_id) gid: vec3u) {
 // copy_v: Vector copy - contiguous 1:1 element copy with offsets.
 // ============================================================================
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn copy_v(@builtin(global_invocation_id) gid: vec3u) {
-  let base = gid.x * N_READS;
+fn copy_v(
+  @builtin(workgroup_id) wg_id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u
+) {
+  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;
   let size = params.size_ndim_offsets.x;
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
@@ -146,8 +159,12 @@ fn copy_v(@builtin(global_invocation_id) gid: vec3u) {
 // copy_g: General strided copy - strided input, contiguous output.
 // ============================================================================
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn copy_g(@builtin(global_invocation_id) gid: vec3u) {
-  let base = gid.x * N_READS;
+fn copy_g(
+  @builtin(workgroup_id) wg_id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u
+) {
+  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;
   let size = params.size_ndim_offsets.x;
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;
@@ -165,8 +182,12 @@ fn copy_g(@builtin(global_invocation_id) gid: vec3u) {
 // copy_gg: General-general copy - strided input AND strided output.
 // ============================================================================
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn copy_gg(@builtin(global_invocation_id) gid: vec3u) {
-  let base = gid.x * N_READS;
+fn copy_gg(
+  @builtin(workgroup_id) wg_id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u
+) {
+  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;
   let size = params.size_ndim_offsets.x;
   if (base >= size) { return; }
   let in_off = params.size_ndim_offsets.z;

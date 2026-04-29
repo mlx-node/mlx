@@ -8,6 +8,7 @@
 #include "mlx/utils.h"
 #include "gen/wgsl_sources.h"
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <sstream>
@@ -210,8 +211,17 @@ void dispatch_copy(
       (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
       (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
+  constexpr uint32_t kMaxWorkgroupsPerDimension = 65535u;
+  uint32_t wg_x = std::min(num_workgroups, kMaxWorkgroupsPerDimension);
+  uint32_t wg_y =
+      (num_workgroups + kMaxWorkgroupsPerDimension - 1) /
+      kMaxWorkgroupsPerDimension;
+  if (wg_y > kMaxWorkgroupsPerDimension) {
+    throw std::runtime_error(
+        "[WebGPU copy] output is too large for a 2D WebGPU dispatch.");
+  }
 
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
