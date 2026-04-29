@@ -230,13 +230,15 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Ensure inputs are contiguous
   array in = in_orig;
   auto& encoder = wgpu::get_command_encoder(s);
-  if (!in.flags().row_contiguous) {
+  if (!in.flags().row_contiguous || in.offset() != 0 ||
+      in.size() != in.data_size()) {
     in = contiguous_copy_gpu(in_orig, s);
     encoder.add_temporary(in);
   }
 
   array wt = wt_orig;
-  if (!wt.flags().row_contiguous) {
+  if (!wt.flags().row_contiguous || wt.offset() != 0 ||
+      wt.size() != wt.data_size()) {
     wt = contiguous_copy_gpu(wt_orig, s);
     encoder.add_temporary(wt);
   }

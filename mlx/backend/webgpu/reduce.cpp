@@ -191,7 +191,7 @@ const char* get_subgroup_builtin(Reduce::ReduceType rtype) {
 
 // C++ struct matching the WGSL AllReduceParams layout (vec4-aligned).
 struct AllReduceParams {
-  uint32_t data[4]; // [input_size, pad, pad, pad]
+  uint32_t data[4]; // [input_size, input_offset, output_offset, pad]
 };
 
 std::string make_all_reduce_kernel(
@@ -243,6 +243,8 @@ std::string make_all_reduce_kernel(
     << " @builtin(workgroup_id) wg_id: vec3u,\n"
     << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let input_size = params.data.x;\n"
+    << "  let input_offset = params.data.y;\n"
+    << "  let output_offset = params.data.z;\n"
     << "  let tid = lid.x;\n"
     << "  let total_threads = nwg.x * WORKGROUP_SIZE;\n"
     << "  let global_tid = wg_id.x * WORKGROUP_SIZE + tid;\n"
@@ -251,7 +253,7 @@ std::string make_all_reduce_kernel(
     << "  var acc: " << acc_type << " = " << identity << ";\n"
     << "  var idx: u32 = global_tid;\n"
     << "  while (idx < input_size) {\n"
-    << "    acc = reduce_op(acc, " << acc_type << "(input[idx]));\n"
+    << "    acc = reduce_op(acc, " << acc_type << "(input[input_offset + idx]));\n"
     << "    idx = idx + total_threads;\n"
     << "  }\n"
     << "\n";
@@ -272,7 +274,7 @@ std::string make_all_reduce_kernel(
   s << "\n"
     << "  // Thread 0 writes the workgroup result\n"
     << "  if (tid == 0u) {\n"
-    << "    output[wg_id.x] = " << out_type << "(shared_data[0]);\n"
+    << "    output[output_offset + wg_id.x] = " << out_type << "(shared_data[0]);\n"
     << "  }\n"
     << "}\n";
 
@@ -287,6 +289,7 @@ std::string make_all_reduce_kernel(
 // Supports both simple (contiguous) and general (strided) row reduce.
 struct RowReduceParams {
   uint32_t row_size_num_rows[4];  // [row_size, num_rows, ndim, reduce_ndim]
+  uint32_t offsets[4];            // [input_offset, output_offset, pad, pad]
   uint32_t shape_0[4];            // non-reduce shape[0..3]
   uint32_t shape_1[4];            // non-reduce shape[4..7]
   int32_t strides_0[4];           // non-reduce strides[0..3]
@@ -323,6 +326,7 @@ std::string make_row_reduce_kernel(
 
   s << "struct RowReduceParams {\n"
     << "  row_size_num_rows: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "  shape_0: vec4<u32>,\n"
     << "  shape_1: vec4<u32>,\n"
     << "  strides_0: vec4<i32>,\n"
@@ -412,7 +416,7 @@ std::string make_row_reduce_kernel(
       << "  for (var nr: u32 = 0u; nr < non_row_reductions; nr = nr + 1u) {\n"
       << "    let reduce_offset = reduce_elem_to_loc(nr, reduce_ndim);\n"
       << "    for (var i: u32 = tid; i < row_size; i = i + WORKGROUP_SIZE) {\n"
-      << "      let idx = base_offset + reduce_offset + i;\n"
+      << "      let idx = params.offsets.x + base_offset + reduce_offset + i;\n"
       << "      acc = reduce_op(acc, " << acc_type << "(input[idx]));\n"
       << "    }\n"
       << "  }\n";
@@ -421,8 +425,8 @@ std::string make_row_reduce_kernel(
     s << "  let row_start = out_idx * row_size;\n"
       << "  var acc: " << acc_type << " = " << identity << ";\n"
       << "  for (var i: u32 = tid; i < row_size; i = i + WORKGROUP_SIZE) {\n"
-      << "    let idx = row_start + i;\n"
-      << "    if (idx < row_start + row_size) {\n"
+      << "    let idx = params.offsets.x + row_start + i;\n"
+      << "    if (idx < params.offsets.x + row_start + row_size) {\n"
       << "      acc = reduce_op(acc, " << acc_type << "(input[idx]));\n"
       << "    }\n"
       << "  }\n";
@@ -446,7 +450,7 @@ std::string make_row_reduce_kernel(
   s << "\n"
     << "  // Thread 0 writes the output\n"
     << "  if (tid == 0u) {\n"
-    << "    output[out_idx] = " << out_type << "(shared_data[0]);\n"
+    << "    output[params.offsets.y + out_idx] = " << out_type << "(shared_data[0]);\n"
     << "  }\n"
     << "}\n";
 
@@ -460,6 +464,7 @@ std::string make_row_reduce_kernel(
 // C++ struct matching the WGSL ColReduceParams layout.
 struct ColReduceParams {
   uint32_t data[4];       // [reduction_size, reduction_stride, ndim, reduce_ndim]
+  uint32_t offsets[4];    // [input_offset, output_offset, pad, pad]
   uint32_t shape_0[4];    // non-reduce shape[0..3]
   uint32_t shape_1[4];    // non-reduce shape[4..7]
   int32_t strides_0[4];   // non-reduce strides[0..3]
@@ -487,6 +492,7 @@ std::string make_col_reduce_kernel(
 
   s << "struct ColReduceParams {\n"
     << "  data: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "  shape_0: vec4<u32>,\n"
     << "  shape_1: vec4<u32>,\n"
     << "  strides_0: vec4<i32>,\n"
@@ -564,10 +570,13 @@ std::string make_col_reduce_kernel(
     << "  let out_idx = gid.x;\n"
     << "  if (out_idx >= out_size) { return; }\n"
     << "\n"
+    << "  let column = out_idx % reduction_stride;\n"
+    << "  let outer_idx = out_idx / reduction_stride;\n"
+    << "\n"
     << "  // Compute input base offset from non-reduction indices\n"
-    << "  var in_offset: u32 = 0u;\n"
+    << "  var in_offset: u32 = column;\n"
     << "  if (ndim > 0u) {\n"
-    << "    in_offset = elem_to_loc(out_idx, ndim);\n"
+    << "    in_offset = in_offset + elem_to_loc(outer_idx, ndim);\n"
     << "  }\n"
     << "\n"
     << "  var acc: " << acc_type << " = " << identity << ";\n"
@@ -576,11 +585,11 @@ std::string make_col_reduce_kernel(
     << "  let total_reductions = non_col_reductions * reduction_size;\n"
     << "  for (var r: u32 = 0u; r < total_reductions; r = r + 1u) {\n"
     << "    let reduce_offset = reduce_elem_to_loc(r, reduce_ndim);\n"
-    << "    let idx = in_offset + reduce_offset;\n"
+    << "    let idx = params.offsets.x + in_offset + reduce_offset;\n"
     << "    acc = reduce_op(acc, " << acc_type << "(input[idx]));\n"
     << "  }\n"
     << "\n"
-    << "  output[out_idx] = " << out_type << "(acc);\n"
+    << "  output[params.offsets.y + out_idx] = " << out_type << "(acc);\n"
     << "}\n";
 
   return s.str();
@@ -748,6 +757,9 @@ void gpu_all_reduce(
 
     AllReduceParams params{};
     params.data[0] = input_size;
+    params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
+    params.data[2] =
+        static_cast<uint32_t>(intermediate.offset() / intermediate.itemsize());
     WGPUBuffer uniform_buf =
         pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
@@ -787,6 +799,9 @@ void gpu_all_reduce(
 
     AllReduceParams params2{};
     params2.data[0] = num_workgroups;
+    params2.data[1] =
+        static_cast<uint32_t>(intermediate.offset() / intermediate.itemsize());
+    params2.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
     WGPUBuffer uniform_buf2 =
         pool.acquire(wgpu::device().gpu_queue(), &params2, sizeof(AllReduceParams));
 
@@ -810,6 +825,8 @@ void gpu_all_reduce(
 
     AllReduceParams params{};
     params.data[0] = input_size;
+    params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
+    params.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
     WGPUBuffer uniform_buf =
         pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
@@ -887,6 +904,8 @@ void gpu_row_reduce(
   RowReduceParams params{};
   params.row_size_num_rows[0] = row_size;
   params.row_size_num_rows[1] = static_cast<uint32_t>(out.size());
+  params.offsets[0] = static_cast<uint32_t>(in.offset() / in.itemsize());
+  params.offsets[1] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   if (general) {
     // Fill non-reduce shape/strides
@@ -999,6 +1018,8 @@ void gpu_col_reduce(
   int64_t reduction_stride = plan.strides.back();
   params.data[0] = reduction_size;
   params.data[1] = static_cast<uint32_t>(reduction_stride);
+  params.offsets[0] = static_cast<uint32_t>(in.offset() / in.itemsize());
+  params.offsets[1] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   // Non-reduction shape/strides
   auto [shape_vec, strides_vec] = shapes_without_reduction_axes(in, axes);

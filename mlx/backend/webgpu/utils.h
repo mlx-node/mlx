@@ -28,11 +28,21 @@ constexpr uint32_t N_READS = 4;
 // WGSL has no 8-bit or 16-bit integer storage, so:
 //   bool    -> u32 (4 bytes)
 //   bfloat16 -> f32 (4 bytes)
+//   int64/uint64 -> i32/u32 (4 bytes, low 32 bits)
 //   everything else -> same as CPU itemsize
 inline size_t wgpu_itemsize(Dtype dtype) {
   switch (dtype.val()) {
     case Dtype::Val::bool_: return 4;     // bool stored as u32
     case Dtype::Val::bfloat16: return 4;  // bf16 promoted to f32
+    case Dtype::Val::int64:
+    case Dtype::Val::uint64:
+      // WGSL has no 64-bit integer storage. MLX uses uint32 for arg-reduce
+      // outputs, but JAX promotion rules can transiently widen routing/index
+      // math to int64 (for example uint32 // int32 in MoE gather_sort). The
+      // WebGPU backend stores those tensors as 32-bit values and converts on
+      // CPU upload/readback. This is sufficient for shape/index tensors, which
+      // must fit in 32 bits for WebGPU dispatch anyway.
+      return 4;
     default: return dtype.size();
   }
 }
@@ -298,8 +308,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::uint32:
       return "u32";
     case Dtype::Val::uint64:
-      throw std::runtime_error(
-          "[WebGPU] uint64 is not supported on WebGPU backend");
+      return "u32";
     case Dtype::Val::int8:
       throw std::runtime_error(
           "[WebGPU] int8 is not supported (no 8-bit storage in WGSL)");
@@ -309,8 +318,7 @@ inline const char* dtype_to_wgsl(Dtype dtype) {
     case Dtype::Val::int32:
       return "i32";
     case Dtype::Val::int64:
-      throw std::runtime_error(
-          "[WebGPU] int64 is not supported on WebGPU backend");
+      return "i32";
     case Dtype::Val::float16:
       return "f16";
     case Dtype::Val::bfloat16:

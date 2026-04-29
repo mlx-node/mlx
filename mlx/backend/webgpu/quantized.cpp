@@ -13,15 +13,17 @@
 // QQMatmul (quantized-quantized matmul) throws not-implemented as it's
 // rarely used.
 
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
-#include "mlx/backend/gpu/copy.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -35,8 +37,8 @@ struct QuantizedMatmulParams {
   uint32_t K;
   uint32_t bits;
   uint32_t group_size;
-  uint32_t w_cols;    // number of u32 columns in packed weights
-  uint32_t has_bias;  // 1 if biases present, 0 otherwise
+  uint32_t w_cols; // number of u32 columns in packed weights
+  uint32_t has_bias; // 1 if biases present, 0 otherwise
   uint32_t batch_size;
   uint32_t batch_stride_x;
   uint32_t batch_stride_w;
@@ -62,7 +64,14 @@ struct GatherQMMParams {
   uint32_t group_size;
   uint32_t w_cols;
   uint32_t num_groups;
+  uint32_t index_ndim;
+  uint32_t lhs_offset;
+  uint32_t rhs_offset;
   uint32_t _pad0;
+  uint32_t _pad1;
+  std::array<uint32_t, wgpu::MAX_NDIM> index_shape;
+  std::array<int32_t, wgpu::MAX_NDIM> lhs_strides;
+  std::array<int32_t, wgpu::MAX_NDIM> rhs_strides;
 };
 
 struct DequantizeParams {
@@ -87,8 +96,8 @@ void validate_webgpu_quant_bits(int bits, const char* op_name) {
 }
 
 uint32_t shader_elem_offset(const array& arr, const char* op_name) {
-  uint64_t offset =
-      static_cast<uint64_t>(arr.offset()) / static_cast<uint64_t>(arr.itemsize());
+  uint64_t offset = static_cast<uint64_t>(arr.offset()) /
+      static_cast<uint64_t>(arr.itemsize());
   if (offset > std::numeric_limits<uint32_t>::max()) {
     throw std::runtime_error(
         std::string(op_name) + " array offset exceeds WebGPU u32 indexing");
@@ -96,30 +105,121 @@ uint32_t shader_elem_offset(const array& arr, const char* op_name) {
   return static_cast<uint32_t>(offset);
 }
 
+uint32_t checked_u32(int64_t value, const char* op_name, const char* field) {
+  if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string(op_name) + " " + field + " exceeds WebGPU u32 indexing");
+  }
+  return static_cast<uint32_t>(value);
+}
+
+int32_t checked_i32(int64_t value, const char* op_name, const char* field) {
+  if (value < std::numeric_limits<int32_t>::min() ||
+      value > std::numeric_limits<int32_t>::max()) {
+    throw std::runtime_error(
+        std::string(op_name) + " " + field + " exceeds WebGPU i32 indexing");
+  }
+  return static_cast<int32_t>(value);
+}
+
 void emit_extract_val(std::ostringstream& s, int bits) {
-  if (bits == 4) {
+  if (bits == 2 || bits == 4 || bits == 8) {
+    uint32_t log2_bits = bits == 2 ? 4 : (bits == 4 ? 3 : 2);
+    uint32_t bit_shift = bits == 2 ? 1 : (bits == 4 ? 2 : 3);
+    uint32_t lane_mask = (1u << log2_bits) - 1u;
     s << "fn extract_val(row_base: u32, k: u32) -> f32 {\n"
-      << "  let packed = w[row_base + (k >> 3u)];\n"
-      << "  let shift = (k & 7u) << 2u;\n"
+      << "  let packed = w[row_base + (k >> " << log2_bits << "u)];\n"
+      << "  let shift = (k & " << lane_mask << "u) << " << bit_shift << "u;\n"
       << "  return f32((packed >> shift) & BIT_MASK);\n"
       << "}\n\n";
     return;
   }
 
-  // Generic bitstream extractor for non-nibble affine weights. This handles
-  // 3/5/6-bit values that can cross a u32 word boundary.
+  s << "fn load_quant_byte(row_base: u32, byte_offset: u32) -> u32 {\n"
+    << "  let packed = w[row_base + (byte_offset >> 2u)];\n"
+    << "  let shift = (byte_offset & 3u) << 3u;\n"
+    << "  return (packed >> shift) & 0xffu;\n"
+    << "}\n\n";
+
+  if (bits == 3) {
+    s << "fn extract_val(row_base: u32, k: u32) -> f32 {\n"
+      << "  let pack_base = (k >> 3u) * 3u;\n"
+      << "  let lane = k & 7u;\n"
+      << "  let b0 = load_quant_byte(row_base, pack_base);\n"
+      << "  let b1 = load_quant_byte(row_base, pack_base + 1u);\n"
+      << "  let b2 = load_quant_byte(row_base, pack_base + 2u);\n"
+      << "  var val: u32;\n"
+      << "  if (lane == 0u) {\n"
+      << "    val = b0 & 0x7u;\n"
+      << "  } else if (lane == 1u) {\n"
+      << "    val = (b0 >> 3u) & 0x7u;\n"
+      << "  } else if (lane == 2u) {\n"
+      << "    val = ((b0 >> 6u) & 0x3u) | ((b1 & 0x1u) << 2u);\n"
+      << "  } else if (lane == 3u) {\n"
+      << "    val = (b1 >> 1u) & 0x7u;\n"
+      << "  } else if (lane == 4u) {\n"
+      << "    val = (b1 >> 4u) & 0x7u;\n"
+      << "  } else if (lane == 5u) {\n"
+      << "    val = ((b1 >> 7u) & 0x1u) | ((b2 & 0x3u) << 1u);\n"
+      << "  } else if (lane == 6u) {\n"
+      << "    val = (b2 >> 2u) & 0x7u;\n"
+      << "  } else {\n"
+      << "    val = (b2 >> 5u) & 0x7u;\n"
+      << "  }\n"
+      << "  return f32(val);\n"
+      << "}\n\n";
+    return;
+  }
+
+  if (bits == 5) {
+    s << "fn extract_val(row_base: u32, k: u32) -> f32 {\n"
+      << "  let pack_base = (k >> 3u) * 5u;\n"
+      << "  let lane = k & 7u;\n"
+      << "  let b0 = load_quant_byte(row_base, pack_base);\n"
+      << "  let b1 = load_quant_byte(row_base, pack_base + 1u);\n"
+      << "  let b2 = load_quant_byte(row_base, pack_base + 2u);\n"
+      << "  let b3 = load_quant_byte(row_base, pack_base + 3u);\n"
+      << "  let b4 = load_quant_byte(row_base, pack_base + 4u);\n"
+      << "  var val: u32;\n"
+      << "  if (lane == 0u) {\n"
+      << "    val = b0 & 0x1fu;\n"
+      << "  } else if (lane == 1u) {\n"
+      << "    val = ((b0 >> 5u) & 0x7u) | ((b1 & 0x3u) << 3u);\n"
+      << "  } else if (lane == 2u) {\n"
+      << "    val = (b1 >> 2u) & 0x1fu;\n"
+      << "  } else if (lane == 3u) {\n"
+      << "    val = ((b1 >> 7u) & 0x1u) | ((b2 & 0xfu) << 1u);\n"
+      << "  } else if (lane == 4u) {\n"
+      << "    val = ((b2 >> 4u) & 0xfu) | ((b3 & 0x1u) << 4u);\n"
+      << "  } else if (lane == 5u) {\n"
+      << "    val = (b3 >> 1u) & 0x1fu;\n"
+      << "  } else if (lane == 6u) {\n"
+      << "    val = ((b3 >> 6u) & 0x3u) | ((b4 & 0x7u) << 2u);\n"
+      << "  } else {\n"
+      << "    val = (b4 >> 3u) & 0x1fu;\n"
+      << "  }\n"
+      << "  return f32(val);\n"
+      << "}\n\n";
+    return;
+  }
+
   s << "fn extract_val(row_base: u32, k: u32) -> f32 {\n"
-    << "  let bit_offset = k * BITS;\n"
-    << "  let word_idx = bit_offset / 32u;\n"
-    << "  let bit_idx = bit_offset % 32u;\n"
-    << "  var val = w[row_base + word_idx] >> bit_idx;\n"
-    << "  if (bit_idx + BITS > 32u) {\n"
-    << "    let upper_bits = bit_idx + BITS - 32u;\n"
-    << "    let upper_mask = (1u << upper_bits) - 1u;\n"
-    << "    let upper = w[row_base + word_idx + 1u] & upper_mask;\n"
-    << "    val = val | (upper << (BITS - upper_bits));\n"
+    << "  let pack_base = (k >> 2u) * 3u;\n"
+    << "  let lane = k & 3u;\n"
+    << "  let b0 = load_quant_byte(row_base, pack_base);\n"
+    << "  let b1 = load_quant_byte(row_base, pack_base + 1u);\n"
+    << "  let b2 = load_quant_byte(row_base, pack_base + 2u);\n"
+    << "  var val: u32;\n"
+    << "  if (lane == 0u) {\n"
+    << "    val = b0 & 0x3fu;\n"
+    << "  } else if (lane == 1u) {\n"
+    << "    val = ((b0 >> 6u) & 0x3u) | ((b1 & 0xfu) << 2u);\n"
+    << "  } else if (lane == 2u) {\n"
+    << "    val = ((b1 >> 4u) & 0xfu) | ((b2 & 0x3u) << 4u);\n"
+    << "  } else {\n"
+    << "    val = (b2 >> 2u) & 0x3fu;\n"
     << "  }\n"
-    << "  return f32(val & BIT_MASK);\n"
+    << "  return f32(val);\n"
     << "}\n\n";
 }
 
@@ -170,17 +270,19 @@ std::string make_quantized_matmul_kernel(
 
   s << "@group(0) @binding(0) var<storage, read> x: array<" << x_type << ">;\n"
     << "@group(0) @binding(1) var<storage, read> w: array<u32>;\n"
-    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type << ">;\n"
-    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type
+    << ">;\n"
+    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(5) var<uniform> params: QParams;\n\n";
 
   emit_extract_val(s, bits);
 
   // Main kernel: each thread computes one output element
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let output_idx = gid.x + gid.y * GRID_X * WG_SIZE;\n"
     << "  let batch = gid.z;\n"
     << "  if (batch >= params.batch_size) { return; }\n"
@@ -282,9 +384,12 @@ std::string make_quantized_gemv_kernel(
 
   s << "@group(0) @binding(0) var<storage, read> x: array<" << x_type << ">;\n"
     << "@group(0) @binding(1) var<storage, read> w: array<u32>;\n"
-    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type << ">;\n"
-    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type
+    << ">;\n"
+    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(5) var<uniform> params: QParams;\n\n";
 
   s << "fn sum_op(x: f32, y: f32) -> f32 { return x + y; }\n\n";
@@ -300,8 +405,7 @@ std::string make_quantized_gemv_kernel(
   emit_extract_val(s, bits);
 
   s << "@compute @workgroup_size(128)\n"
-    << "fn " << entry_name
-    << "(@builtin(workgroup_id) wid: vec3u,\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wid: vec3u,\n"
     << " @builtin(local_invocation_id) lid: vec3u) {\n"
     << "  let tile_idx = wid.x + wid.y * GRID_X;\n"
     << "  let batch = wid.z;\n"
@@ -430,9 +534,9 @@ void emit_q4_word_accumulate(std::ostringstream& s, int col) {
     << indent << "if (params.has_bias == 1u) { bias" << suffix
     << " = f32(biases[b_base + col" << suffix
     << " * num_groups + group_idx]); }\n"
-    << indent << "acc" << suffix << " = acc" << suffix
-    << " + q4_dot_word(w[row" << suffix << " + word_idx], f32(scales[sb"
-    << suffix << "]), bias" << suffix << ", xlo, xhi);\n";
+    << indent << "acc" << suffix << " = acc" << suffix << " + q4_dot_word(w[row"
+    << suffix << " + word_idx], f32(scales[sb" << suffix << "]), bias" << suffix
+    << ", xlo, xhi);\n";
   if (col > 0) {
     s << "    }\n";
   }
@@ -459,8 +563,8 @@ void emit_gemv_multi_col_reduction(
     for (uint32_t stride = num_partials >> 1; stride >= 1; stride >>= 1) {
       s << "  if (tid < " << stride << "u) {\n";
       for (int i = 0; i < cols_per_wg; ++i) {
-        s << "    shared" << i << "[tid] = shared" << i << "[tid] + shared"
-          << i << "[tid + " << stride << "u];\n";
+        s << "    shared" << i << "[tid] = shared" << i << "[tid] + shared" << i
+          << "[tid + " << stride << "u];\n";
       }
       s << "  }\n"
         << "  workgroupBarrier();\n";
@@ -473,8 +577,8 @@ void emit_gemv_multi_col_reduction(
     for (uint32_t stride = 64; stride >= 1; stride >>= 1) {
       s << "  if (tid < " << stride << "u) {\n";
       for (int i = 0; i < cols_per_wg; ++i) {
-        s << "    shared" << i << "[tid] = shared" << i << "[tid] + shared"
-          << i << "[tid + " << stride << "u];\n";
+        s << "    shared" << i << "[tid] = shared" << i << "[tid] + shared" << i
+          << "[tid + " << stride << "u];\n";
       }
       s << "  }\n"
         << "  workgroupBarrier();\n";
@@ -485,8 +589,8 @@ void emit_gemv_multi_col_reduction(
     << "    let out_row = o_base + m * params.N;\n"
     << "    out[out_row + col0] = " << out_type << "(shared0[0]);\n";
   for (int i = 1; i < cols_per_wg; ++i) {
-    s << "    if (has" << i << ") { out[out_row + col" << i << "] = "
-      << out_type << "(shared" << i << "[0]); }\n";
+    s << "    if (has" << i << ") { out[out_row + col" << i
+      << "] = " << out_type << "(shared" << i << "[0]); }\n";
   }
   s << "  }\n"
     << "}\n";
@@ -537,9 +641,12 @@ std::string make_quantized_q4_gemv_kernel(
 
   s << "@group(0) @binding(0) var<storage, read> x: array<" << x_type << ">;\n"
     << "@group(0) @binding(1) var<storage, read> w: array<u32>;\n"
-    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type << ">;\n"
-    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type
+    << ">;\n"
+    << "@group(0) @binding(4) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(5) var<uniform> params: QParams;\n\n";
 
   s << "fn sum_op(x: f32, y: f32) -> f32 { return x + y; }\n\n"
@@ -564,8 +671,7 @@ std::string make_quantized_q4_gemv_kernel(
   s << "\n";
 
   s << "@compute @workgroup_size(128)\n"
-    << "fn " << entry_name
-    << "(@builtin(workgroup_id) wid: vec3u,\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wid: vec3u,\n"
     << " @builtin(local_invocation_id) lid: vec3u) {\n"
     << "  let tile_idx = wid.x + wid.y * GRID_X;\n"
     << "  let batch = wid.z;\n"
@@ -613,8 +719,7 @@ std::string make_quantized_q4_gemv_kernel(
   }
   s << "  }\n"
     << "\n";
-  emit_gemv_multi_col_reduction(
-      s, out_type, subgroup_size, kColsPerWorkgroup);
+  emit_gemv_multi_col_reduction(s, out_type, subgroup_size, kColsPerWorkgroup);
 
   return s.str();
 }
@@ -635,6 +740,7 @@ std::string make_gather_qmm_kernel(
   }
 
   const uint32_t mask = (1u << bits) - 1u;
+  constexpr uint32_t kIndexVecs = (wgpu::MAX_NDIM + 3) / 4;
 
   s << "const BIT_MASK: u32 = " << mask << "u;\n"
     << "const BITS: u32 = " << bits << "u;\n"
@@ -645,23 +751,81 @@ std::string make_gather_qmm_kernel(
   s << "struct GatherParams {\n"
     << "  M: u32, N: u32, K: u32, index_size: u32,\n"
     << "  group_size: u32, w_cols: u32, num_groups: u32,\n"
-    << "  _pad0: u32,\n"
+    << "  index_ndim: u32,\n"
+    << "  lhs_offset: u32, rhs_offset: u32,\n"
+    << "  _pad0: u32, _pad1: u32,\n"
+    << "  index_shape: array<vec4u, " << kIndexVecs << ">,\n"
+    << "  lhs_strides: array<vec4i, " << kIndexVecs << ">,\n"
+    << "  rhs_strides: array<vec4i, " << kIndexVecs << ">,\n"
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> x: array<" << x_type << ">;\n"
     << "@group(0) @binding(1) var<storage, read> w: array<u32>;\n"
-    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> scales: array<" << scale_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read> biases: array<" << bias_type
+    << ">;\n"
     << "@group(0) @binding(4) var<storage, read> lhs_indices: array<u32>;\n"
     << "@group(0) @binding(5) var<storage, read> rhs_indices: array<u32>;\n"
-    << "@group(0) @binding(6) var<storage, read_write> out: array<" << out_type << ">;\n"
+    << "@group(0) @binding(6) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(7) var<uniform> params: GatherParams;\n\n";
 
   emit_extract_val(s, bits);
 
-  s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+  s << "fn get_index_shape(d: u32) -> u32 {\n"
+    << "  let v = params.index_shape[d >> 2u];\n"
+    << "  switch (d & 3u) {\n"
+    << "    case 0u: { return v.x; }\n"
+    << "    case 1u: { return v.y; }\n"
+    << "    case 2u: { return v.z; }\n"
+    << "    default: { return v.w; }\n"
+    << "  }\n"
+    << "}\n\n"
+    << "fn get_lhs_stride(d: u32) -> i32 {\n"
+    << "  let v = params.lhs_strides[d >> 2u];\n"
+    << "  switch (d & 3u) {\n"
+    << "    case 0u: { return v.x; }\n"
+    << "    case 1u: { return v.y; }\n"
+    << "    case 2u: { return v.z; }\n"
+    << "    default: { return v.w; }\n"
+    << "  }\n"
+    << "}\n\n"
+    << "fn get_rhs_stride(d: u32) -> i32 {\n"
+    << "  let v = params.rhs_strides[d >> 2u];\n"
+    << "  switch (d & 3u) {\n"
+    << "    case 0u: { return v.x; }\n"
+    << "    case 1u: { return v.y; }\n"
+    << "    case 2u: { return v.z; }\n"
+    << "    default: { return v.w; }\n"
+    << "  }\n"
+    << "}\n\n"
+    << "fn lhs_index_loc(flat_idx: u32) -> u32 {\n"
+    << "  var loc: i32 = i32(params.lhs_offset);\n"
+    << "  var rem = flat_idx;\n"
+    << "  for (var r: u32 = 0u; r < params.index_ndim; r = r + 1u) {\n"
+    << "    let d = params.index_ndim - 1u - r;\n"
+    << "    let dim = get_index_shape(d);\n"
+    << "    let coord = rem % dim;\n"
+    << "    rem = rem / dim;\n"
+    << "    loc = loc + i32(coord) * get_lhs_stride(d);\n"
+    << "  }\n"
+    << "  return u32(loc);\n"
+    << "}\n\n"
+    << "fn rhs_index_loc(flat_idx: u32) -> u32 {\n"
+    << "  var loc: i32 = i32(params.rhs_offset);\n"
+    << "  var rem = flat_idx;\n"
+    << "  for (var r: u32 = 0u; r < params.index_ndim; r = r + 1u) {\n"
+    << "    let d = params.index_ndim - 1u - r;\n"
+    << "    let dim = get_index_shape(d);\n"
+    << "    let coord = rem % dim;\n"
+    << "    rem = rem / dim;\n"
+    << "    loc = loc + i32(coord) * get_rhs_stride(d);\n"
+    << "  }\n"
+    << "  return u32(loc);\n"
+    << "}\n\n"
+    << "@compute @workgroup_size(256)\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let output_idx = gid.x + gid.y * GRID_X * WG_SIZE;\n"
     << "  let output_size = params.index_size * params.M * params.N;\n"
     << "  if (output_idx >= output_size) { return; }\n"
@@ -669,8 +833,8 @@ std::string make_gather_qmm_kernel(
     << "  let n = output_idx % params.N;\n"
     << "  let m = (output_idx / params.N) % params.M;\n"
     << "  let index_slot = output_idx / (params.M * params.N);\n"
-    << "  let lhs_batch = lhs_indices[index_slot];\n"
-    << "  let rhs_batch = rhs_indices[index_slot];\n"
+    << "  let lhs_batch = lhs_indices[lhs_index_loc(index_slot)];\n"
+    << "  let rhs_batch = rhs_indices[rhs_index_loc(index_slot)];\n"
     << "\n"
     << "  let x_base = (lhs_batch * params.M + m) * params.K;\n"
     << "  let w_base = (rhs_batch * params.N + n) * params.w_cols;\n"
@@ -719,16 +883,18 @@ std::string make_affine_dequantize_kernel(
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> w: array<u32>;\n"
-    << "@group(0) @binding(1) var<storage, read> scales: array<" << scale_type << ">;\n"
-    << "@group(0) @binding(2) var<storage, read> biases: array<" << bias_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read_write> out: array<" << out_type << ">;\n"
+    << "@group(0) @binding(1) var<storage, read> scales: array<" << scale_type
+    << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> biases: array<" << bias_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(4) var<uniform> params: DequantParams;\n\n";
 
   emit_extract_val(s, bits);
 
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let idx = gid.x + gid.y * params.grid_x * WG_SIZE;\n"
     << "  if (idx >= params.out_size) { return; }\n"
     << "\n"
@@ -804,45 +970,106 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   uint32_t K = static_cast<uint32_t>(x_contiguous.shape(-1));
   uint32_t batch_size = static_cast<uint32_t>(out.size() / (M * N));
 
+  auto flat_batch_stride = [&](const array& arr,
+                               const char* name) -> std::optional<uint32_t> {
+    if (batch_size <= 1 || arr.ndim() < 3) {
+      return 0;
+    }
+
+    int64_t logical_batch = 1;
+    for (int i = 0; i < arr.ndim() - 2; ++i) {
+      logical_batch *= arr.shape()[i];
+    }
+    if (logical_batch == 1) {
+      return 0;
+    }
+    if (logical_batch != batch_size) {
+      return std::nullopt;
+    }
+
+    int64_t expected_stride = arr.shape(-2) * arr.shape(-1);
+    int64_t flat_stride = expected_stride;
+    for (int i = arr.ndim() - 3; i >= 0; --i) {
+      if (arr.shape()[i] != 1) {
+        if (arr.strides()[i] != expected_stride) {
+          return std::nullopt;
+        }
+        flat_stride = arr.strides()[i];
+      }
+      expected_stride *= arr.shape()[i];
+    }
+
+    return checked_u32(flat_stride, "[WebGPU QuantizedMatmul]", name);
+  };
+
+  auto ensure_linear_flat_batch = [&](const array& arr, const char* name) {
+    if (flat_batch_stride(arr, name).has_value()) {
+      return arr;
+    }
+    auto arr_copy = contiguous_copy_gpu(arr, s);
+    encoder.add_temporary(arr_copy);
+    return arr_copy;
+  };
+
+  x_contiguous = ensure_linear_flat_batch(x_contiguous, "batch_stride_x");
+  w_contiguous = ensure_linear_flat_batch(w_contiguous, "batch_stride_w");
+  scales_contiguous =
+      ensure_linear_flat_batch(scales_contiguous, "batch_stride_scales");
+  biases_contiguous =
+      ensure_linear_flat_batch(biases_contiguous, "batch_stride_biases");
+
   uint32_t w_cols = static_cast<uint32_t>(w_contiguous.shape(-1));
 
   const char* x_type = wgpu::dtype_to_wgsl_safe(x_contiguous.dtype());
-  const char* scale_type =
-      wgpu::dtype_to_wgsl_safe(scales_contiguous.dtype());
+  const char* scale_type = wgpu::dtype_to_wgsl_safe(scales_contiguous.dtype());
   const char* bias_type = wgpu::dtype_to_wgsl_safe(biases_contiguous.dtype());
   const char* out_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const bool use_gemv = (M == 1);
   const bool use_q4_word_gemv =
       use_gemv && bits_ == 4 && (group_size_ % 8 == 0) && (K % 8 == 0);
-  const int subgroup_size = use_gemv ? wgpu::effective_subgroup_size() : 0;
+  int subgroup_size = use_gemv ? wgpu::effective_subgroup_size() : 0;
+  if (subgroup_size > 0 && (128 % subgroup_size) != 0) {
+    subgroup_size = 0;
+  }
 
   std::string entry_name =
-      std::string(use_q4_word_gemv ? "qgemv4w_" : (use_gemv ? "qgemv_" : "qmatmul_")) +
-      x_type +
-      "_s" + scale_type +
-      "_z" + bias_type +
-      "_o" + out_type +
-      "_b" + std::to_string(bits_) +
-      "_g" + std::to_string(group_size_) +
+      std::string(
+          use_q4_word_gemv ? "qgemv4w_" : (use_gemv ? "qgemv_" : "qmatmul_")) +
+      x_type + "_s" + scale_type + "_z" + bias_type + "_o" + out_type + "_b" +
+      std::to_string(bits_) + "_g" + std::to_string(group_size_) +
       (subgroup_size > 0 ? "_sg" + std::to_string(subgroup_size) : "") +
       (transpose_ ? "_t" : "_n");
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        if (use_q4_word_gemv) {
-          return make_quantized_q4_gemv_kernel(
-              entry_name, x_type, scale_type, bias_type, out_type,
-              group_size_, subgroup_size);
-        } else if (use_gemv) {
-          return make_quantized_gemv_kernel(
-              entry_name, x_type, scale_type, bias_type, out_type, bits_,
-              group_size_, subgroup_size);
-        }
-        return make_quantized_matmul_kernel(
-            entry_name, x_type, scale_type, bias_type, out_type, bits_,
-            group_size_);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    if (use_q4_word_gemv) {
+      return make_quantized_q4_gemv_kernel(
+          entry_name,
+          x_type,
+          scale_type,
+          bias_type,
+          out_type,
+          group_size_,
+          subgroup_size);
+    } else if (use_gemv) {
+      return make_quantized_gemv_kernel(
+          entry_name,
+          x_type,
+          scale_type,
+          bias_type,
+          out_type,
+          bits_,
+          group_size_,
+          subgroup_size);
+    }
+    return make_quantized_matmul_kernel(
+        entry_name,
+        x_type,
+        scale_type,
+        bias_type,
+        out_type,
+        bits_,
+        group_size_);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(x_contiguous);
@@ -862,21 +1089,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.has_bias = 1;
   params.batch_size = batch_size;
 
-  // Compute batch strides
-  if (batch_size > 1) {
-    params.batch_stride_x = M * K;
-    params.batch_stride_w =
-        static_cast<uint32_t>(w_contiguous.size() / batch_size);
-    params.batch_stride_scales =
-        static_cast<uint32_t>(scales_contiguous.size() / batch_size);
-    params.batch_stride_biases =
-        static_cast<uint32_t>(biases_contiguous.size() / batch_size);
-  } else {
-    params.batch_stride_x = 0;
-    params.batch_stride_w = 0;
-    params.batch_stride_scales = 0;
-    params.batch_stride_biases = 0;
-  }
+  // Compute flattened batch strides from each input independently. A 2D
+  // quantized weight/scales/biases tensor is broadcast across activation
+  // batches and must therefore use stride 0.
+  params.batch_stride_x =
+      flat_batch_stride(x_contiguous, "batch_stride_x").value();
+  params.batch_stride_w =
+      flat_batch_stride(w_contiguous, "batch_stride_w").value();
+  params.batch_stride_scales =
+      flat_batch_stride(scales_contiguous, "batch_stride_scales").value();
+  params.batch_stride_biases =
+      flat_batch_stride(biases_contiguous, "batch_stride_biases").value();
   params.batch_stride_out = M * N;
   params.transpose = transpose_ ? 1 : 0;
   params.offset_x =
@@ -890,8 +1113,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.offset_out = shader_elem_offset(out, "[WebGPU QuantizedMatmul]");
 
   auto& pool = wgpu::device().uniform_pool();
-  WGPUBuffer uniform_buf =
-      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(QuantizedMatmulParams));
+  WGPUBuffer uniform_buf = pool.acquire(
+      wgpu::device().gpu_queue(), &params, sizeof(QuantizedMatmulParams));
 
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x_contiguous);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w_contiguous);
@@ -943,9 +1166,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -967,9 +1189,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto& encoder = wgpu::get_command_encoder(s);
-  auto ensure_row_contiguous_matrix = [&](const array& arr) {
+  auto ensure_compact_row_contiguous_matrix = [&](const array& arr) {
     if (arr.ndim() < 2) {
-      if (arr.offset() == 0 && arr.flags().contiguous) {
+      if (arr.offset() == 0 && arr.flags().contiguous &&
+          arr.size() == arr.data_size()) {
         return arr;
       }
       auto arr_copy = contiguous_copy_gpu(arr, s);
@@ -978,15 +1201,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     auto stride_0 = arr.strides()[arr.ndim() - 2];
     auto stride_1 = arr.strides()[arr.ndim() - 1];
-    if (arr.offset() == 0 && stride_0 == arr.shape(-1) && stride_1 == 1) {
-      return arr;
-    }
-    auto arr_copy = contiguous_copy_gpu(arr, s);
-    encoder.add_temporary(arr_copy);
-    return arr_copy;
-  };
-  auto ensure_contiguous = [&](const array& arr) {
-    if (arr.offset() == 0 && arr.flags().contiguous) {
+    if (arr.offset() == 0 && arr.flags().contiguous &&
+        arr.size() == arr.data_size() && stride_0 == arr.shape(-1) &&
+        stride_1 == 1) {
       return arr;
     }
     auto arr_copy = contiguous_copy_gpu(arr, s);
@@ -994,40 +1211,64 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return arr_copy;
   };
 
-  array x = ensure_row_contiguous_matrix(inputs[0]);
-  array w = ensure_row_contiguous_matrix(inputs[1]);
-  array scales = ensure_row_contiguous_matrix(inputs[2]);
-  array biases = ensure_row_contiguous_matrix(inputs[3]);
-  array lhs_indices = ensure_contiguous(inputs[4]);
-  array rhs_indices = ensure_contiguous(inputs[5]);
+  array x = ensure_compact_row_contiguous_matrix(inputs[0]);
+  array w = ensure_compact_row_contiguous_matrix(inputs[1]);
+  array scales = ensure_compact_row_contiguous_matrix(inputs[2]);
+  array biases = ensure_compact_row_contiguous_matrix(inputs[3]);
+  const array& lhs_indices = inputs[4];
+  const array& rhs_indices = inputs[5];
 
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   if (out.size() == 0) {
     return;
   }
 
-  uint32_t M = static_cast<uint32_t>(out.shape(-2));
-  uint32_t N = static_cast<uint32_t>(out.shape(-1));
-  uint32_t K = static_cast<uint32_t>(x.shape(-1));
-  uint32_t index_size = static_cast<uint32_t>(out.size() / (M * N));
-  uint32_t w_cols = static_cast<uint32_t>(w.shape(-1));
+  uint32_t M = checked_u32(out.shape(-2), "[WebGPU GatherQMM]", "M");
+  uint32_t N = checked_u32(out.shape(-1), "[WebGPU GatherQMM]", "N");
+  uint32_t K = checked_u32(x.shape(-1), "[WebGPU GatherQMM]", "K");
+  uint32_t index_size = checked_u32(
+      out.size() / (static_cast<int64_t>(M) * static_cast<int64_t>(N)),
+      "[WebGPU GatherQMM]",
+      "index_size");
+  if (lhs_indices.size() != index_size || rhs_indices.size() != index_size) {
+    throw std::runtime_error(
+        "[WebGPU GatherQMM] index tensor sizes must match the output batch size.");
+  }
+  if (lhs_indices.ndim() != rhs_indices.ndim()) {
+    throw std::runtime_error(
+        "[WebGPU GatherQMM] lhs_indices and rhs_indices must have matching rank.");
+  }
+  if (lhs_indices.ndim() > wgpu::MAX_NDIM) {
+    throw std::runtime_error(
+        "[WebGPU GatherQMM] index rank exceeds WebGPU MAX_NDIM.");
+  }
+  for (int d = 0; d < lhs_indices.ndim(); ++d) {
+    if (lhs_indices.shape(d) != rhs_indices.shape(d)) {
+      throw std::runtime_error(
+          "[WebGPU GatherQMM] lhs_indices and rhs_indices must have matching shapes.");
+    }
+  }
+  uint32_t w_cols = checked_u32(w.shape(-1), "[WebGPU GatherQMM]", "w_cols");
   uint32_t num_groups = K / static_cast<uint32_t>(group_size_);
 
   const char* x_type = wgpu::dtype_to_wgsl_safe(x.dtype());
   const char* scale_type = wgpu::dtype_to_wgsl_safe(scales.dtype());
   const char* bias_type = wgpu::dtype_to_wgsl_safe(biases.dtype());
   const char* out_type = wgpu::dtype_to_wgsl_safe(out.dtype());
-  std::string entry_name = std::string("gather_qmm_") + x_type +
-      "_s" + scale_type + "_z" + bias_type + "_o" + out_type +
-      "_b" + std::to_string(bits_) + "_g" + std::to_string(group_size_);
+  std::string entry_name = std::string("gather_qmm_") + x_type + "_s" +
+      scale_type + "_z" + bias_type + "_o" + out_type + "_b" +
+      std::to_string(bits_) + "_g" + std::to_string(group_size_);
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_gather_qmm_kernel(
-            entry_name, x_type, scale_type, bias_type, out_type, bits_,
-            group_size_);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_gather_qmm_kernel(
+        entry_name,
+        x_type,
+        scale_type,
+        bias_type,
+        out_type,
+        bits_,
+        group_size_);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(x);
@@ -1046,10 +1287,25 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.group_size = static_cast<uint32_t>(group_size_);
   params.w_cols = w_cols;
   params.num_groups = num_groups;
+  params.index_ndim =
+      checked_u32(lhs_indices.ndim(), "[WebGPU GatherQMM]", "index_ndim");
+  params.lhs_offset = shader_elem_offset(lhs_indices, "[WebGPU GatherQMM]");
+  params.rhs_offset = shader_elem_offset(rhs_indices, "[WebGPU GatherQMM]");
+  params.index_shape.fill(1);
+  params.lhs_strides.fill(0);
+  params.rhs_strides.fill(0);
+  for (int d = 0; d < lhs_indices.ndim(); ++d) {
+    params.index_shape[d] =
+        checked_u32(lhs_indices.shape(d), "[WebGPU GatherQMM]", "index_shape");
+    params.lhs_strides[d] = checked_i32(
+        lhs_indices.strides()[d], "[WebGPU GatherQMM]", "lhs_strides");
+    params.rhs_strides[d] = checked_i32(
+        rhs_indices.strides()[d], "[WebGPU GatherQMM]", "rhs_strides");
+  }
 
   auto& pool = wgpu::device().uniform_pool();
-  WGPUBuffer uniform_buf =
-      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(GatherQMMParams));
+  WGPUBuffer uniform_buf = pool.acquire(
+      wgpu::device().gpu_queue(), &params, sizeof(GatherQMMParams));
 
   WGPUBuffer x_buf = wgpu::wgpu_buffer(x);
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
@@ -1070,7 +1326,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
        {out_buf, wgpu::wgpu_bind_size(out)},
        {uniform_buf, sizeof(GatherQMMParams)}});
 
-  uint32_t output_size = static_cast<uint32_t>(out.size());
+  uint32_t output_size =
+      checked_u32(out.size(), "[WebGPU GatherQMM]", "output_size");
   uint32_t num_workgroups =
       (output_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
   constexpr uint32_t kGridX = 65535u;
@@ -1083,9 +1340,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y, 1);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 void fast::Quantize::eval_gpu(
@@ -1136,16 +1392,14 @@ void fast::Quantize::eval_gpu(
   const char* out_type = wgpu::dtype_to_wgsl_safe(out.dtype());
   const char* scale_type = wgpu::dtype_to_wgsl_safe(scales.dtype());
   const char* bias_type = wgpu::dtype_to_wgsl_safe(biases.dtype());
-  std::string entry_name = std::string("affine_dequantize_") + out_type +
-      "_s" + scale_type + "_z" + bias_type +
-      "_b" + std::to_string(bits_) + "_g" + std::to_string(group_size_);
+  std::string entry_name = std::string("affine_dequantize_") + out_type + "_s" +
+      scale_type + "_z" + bias_type + "_b" + std::to_string(bits_) + "_g" +
+      std::to_string(group_size_);
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_affine_dequantize_kernel(
-            entry_name, out_type, scale_type, bias_type, bits_, group_size_);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_affine_dequantize_kernel(
+        entry_name, out_type, scale_type, bias_type, bits_, group_size_);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(w);
@@ -1173,8 +1427,8 @@ void fast::Quantize::eval_gpu(
   params.grid_x = grid_x;
 
   auto& pool = wgpu::device().uniform_pool();
-  WGPUBuffer uniform_buf =
-      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(DequantizeParams));
+  WGPUBuffer uniform_buf = pool.acquire(
+      wgpu::device().gpu_queue(), &params, sizeof(DequantizeParams));
 
   WGPUBuffer w_buf = wgpu::wgpu_buffer(w);
   WGPUBuffer s_buf = wgpu::wgpu_buffer(scales);
@@ -1192,9 +1446,8 @@ void fast::Quantize::eval_gpu(
   encoder.dispatch_compute(pe.pipeline, bg, grid_x, grid_y, 1);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {

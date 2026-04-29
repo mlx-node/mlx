@@ -29,7 +29,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct SoftmaxParams {
-  uint32_t data[4]; // [axis_size, pad, pad, pad]
+  uint32_t data[4]; // [axis_size, input_offset, output_offset, pad]
 };
 
 // ---------------------------------------------------------------------------
@@ -81,13 +81,15 @@ std::string make_softmax_kernel(
     << "  let axis_size = params.data.x;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
+    << "  let input_offset = params.data.y;\n"
+    << "  let output_offset = params.data.z;\n"
     << "  let row_start = row * axis_size;\n"
     << "\n"
     << "  // Phase 1: Compute max via parallel reduction\n"
     << "  var thread_max: " << acc_type << " = " << acc_type
     << "(-3.402823e+38);\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
+    << "    let val = " << acc_type << "(input[input_offset + row_start + i]);\n"
     << "    thread_max = max(thread_max, val);\n"
     << "  }\n"
     << "\n"
@@ -109,7 +111,7 @@ std::string make_softmax_kernel(
     << "  // Phase 2: Compute sum of exp(x - max)\n"
     << "  var thread_sum: " << acc_type << " = " << acc_type << "(0.0);\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
+    << "    let val = " << acc_type << "(input[input_offset + row_start + i]);\n"
     << "    thread_sum = thread_sum + exp(val - row_max);\n"
     << "  }\n"
     << "\n";
@@ -128,8 +130,8 @@ std::string make_softmax_kernel(
     << "\n"
     << "  // Phase 3: Write output = exp(x - max) / sum\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
-    << "    output[row_start + i] = " << in_type
+    << "    let val = " << acc_type << "(input[input_offset + row_start + i]);\n"
+    << "    output[output_offset + row_start + i] = " << in_type
     << "(exp(val - row_max) * inv_sum);\n"
     << "  }\n"
     << "}\n";
@@ -208,6 +210,8 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   SoftmaxParams params{};
   params.data[0] = static_cast<uint32_t>(axis_size);
+  params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
+  params.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =

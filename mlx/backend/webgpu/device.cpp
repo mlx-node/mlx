@@ -5,6 +5,7 @@
 #include "mlx/backend/webgpu/worker.h"
 #include "mlx/utils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
@@ -12,11 +13,45 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 
 namespace mlx::core::wgpu {
+
+namespace {
+
+size_t cpu_itemsize(Dtype::Val dtype_val) {
+  switch (dtype_val) {
+    case Dtype::Val::bool_: return sizeof(bool);
+    case Dtype::Val::uint8: return sizeof(uint8_t);
+    case Dtype::Val::uint16: return sizeof(uint16_t);
+    case Dtype::Val::uint32: return sizeof(uint32_t);
+    case Dtype::Val::uint64: return sizeof(uint64_t);
+    case Dtype::Val::int8: return sizeof(int8_t);
+    case Dtype::Val::int16: return sizeof(int16_t);
+    case Dtype::Val::int32: return sizeof(int32_t);
+    case Dtype::Val::int64: return sizeof(int64_t);
+    case Dtype::Val::float16: return sizeof(uint16_t);
+    case Dtype::Val::float32: return sizeof(float);
+    case Dtype::Val::float64: return sizeof(double);
+    case Dtype::Val::bfloat16: return sizeof(uint16_t);
+    case Dtype::Val::complex64: return sizeof(complex64_t);
+  }
+  return 4;
+}
+
+size_t cpu_upload_bytes(
+    const WebGPUBuffer* buf,
+    Dtype::Val dtype_val,
+    size_t data_size) {
+  size_t bytes =
+      buf->cpu_bytes > 0 ? buf->cpu_bytes : data_size * cpu_itemsize(dtype_val);
+  return std::min(bytes, buf->size);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Phase 0 dispatch-stats counters (observability only, no behavior change).
@@ -789,9 +824,50 @@ static void upload_with_conversion(
       tmp[i] = src[i] ? 1u : 0u;
     }
     wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), data_size * 4);
+  } else if (dtype_val == Dtype::Val::int64) {
+    // Narrow int64 → i32 for WebGPU. This path is intended for index/shape
+    // tensors; values outside i32 cannot be represented in WGSL storage.
+    size_t full_n =
+        buf->cpu_bytes > 0 ? (buf->cpu_bytes / sizeof(int64_t)) : data_size;
+    if (full_n * 4 > buf->size) {
+      full_n = buf->size / 4;
+    }
+    std::vector<int32_t> tmp(full_n);
+    auto* src = static_cast<const int64_t*>(buf->cpu_ptr);
+    for (size_t i = 0; i < full_n; i++) {
+      if (src[i] < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+          src[i] > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::runtime_error(
+            "[WebGPU] int64 value does not fit in WebGPU i32 storage");
+      }
+      tmp[i] = static_cast<int32_t>(src[i]);
+    }
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), full_n * 4);
+    buf->cpu_bytes = full_n * 4;
+  } else if (dtype_val == Dtype::Val::uint64) {
+    // Narrow uint64 → u32 for WebGPU index/shape tensors.
+    size_t full_n =
+        buf->cpu_bytes > 0 ? (buf->cpu_bytes / sizeof(uint64_t)) : data_size;
+    if (full_n * 4 > buf->size) {
+      full_n = buf->size / 4;
+    }
+    std::vector<uint32_t> tmp(full_n);
+    auto* src = static_cast<const uint64_t*>(buf->cpu_ptr);
+    for (size_t i = 0; i < full_n; i++) {
+      if (src[i] > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw std::runtime_error(
+            "[WebGPU] uint64 value does not fit in WebGPU u32 storage");
+      }
+      tmp[i] = static_cast<uint32_t>(src[i]);
+    }
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, tmp.data(), full_n * 4);
+    buf->cpu_bytes = full_n * 4;
   } else {
-    // Direct copy for types where CPU and GPU sizes match
-    wgpuQueueWriteBuffer(queue, buf->buffer, 0, buf->cpu_ptr, buf->size);
+    // Direct copy for types where CPU and GPU sizes match. Use the logical
+    // CPU byte count, not the rounded GPU allocation size, or small/unaligned
+    // CPU-origin arrays can overread past cpu_ptr during upload.
+    size_t bytes = cpu_upload_bytes(buf, dtype_val, data_size);
+    wgpuQueueWriteBuffer(queue, buf->buffer, 0, buf->cpu_ptr, bytes);
   }
 }
 
@@ -864,6 +940,13 @@ WGPUBuffer wgpu_buffer(const array& arr) {
     needed = arr.data_size() * wgpu_itemsize(arr.dtype());
   }
   if (needed > buf->size) {
+    if (buf->gpu_has_data && !buf->cpu_ptr) {
+      std::ostringstream msg;
+      msg << "[WebGPU] Refusing to resize GPU-only buffer from " << buf->size
+          << " to " << needed
+          << " bytes; no CPU shadow is available to preserve imported data";
+      throw std::runtime_error(msg.str());
+    }
     if (buf->buffer) {
       wgpuBufferDestroy(buf->buffer);
       wgpuBufferRelease(buf->buffer);

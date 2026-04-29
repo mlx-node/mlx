@@ -30,7 +30,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct LogSumExpParams {
-  uint32_t data[4]; // [axis_size, pad, pad, pad]
+  uint32_t data[4]; // [axis_size, input_offset, output_offset, pad]
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +74,8 @@ std::string make_logsumexp_kernel(
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
     << " @builtin(workgroup_id) wg_id: vec3u) {\n"
     << "  let axis_size = params.data.x;\n"
+    << "  let input_offset = params.data.y;\n"
+    << "  let output_offset = params.data.z;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
     << "  let row_start = row * axis_size;\n"
@@ -82,7 +84,7 @@ std::string make_logsumexp_kernel(
     << "  var thread_max: " << acc_type << " = " << acc_type
     << "(-3.402823e+38);\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
+    << "    let val = " << acc_type << "(input[input_offset + row_start + i]);\n"
     << "    thread_max = max(thread_max, val);\n"
     << "  }\n"
     << "\n"
@@ -96,7 +98,7 @@ std::string make_logsumexp_kernel(
     << "  // Phase 2: sum of exp(x - max)\n"
     << "  var thread_sum: " << acc_type << " = " << acc_type << "(0.0);\n"
     << "  for (var i: u32 = tid; i < axis_size; i = i + WORKGROUP_SIZE) {\n"
-    << "    let val = " << acc_type << "(input[row_start + i]);\n"
+    << "    let val = " << acc_type << "(input[input_offset + row_start + i]);\n"
     << "    thread_sum = thread_sum + exp(val - row_max);\n"
     << "  }\n"
     << "\n"
@@ -110,9 +112,9 @@ std::string make_logsumexp_kernel(
     << "    let s = shared_sum[0];\n"
     << "    if (row_max >= " << acc_type << "(3.402823e+38) || row_max <= "
     << acc_type << "(-3.402823e+38)) {\n"
-    << "      output[row] = " << in_type << "(row_max);\n"
+    << "      output[output_offset + row] = " << in_type << "(row_max);\n"
     << "    } else {\n"
-    << "      output[row] = " << in_type << "(log(s) + row_max);\n"
+    << "      output[output_offset + row] = " << in_type << "(log(s) + row_max);\n"
     << "    }\n"
     << "  }\n"
     << "}\n";
@@ -183,6 +185,8 @@ void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   LogSumExpParams params{};
   params.data[0] = static_cast<uint32_t>(axis_size);
+  params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
+  params.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf = pool.acquire(
