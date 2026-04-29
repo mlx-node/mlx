@@ -25,9 +25,9 @@ namespace {
 // Total: 176 bytes.
 struct TernaryParams {
   uint32_t size_ndim[4]; // [size, ndim, pad, pad]
-  uint32_t offsets[4];   // [cond_offset, true_offset, false_offset, out_offset]
-  uint32_t shape_0[4];   // shape[0..3]
-  uint32_t shape_1[4];   // shape[4..7]
+  uint32_t offsets[4]; // [cond_offset, true_offset, false_offset, out_offset]
+  uint32_t shape_0[4]; // shape[0..3]
+  uint32_t shape_1[4]; // shape[4..7]
   int32_t a_strides_0[4]; // condition strides[0..3]
   int32_t a_strides_1[4]; // condition strides[4..7]
   int32_t b_strides_0[4]; // true_val strides[0..3]
@@ -70,12 +70,12 @@ std::string make_select_kernel(
 
   // Condition is stored as u32 (bool-as-u32).
   s << "@group(0) @binding(0) var<storage, read> cond: array<u32>;\n"
-    << "@group(0) @binding(1) var<storage, read> true_vals: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(2) var<storage, read> false_vals: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(3) var<storage, read_write> out: array<"
-    << val_type << ">;\n"
+    << "@group(0) @binding(1) var<storage, read> true_vals: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(2) var<storage, read> false_vals: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(3) var<storage, read_write> out: array<" << val_type
+    << ">;\n"
     << "@group(0) @binding(4) var<uniform> params: TernaryParams;\n\n";
 
   if (variant == "g") {
@@ -128,11 +128,14 @@ std::string make_select_kernel(
       << "}\n\n";
   }
 
+  s << wgpu::wgsl_linear_thread_id();
+
   // Entry point
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let idx = gid.x;\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let size = params.size_ndim.x;\n"
     << "  if (idx >= size) { return; }\n";
 
@@ -169,8 +172,8 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   assert(inputs.size() == 3);
   const auto& cond = inputs[0]; // condition (bool)
-  const auto& b = inputs[1];    // true values
-  const auto& c = inputs[2];    // false values
+  const auto& b = inputs[1]; // true values
+  const auto& c = inputs[2]; // false values
 
   auto topt = get_ternary_op_type(cond, b, c);
   set_ternary_op_output_data(cond, b, c, out, topt);
@@ -195,12 +198,11 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
     variant = "g";
   }
 
-  std::string entry_name =
-      std::string("select_") + variant + "_" + val_type;
+  std::string entry_name = std::string("select_") + variant + "_" + val_type;
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() { return make_select_kernel(entry_name, val_type, variant); });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_select_kernel(entry_name, val_type, variant);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -272,12 +274,12 @@ void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (elem_count + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU select]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 } // namespace mlx::core

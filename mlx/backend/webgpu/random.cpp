@@ -28,10 +28,10 @@ namespace {
 // `random.split`). We plumb element offsets into the key buffer so this
 // supports both row-contiguous and strided key arrays.
 struct RandomBitsParams {
-  uint32_t key0_offset;  // element index into keys storage buffer for key0
-  uint32_t key1_offset;  // element index into keys storage buffer for key1
-  uint32_t half_size;    // number of threads (each produces 2 u32 outputs)
-  uint32_t odd;          // 1 if out_per_key is odd, 0 otherwise
+  uint32_t key0_offset; // element index into keys storage buffer for key0
+  uint32_t key1_offset; // element index into keys storage buffer for key1
+  uint32_t half_size; // number of threads (each produces 2 u32 outputs)
+  uint32_t odd; // 1 if out_per_key is odd, 0 otherwise
   uint32_t bytes_per_key;
   uint32_t _pad0;
   uint32_t _pad1;
@@ -131,6 +131,8 @@ fn threefry2x32(key0: u32, key1: u32, ctr0: u32, ctr1: u32) -> vec2<u32> {
 
 )";
 
+  s << wgpu::wgsl_linear_thread_id();
+
   // Main compute kernel.
   // Each thread at global index `gid` generates one Threefry pair and writes
   // two u32 values to the output buffer, matching the Metal kernel's layout:
@@ -139,9 +141,10 @@ fn threefry2x32(key0: u32, key1: u32, ctr0: u32, ctr1: u32) -> vec2<u32> {
   // When the output has an odd number of u32 words, the last thread in the
   // first half (gid == half_size) only writes one value.
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let tid = gid.x;\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let tid = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let half_size = params.half_size;\n"
     << "  let odd = params.odd;\n"
     << "  let total_threads = half_size + odd;\n"
@@ -191,7 +194,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  size_t out_per_key = (bytes_per_key + 3) / 4;  // number of u32 words per key
+  size_t out_per_key = (bytes_per_key + 3) / 4; // number of u32 words per key
   size_t half_size = out_per_key / 2;
   bool odd = out_per_key % 2;
 
@@ -202,8 +205,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Cache shader by name
   std::string entry_name = "random_bits";
   WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() { return make_random_bits_kernel(entry_name); });
+      entry_name, [&]() { return make_random_bits_kernel(entry_name); });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   encoder.set_input_array(keys);
@@ -235,10 +237,10 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
       k0_elem = keys_elem_base + static_cast<uint64_t>(kidx);
       k1_elem = keys_elem_base + static_cast<uint64_t>(kidx + 1);
     } else {
-      auto k0_rel = elem_to_loc(
-          static_cast<int>(kidx), keys.shape(), keys.strides());
-      auto k1_rel = elem_to_loc(
-          static_cast<int>(kidx + 1), keys.shape(), keys.strides());
+      auto k0_rel =
+          elem_to_loc(static_cast<int>(kidx), keys.shape(), keys.strides());
+      auto k1_rel =
+          elem_to_loc(static_cast<int>(kidx + 1), keys.shape(), keys.strides());
       k0_elem = keys_elem_base + static_cast<uint64_t>(k0_rel);
       k1_elem = keys_elem_base + static_cast<uint64_t>(k1_rel);
     }
@@ -283,11 +285,14 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
     uint32_t total_threads = static_cast<uint32_t>(half_size + (odd ? 1 : 0));
     uint32_t num_workgroups =
         (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+    auto [wg_x, wg_y] =
+        wgpu::get_2d_grid(num_workgroups, "[WebGPU random_bits]");
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
     wgpuBindGroupRelease(bg);
-    encoder.add_completed_handler(
-        [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
+    encoder.add_completed_handler([uniform_buf]() {
+      wgpu::device().uniform_pool().release(uniform_buf);
+    });
   }
 }
 

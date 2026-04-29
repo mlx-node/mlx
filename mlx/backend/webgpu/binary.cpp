@@ -26,9 +26,9 @@ namespace {
 // Total: 128 bytes.
 struct BinaryParams {
   uint32_t size_ndim[4]; // [size, ndim, pad, pad]
-  uint32_t offsets[4];   // [a_offset, b_offset, out_offset, pad]
-  uint32_t shape_0[4];   // shape[0..3]
-  uint32_t shape_1[4];   // shape[4..7]
+  uint32_t offsets[4]; // [a_offset, b_offset, out_offset, pad]
+  uint32_t shape_0[4]; // shape[0..3]
+  uint32_t shape_1[4]; // shape[4..7]
   int32_t a_strides_0[4]; // a_strides[0..3]
   int32_t a_strides_1[4]; // a_strides[4..7]
   int32_t b_strides_0[4]; // b_strides[0..3]
@@ -74,10 +74,8 @@ std::string make_binary_kernel(
     << "}\n\n";
 
   // Bindings
-  s << "@group(0) @binding(0) var<storage, read> a: array<" << in_type
-    << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> b: array<" << in_type
-    << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read> a: array<" << in_type << ">;\n"
+    << "@group(0) @binding(1) var<storage, read> b: array<" << in_type << ">;\n"
     << "@group(0) @binding(2) var<storage, read_write> out: array<" << out_type
     << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: BinaryParams;\n\n";
@@ -118,12 +116,15 @@ std::string make_binary_kernel(
       << "}\n\n";
   }
 
+  s << wgpu::wgsl_linear_thread_id();
+
   // Entry point
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let size = params.size_ndim.x;\n"
-    << "  let base = gid.x * N_READS;\n"
+    << "  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;\n"
     << "  if (base >= size) { return; }\n"
     << "  let end = min(base + N_READS, size);\n";
 
@@ -197,24 +198,42 @@ const char* binary_op_type_to_variant(BinaryOpType bopt) {
 // Get a short name for the operation (used in pipeline key / entry point).
 const char* get_op_short_name(const char* name) {
   std::string n(name);
-  if (n == "Add") return "add";
-  if (n == "Subtract") return "sub";
-  if (n == "Multiply") return "mul";
-  if (n == "Divide") return "div";
-  if (n == "Remainder") return "rem";
-  if (n == "Power") return "pow_";
-  if (n == "Equal") return "eq";
-  if (n == "NotEqual") return "ne";
-  if (n == "Greater") return "gt";
-  if (n == "GreaterEqual") return "ge";
-  if (n == "Less") return "lt";
-  if (n == "LessEqual") return "le";
-  if (n == "LogicalAnd") return "land";
-  if (n == "LogicalOr") return "lor";
-  if (n == "Maximum") return "max_";
-  if (n == "Minimum") return "min_";
-  if (n == "LogAddExp") return "logaddexp";
-  if (n == "ArcTan2") return "atan2_";
+  if (n == "Add")
+    return "add";
+  if (n == "Subtract")
+    return "sub";
+  if (n == "Multiply")
+    return "mul";
+  if (n == "Divide")
+    return "div";
+  if (n == "Remainder")
+    return "rem";
+  if (n == "Power")
+    return "pow_";
+  if (n == "Equal")
+    return "eq";
+  if (n == "NotEqual")
+    return "ne";
+  if (n == "Greater")
+    return "gt";
+  if (n == "GreaterEqual")
+    return "ge";
+  if (n == "Less")
+    return "lt";
+  if (n == "LessEqual")
+    return "le";
+  if (n == "LogicalAnd")
+    return "land";
+  if (n == "LogicalOr")
+    return "lor";
+  if (n == "Maximum")
+    return "max_";
+  if (n == "Minimum")
+    return "min_";
+  if (n == "LogAddExp")
+    return "logaddexp";
+  if (n == "ArcTan2")
+    return "atan2_";
   return "unknown";
 }
 
@@ -239,7 +258,8 @@ void binary_op_gpu_dispatch(
   // WebGPU: prevent buffer aliasing between input and output bindings
   wgpu::ensure_no_alias(out, a);
   wgpu::ensure_no_alias(out, b);
-  // Ensure buffer is large enough for GPU-side element sizes (bool->u32, bf16->f32)
+  // Ensure buffer is large enough for GPU-side element sizes (bool->u32,
+  // bf16->f32)
   wgpu::ensure_wgpu_size(out);
 
   if (out.size() == 0) {
@@ -255,16 +275,14 @@ void binary_op_gpu_dispatch(
       wgpu::get_binary_op_expr(op_name, in_type, out_wgsl_type);
 
   // Build entry point name and pipeline key
-  std::string entry_name = std::string("binary_") + short_name + "_" +
-      variant + "_" + in_type + "_" + out_wgsl_type;
+  std::string entry_name = std::string("binary_") + short_name + "_" + variant +
+      "_" + in_type + "_" + out_wgsl_type;
   // Get shader module with lazy codegen, then pipeline
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_binary_kernel(
-            entry_name, in_type, out_wgsl_type, op_expr, variant);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_binary_kernel(
+        entry_name, in_type, out_wgsl_type, op_expr, variant);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -282,8 +300,7 @@ void binary_op_gpu_dispatch(
   params.offsets[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
 
   if (bopt == BinaryOpType::General) {
-    auto [shape_collapsed, strides_vec] =
-        collapse_contiguous_dims(a, b, out);
+    auto [shape_collapsed, strides_vec] = collapse_contiguous_dims(a, b, out);
     auto& a_strides = strides_vec[0];
     auto& b_strides = strides_vec[1];
 
@@ -333,12 +350,12 @@ void binary_op_gpu_dispatch(
   uint32_t total_threads = (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
       (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU binary]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 } // namespace
@@ -347,10 +364,10 @@ void binary_op_gpu_dispatch(
 // Primitive eval_gpu definitions via macro
 // ---------------------------------------------------------------------------
 
-#define BINARY_GPU(Op)                                                  \
-  void Op::eval_gpu(const std::vector<array>& inputs, array& out) {     \
-    auto& s = out.primitive().stream();                                 \
-    binary_op_gpu_dispatch(inputs, out, name(), s);                     \
+#define BINARY_GPU(Op)                                              \
+  void Op::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    auto& s = out.primitive().stream();                             \
+    binary_op_gpu_dispatch(inputs, out, name(), s);                 \
   }
 
 BINARY_GPU(Add)
