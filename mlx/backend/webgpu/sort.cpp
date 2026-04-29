@@ -261,8 +261,10 @@ void eval_sort_gpu(
   auto& encoder = wgpu::get_command_encoder(s_stream);
 
   bool axis_is_last = (axis == ndim - 1);
-  bool contiguous_last =
-      in.flags().contiguous && (ndim == 0 || in.strides()[ndim - 1] == 1);
+  bool contiguous_last = in.flags().contiguous &&
+      in.offset() == 0 &&
+      in.size() == in.data_size() &&
+      (ndim == 0 || in.strides()[ndim - 1] == 1);
 
   if (!axis_is_last || !contiguous_last) {
     if (!axis_is_last) {
@@ -273,7 +275,9 @@ void eval_sort_gpu(
   }
 
   // Now 'in' has shape [..., axis_size] with stride-1 last axis.
-  int n_rows = static_cast<int>(in.data_size()) / axis_size;
+  int n_rows = axis_size == 0
+      ? 0
+      : static_cast<int>(in.size()) / static_cast<int>(axis_size);
 
   // Allocate output
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));

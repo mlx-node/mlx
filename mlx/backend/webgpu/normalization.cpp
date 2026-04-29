@@ -21,7 +21,10 @@
 #include "mlx/fast_primitives.h"
 
 #include <cassert>
+#include <cstring>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 
 #ifdef MLX_WGPU_LOG_KERNELS
 #include <iostream>
@@ -36,7 +39,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct RMSNormParams {
-  uint32_t data[4]; // [axis_size, w_stride, eps_bits, pad]
+  uint32_t data[4]; // [axis_size, w_stride, eps_bits, w_offset]
 };
 
 // ---------------------------------------------------------------------------
@@ -50,7 +53,18 @@ struct RMSNormParams {
 
 struct LayerNormParams {
   uint32_t data[4]; // [axis_size, w_stride, eps_bits, b_stride]
+  uint32_t offsets[4]; // [w_offset, b_offset, pad, pad]
 };
+
+uint32_t shader_elem_offset(const array& arr, const char* op_name) {
+  uint64_t offset =
+      static_cast<uint64_t>(arr.offset()) / static_cast<uint64_t>(arr.itemsize());
+  if (offset > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string(op_name) + " array offset exceeds WebGPU u32 indexing");
+  }
+  return static_cast<uint32_t>(offset);
+}
 
 // ---------------------------------------------------------------------------
 // WGSL kernel generation: rmsnorm
@@ -111,6 +125,7 @@ std::string make_rmsnorm_kernel(
     << "  let axis_size = params.data.x;\n"
     << "  let w_stride = params.data.y;\n"
     << "  let eps = bitcast<f32>(params.data.z);\n"
+    << "  let w_offset = params.data.w;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
     << "  let row_start = row * axis_size;\n"
@@ -144,13 +159,14 @@ std::string make_rmsnorm_kernel(
     // indexing formula works for both: w_stride=0 always reads slot 0's
     // low half (the broadcast scalar). When w_stride=1 we read element
     // `i` as `weight[i>>1].{x|y}` depending on parity.
-    s << "    let w_elem_idx = i * w_stride;\n"
+    s << "    let w_elem_idx = w_offset + i * w_stride;\n"
       << "    let w_u32_idx = w_elem_idx >> 1u;\n"
       << "    let w_parity = w_elem_idx & 1u;\n"
       << "    let w_pair = unpack_bf16_pair(weight[w_u32_idx]);\n"
       << "    let w = select(w_pair.y, w_pair.x, w_parity == 0u);\n";
   } else {
-    s << "    let w = " << acc_type << "(weight[i * w_stride]);\n";
+    s << "    let w = " << acc_type
+      << "(weight[w_offset + i * w_stride]);\n";
   }
   s << "    output[row_start + i] = " << in_type
     << "(val * inv_rms * w);\n"
@@ -188,6 +204,7 @@ std::string make_layernorm_kernel(
 
   s << "struct LayerNormParams {\n"
     << "  data: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "}\n\n";
 
   // Bindings: input, weight, [bias], output, params
@@ -234,6 +251,8 @@ std::string make_layernorm_kernel(
     << "  let w_stride = params.data.y;\n"
     << "  let eps = bitcast<f32>(params.data.z);\n"
     << "  let b_stride = params.data.w;\n"
+    << "  let w_offset = params.offsets.x;\n"
+    << "  let b_offset = params.offsets.y;\n"
     << "  let tid = lid.x;\n"
     << "  let row = wg_id.x;\n"
     << "  let row_start = row * axis_size;\n"
@@ -293,26 +312,28 @@ std::string make_layernorm_kernel(
   if (w_packed_bf16) {
     // w_stride is 0 (broadcast) or 1 (1D contiguous); packed formula
     // handles both — broadcast always reads slot 0 low half.
-    s << "    let w_elem_idx = i * w_stride;\n"
+    s << "    let w_elem_idx = w_offset + i * w_stride;\n"
       << "    let w_u32_idx = w_elem_idx >> 1u;\n"
       << "    let w_parity = w_elem_idx & 1u;\n"
       << "    let w_pair = unpack_bf16_pair(weight[w_u32_idx]);\n"
       << "    let w = select(w_pair.y, w_pair.x, w_parity == 0u);\n";
   } else {
-    s << "    let w = " << acc_type << "(weight[i * w_stride]);\n";
+    s << "    let w = " << acc_type
+      << "(weight[w_offset + i * w_stride]);\n";
   }
 
   if (has_bias) {
     if (b_packed_bf16) {
       // b_stride is 0 (broadcast scalar) or 1 (1D contiguous). Packed formula
       // handles both — broadcast always reads slot 0 low half.
-      s << "    let b_elem_idx = i * b_stride;\n"
+      s << "    let b_elem_idx = b_offset + i * b_stride;\n"
         << "    let b_u32_idx = b_elem_idx >> 1u;\n"
         << "    let b_parity = b_elem_idx & 1u;\n"
         << "    let b_pair = unpack_bf16_pair(bias[b_u32_idx]);\n"
         << "    let b = select(b_pair.y, b_pair.x, b_parity == 0u);\n";
     } else {
-      s << "    let b = " << acc_type << "(bias[i * b_stride]);\n";
+      s << "    let b = " << acc_type
+        << "(bias[b_offset + i * b_stride]);\n";
     }
     s << "    output[row_start + i] = " << in_type << "(val * w + b);\n";
   } else {
@@ -422,6 +443,7 @@ void RMSNorm::eval_gpu(
   uint32_t eps_bits;
   std::memcpy(&eps_bits, &eps_val, sizeof(eps_bits));
   params.data[2] = eps_bits;
+  params.data[3] = shader_elem_offset(w, "RMSNorm");
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
@@ -576,6 +598,10 @@ void LayerNorm::eval_gpu(
     }
   }
   params.data[3] = b_stride;
+  params.offsets[0] = shader_elem_offset(w, "LayerNorm");
+  params.offsets[1] = has_bias ? shader_elem_offset(inputs[2], "LayerNorm") : 0;
+  params.offsets[2] = 0;
+  params.offsets[3] = 0;
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =

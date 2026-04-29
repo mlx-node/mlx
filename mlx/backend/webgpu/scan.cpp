@@ -343,9 +343,10 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto in = inputs[0];
 
   // Check if the scan axis is contiguous (stride == 1)
-  bool contiguous = in.flags().contiguous && in.strides()[axis_] == 1;
+  bool contiguous =
+      in.flags().contiguous && in.offset() == 0 && in.strides()[axis_] == 1;
   bool strided_ok =
-      in.flags().contiguous && in.strides()[axis_] != 0;
+      in.flags().contiguous && in.offset() == 0 && in.strides()[axis_] != 0;
 
   if (!contiguous && !strided_ok) {
     // Need a contiguous copy

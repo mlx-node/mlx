@@ -532,6 +532,44 @@ void* Buffer::raw_ptr() {
       void* shrunk = std::realloc(cpu_data, logical);
       if (shrunk) cpu_data = shrunk;
     }
+  } else if (wbuf.dtype_val == Dtype::Val::int64) {
+    // Expand WebGPU's i32 representation back to CPU int64.
+    size_t gpu_bytes = wbuf.cpu_bytes > 0 ? wbuf.cpu_bytes : wbuf.size;
+    size_t n = gpu_bytes / 4;
+    auto* src = static_cast<const int32_t*>(cpu_data);
+    void* expanded = std::malloc(n * sizeof(int64_t));
+    if (!expanded) {
+      std::free(cpu_data);
+      wgpuBufferUnmap(staging);
+      wgpuBufferDestroy(staging);
+      wgpuBufferRelease(staging);
+      throw std::runtime_error("[WebGPU] Failed to allocate int64 readback");
+    }
+    auto* dst = static_cast<int64_t*>(expanded);
+    for (size_t i = 0; i < n; i++) {
+      dst[i] = static_cast<int64_t>(src[i]);
+    }
+    std::free(cpu_data);
+    cpu_data = expanded;
+  } else if (wbuf.dtype_val == Dtype::Val::uint64) {
+    // Expand WebGPU's u32 representation back to CPU uint64.
+    size_t gpu_bytes = wbuf.cpu_bytes > 0 ? wbuf.cpu_bytes : wbuf.size;
+    size_t n = gpu_bytes / 4;
+    auto* src = static_cast<const uint32_t*>(cpu_data);
+    void* expanded = std::malloc(n * sizeof(uint64_t));
+    if (!expanded) {
+      std::free(cpu_data);
+      wgpuBufferUnmap(staging);
+      wgpuBufferDestroy(staging);
+      wgpuBufferRelease(staging);
+      throw std::runtime_error("[WebGPU] Failed to allocate uint64 readback");
+    }
+    auto* dst = static_cast<uint64_t*>(expanded);
+    for (size_t i = 0; i < n; i++) {
+      dst[i] = static_cast<uint64_t>(src[i]);
+    }
+    std::free(cpu_data);
+    cpu_data = expanded;
   }
 
   // Clean up staging buffer

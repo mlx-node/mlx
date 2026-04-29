@@ -31,10 +31,11 @@ namespace {
 // RoPE uniform params — must match the WGSL struct layout (vec4-aligned)
 // ---------------------------------------------------------------------------
 
-// Single kernel: T=1, offset baked into uniform
+// Single kernel: T=1, offset read from storage buffer
 struct RoPESingleParams {
-  uint32_t data[4]; // [dims_half, D, n_rows, offset_val]
+  uint32_t data[4]; // [dims_half, D, n_rows, pad]
   uint32_t data2[4]; // [scale_bits, base_log2_bits, traditional, forward]
+  uint32_t offsets[4]; // [input_offset, output_offset, offset_offset, pad]
 };
 
 // General kernel: T>1, offset read from storage buffer
@@ -42,7 +43,64 @@ struct RoPEGeneralParams {
   uint32_t data[4]; // [dims_half, D, N, B]
   uint32_t data2[4]; // [scale_bits, base_log2_bits, traditional, forward]
   uint32_t data3[4]; // [T, offset_stride, mat_size, 0]
+  uint32_t data4[4]; // [input_offset, output_offset, offset_offset, 0]
 };
+
+uint32_t shader_elem_offset(const array& arr, const char* op_name) {
+  uint64_t offset =
+      static_cast<uint64_t>(arr.offset()) / static_cast<uint64_t>(arr.itemsize());
+  if (offset > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string(op_name) + " array offset exceeds WebGPU u32 indexing");
+  }
+  return static_cast<uint32_t>(offset);
+}
+
+struct RopeOffsetStorage {
+  std::string tag;
+  std::string wgsl_type;
+  uint32_t offset_base;
+  uint32_t stride_scale;
+};
+
+RopeOffsetStorage rope_offset_storage(const array& offset) {
+  switch (offset.dtype().val()) {
+    case Dtype::Val::int32:
+      return {
+          "i32",
+          "i32",
+          shader_elem_offset(offset, "[RoPE::eval_gpu] offset"),
+          1u};
+    case Dtype::Val::uint32:
+      return {
+          "u32",
+          "u32",
+          shader_elem_offset(offset, "[RoPE::eval_gpu] offset"),
+          1u};
+    case Dtype::Val::int64: {
+      return {
+          "i64",
+          "i32",
+          shader_elem_offset(offset, "[RoPE::eval_gpu] offset"),
+          1u};
+    }
+    default:
+      throw std::runtime_error(
+          "[RoPE::eval_gpu] Unsupported offset dtype. Expected int32, "
+          "uint32, or int64.");
+  }
+}
+
+std::string rope_offset_expr(
+    const RopeOffsetStorage& storage,
+    const std::string& index) {
+  if (storage.tag == "i32" || storage.tag == "u32") {
+    return "f32(offsets[" + index + "])";
+  }
+  // WGSL has no i64 scalar type. The WebGPU upload path narrows int64 index
+  // tensors to one i32 lane per logical element before kernels read them.
+  return "f32(offsets[" + index + "])";
+}
 
 // ---------------------------------------------------------------------------
 // WGSL kernel generation: rope_single
@@ -50,7 +108,8 @@ struct RoPEGeneralParams {
 
 std::string make_rope_single_kernel(
     const std::string& entry_name,
-    const std::string& in_type) {
+    const std::string& in_type,
+    const RopeOffsetStorage& offset_storage) {
   std::ostringstream s;
 
   if (in_type == "f16") {
@@ -64,14 +123,17 @@ std::string make_rope_single_kernel(
   s << "struct RoPEParams {\n"
     << "  data: vec4<u32>,\n"
     << "  data2: vec4<u32>,\n"
+    << "  offsets: vec4<u32>,\n"
     << "}\n\n";
 
-  // Bindings: input, output, uniform
+  // Bindings: input, output, offset, uniform
   s << "@group(0) @binding(0) var<storage, read> input: array<" << in_type
     << ">;\n"
     << "@group(0) @binding(1) var<storage, read_write> output: array<"
     << in_type << ">;\n"
-    << "@group(0) @binding(2) var<uniform> params: RoPEParams;\n\n";
+    << "@group(0) @binding(2) var<storage, read> offsets: array<"
+    << offset_storage.wgsl_type << ">;\n"
+    << "@group(0) @binding(3) var<uniform> params: RoPEParams;\n\n";
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
@@ -79,7 +141,10 @@ std::string make_rope_single_kernel(
     << "  let dims_half = params.data.x;\n"
     << "  let D = params.data.y;\n"
     << "  let n_rows = params.data.z;\n"
-    << "  let offset_val = params.data.w;\n"
+    << "  let input_offset = params.offsets.x;\n"
+    << "  let output_offset = params.offsets.y;\n"
+    << "  let offset_index = params.offsets.z;\n"
+    << "  let offset_val = " << rope_offset_expr(offset_storage, "offset_index") << ";\n"
     << "  let scale = bitcast<f32>(params.data2.x);\n"
     << "  let base_log2 = bitcast<f32>(params.data2.y);\n"
     << "  let traditional = params.data2.z;\n"
@@ -98,7 +163,7 @@ std::string make_rope_single_kernel(
     << "  // Compute frequency\n"
     << "  let d = f32(pair_idx) / f32(dims_half);\n"
     << "  let inv_freq = exp2(-d * base_log2);\n"
-    << "  let theta = scale * f32(offset_val) * inv_freq;\n"
+    << "  let theta = scale * offset_val * inv_freq;\n"
     << "  let cos_theta = cos(theta);\n"
     << "  let sin_theta = sin(theta);\n"
     << "\n"
@@ -113,15 +178,15 @@ std::string make_rope_single_kernel(
     << "    idx2 = base_idx + pair_idx + dims_half;\n"
     << "  }\n"
     << "\n"
-    << "  let x1 = f32(input[idx1]);\n"
-    << "  let x2 = f32(input[idx2]);\n"
+    << "  let x1 = f32(input[input_offset + idx1]);\n"
+    << "  let x2 = f32(input[input_offset + idx2]);\n"
     << "\n"
     << "  if (fwd != 0u) {\n"
-    << "    output[idx1] = " << in_type << "(x1 * cos_theta - x2 * sin_theta);\n"
-    << "    output[idx2] = " << in_type << "(x1 * sin_theta + x2 * cos_theta);\n"
+    << "    output[output_offset + idx1] = " << in_type << "(x1 * cos_theta - x2 * sin_theta);\n"
+    << "    output[output_offset + idx2] = " << in_type << "(x1 * sin_theta + x2 * cos_theta);\n"
     << "  } else {\n"
-    << "    output[idx1] = " << in_type << "(x2 * sin_theta + x1 * cos_theta);\n"
-    << "    output[idx2] = " << in_type << "(x2 * cos_theta - x1 * sin_theta);\n"
+    << "    output[output_offset + idx1] = " << in_type << "(x2 * sin_theta + x1 * cos_theta);\n"
+    << "    output[output_offset + idx2] = " << in_type << "(x2 * cos_theta - x1 * sin_theta);\n"
     << "  }\n"
     << "}\n";
 
@@ -134,7 +199,8 @@ std::string make_rope_single_kernel(
 
 std::string make_rope_general_kernel(
     const std::string& entry_name,
-    const std::string& in_type) {
+    const std::string& in_type,
+    const RopeOffsetStorage& offset_storage) {
   std::ostringstream s;
 
   if (in_type == "f16") {
@@ -149,6 +215,7 @@ std::string make_rope_general_kernel(
     << "  data: vec4<u32>,\n"
     << "  data2: vec4<u32>,\n"
     << "  data3: vec4<u32>,\n"
+    << "  data4: vec4<u32>,\n"
     << "}\n\n";
 
   // Bindings: input, output, offset (storage), uniform
@@ -156,7 +223,8 @@ std::string make_rope_general_kernel(
     << ">;\n"
     << "@group(0) @binding(1) var<storage, read_write> output: array<"
     << in_type << ">;\n"
-    << "@group(0) @binding(2) var<storage, read> offsets: array<i32>;\n"
+    << "@group(0) @binding(2) var<storage, read> offsets: array<"
+    << offset_storage.wgsl_type << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: RoPEParams;\n\n";
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
@@ -173,6 +241,9 @@ std::string make_rope_general_kernel(
     << "  let T = params.data3.x;\n"
     << "  let offset_stride = params.data3.y;\n"
     << "  let mat_size = params.data3.z;\n"
+    << "  let input_offset = params.data4.x;\n"
+    << "  let output_offset = params.data4.y;\n"
+    << "  let offset_base = params.data4.z;\n"
     << "\n"
     << "  // Linearize thread_id into (pair_idx, t, head_batch)\n"
     << "  let thread_id = gid.x;\n"
@@ -188,8 +259,9 @@ std::string make_rope_general_kernel(
     << "  let batch_idx = head_batch / N;\n"
     << "\n"
     << "  // Read offset for this batch\n"
-    << "  let batch_offset = offsets[batch_idx * offset_stride];\n"
-    << "  let L = scale * f32(i32(t) + batch_offset);\n"
+    << "  let batch_offset_index = offset_base + batch_idx * offset_stride;\n"
+    << "  let batch_offset = " << rope_offset_expr(offset_storage, "batch_offset_index") << ";\n"
+    << "  let L = scale * (f32(t) + batch_offset);\n"
     << "\n"
     << "  // Compute frequency\n"
     << "  let d = f32(pair_idx) / f32(dims_half);\n"
@@ -212,15 +284,15 @@ std::string make_rope_general_kernel(
     << "    idx2 = base_idx + pair_idx + dims_half;\n"
     << "  }\n"
     << "\n"
-    << "  let x1 = f32(input[idx1]);\n"
-    << "  let x2 = f32(input[idx2]);\n"
+    << "  let x1 = f32(input[input_offset + idx1]);\n"
+    << "  let x2 = f32(input[input_offset + idx2]);\n"
     << "\n"
     << "  if (fwd != 0u) {\n"
-    << "    output[idx1] = " << in_type << "(x1 * cos_theta - x2 * sin_theta);\n"
-    << "    output[idx2] = " << in_type << "(x1 * sin_theta + x2 * cos_theta);\n"
+    << "    output[output_offset + idx1] = " << in_type << "(x1 * cos_theta - x2 * sin_theta);\n"
+    << "    output[output_offset + idx2] = " << in_type << "(x1 * sin_theta + x2 * cos_theta);\n"
     << "  } else {\n"
-    << "    output[idx1] = " << in_type << "(x2 * sin_theta + x1 * cos_theta);\n"
-    << "    output[idx2] = " << in_type << "(x2 * cos_theta - x1 * sin_theta);\n"
+    << "    output[output_offset + idx1] = " << in_type << "(x2 * sin_theta + x1 * cos_theta);\n"
+    << "    output[output_offset + idx2] = " << in_type << "(x2 * cos_theta - x1 * sin_theta);\n"
     << "  }\n"
     << "}\n";
 
@@ -283,6 +355,7 @@ void RoPE::eval_gpu(
 
   const char* in_wgsl = wgpu::dtype_to_wgsl_safe(in.dtype());
   std::string in_type(in_wgsl);
+  auto offset_storage = rope_offset_storage(offset);
 
   // Determine if we can use the optimized single-offset path
   bool single = in.flags().row_contiguous && T == 1 && offset.size() == 1;
@@ -295,45 +368,15 @@ void RoPE::eval_gpu(
 
   if (single) {
     // ----- Single offset path (T=1 inference) -----
-    std::string entry_name = std::string("rope_single_") + in_type;
+    std::string entry_name =
+        std::string("rope_single_") + in_type + "_" + offset_storage.tag;
     WGPUShaderModule shader = dev.get_or_create_shader_module(
         entry_name,
-        [&]() { return make_rope_single_kernel(entry_name, in_type); });
+        [&]() {
+          return make_rope_single_kernel(entry_name, in_type, offset_storage);
+        });
     auto pe =
         dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
-
-    // Read the scalar offset value from the array. Offsets are commonly
-    // int32, but long-context models may produce int64 offsets. We dispatch
-    // on dtype and upconvert safely. int64 values outside the int32 range
-    // indicate a bug (single-offset kernel represents the offset in the
-    // uniform as u32 after reinterpret; positions >= 2^31 are not supported
-    // by the kernel's f32(offset_val) math anyway).
-    uint32_t offset_val = 0;
-    switch (offset.dtype().val()) {
-      case Dtype::Val::int32: {
-        offset_val = static_cast<uint32_t>(offset.data<int32_t>()[0]);
-        break;
-      }
-      case Dtype::Val::int64: {
-        int64_t v = offset.data<int64_t>()[0];
-        if (v > static_cast<int64_t>(std::numeric_limits<int32_t>::max()) ||
-            v < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
-          throw std::runtime_error(
-              "[RoPE::eval_gpu] int64 offset out of int32 range; WebGPU "
-              "backend cannot represent offsets >= 2^31.");
-        }
-        offset_val = static_cast<uint32_t>(static_cast<int32_t>(v));
-        break;
-      }
-      case Dtype::Val::uint32: {
-        offset_val = offset.data<uint32_t>()[0];
-        break;
-      }
-      default:
-        throw std::runtime_error(
-            "[RoPE::eval_gpu] Unsupported offset dtype. Expected int32, "
-            "int64, or uint32.");
-    }
 
     uint32_t n_rows = static_cast<uint32_t>(B * N);
 
@@ -341,17 +384,22 @@ void RoPE::eval_gpu(
     params.data[0] = dims_half;
     params.data[1] = static_cast<uint32_t>(D);
     params.data[2] = n_rows;
-    params.data[3] = offset_val;
+    params.data[3] = 0;
     params.data2[0] = scale_bits;
     params.data2[1] = base_log2_bits;
     params.data2[2] = traditional_ ? 1u : 0u;
     params.data2[3] = forward_ ? 1u : 0u;
+    params.offsets[0] = shader_elem_offset(in, "[RoPE::eval_gpu] input");
+    params.offsets[1] = shader_elem_offset(out, "[RoPE::eval_gpu] output");
+    params.offsets[2] = offset_storage.offset_base;
+    params.offsets[3] = 0;
 
     // Always read from original input (not output) to avoid WebGPU
     // buffer aliasing — the same buffer can't be bound as both read-only
     // and read-write. For partial rotation, copy_gpu already put non-rotated
     // dims into output; we read rotated dims from input.
     encoder.set_input_array(in);
+    encoder.set_input_array(offset);
     encoder.set_output_array(out);
 
     auto& pool = wgpu::device().uniform_pool();
@@ -360,13 +408,16 @@ void RoPE::eval_gpu(
 
     WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
     WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
+    WGPUBuffer offset_buf = wgpu::wgpu_buffer(offset);
     uint64_t in_buf_size = wgpu::wgpu_bind_size(in);
     uint64_t out_buf_size = wgpu::wgpu_bind_size(out);
+    uint64_t offset_buf_size = wgpu::wgpu_bind_size(offset);
 
     WGPUBindGroup bg = wgpu::create_bind_group(
         pe.layout,
         {{in_buf, in_buf_size},
          {out_buf, out_buf_size},
+         {offset_buf, offset_buf_size},
          {uniform_buf, sizeof(RoPESingleParams)}});
 
     // Total threads needed: dims_half * n_rows
@@ -383,19 +434,13 @@ void RoPE::eval_gpu(
 
   } else {
     // ----- General path (T>1 or non-contiguous) -----
-    // The general kernel binds offsets as storage array<i32>, so non-int32
-    // offset dtypes would be silently misread (WebGPU has no i64 type).
-    // Require int32 here; int64 offsets in the general path would require
-    // a GPU-side cast pass which the backend currently doesn't provide.
-    if (offset.dtype() != int32) {
-      throw std::runtime_error(
-          "[RoPE::eval_gpu] General-path offsets must be int32 on WebGPU "
-          "(offset buffer is bound as array<i32>).");
-    }
-    std::string entry_name = std::string("rope_general_") + in_type;
+    std::string entry_name =
+        std::string("rope_general_") + in_type + "_" + offset_storage.tag;
     WGPUShaderModule shader = dev.get_or_create_shader_module(
         entry_name,
-        [&]() { return make_rope_general_kernel(entry_name, in_type); });
+        [&]() {
+          return make_rope_general_kernel(entry_name, in_type, offset_storage);
+        });
     auto pe =
         dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -405,7 +450,8 @@ void RoPE::eval_gpu(
 
     uint32_t offset_stride = 0;
     if (offset.ndim() > 0) {
-      offset_stride = static_cast<uint32_t>(offset.strides()[0]);
+      offset_stride = static_cast<uint32_t>(offset.strides()[0]) *
+          offset_storage.stride_scale;
     }
 
     RoPEGeneralParams params{};
@@ -421,6 +467,11 @@ void RoPE::eval_gpu(
     params.data3[1] = offset_stride;
     params.data3[2] = static_cast<uint32_t>(mat_size);
     params.data3[3] = 0;
+    params.data4[0] =
+        read_from_out ? 0u : shader_elem_offset(in, "[RoPE::eval_gpu] input");
+    params.data4[1] = shader_elem_offset(out, "[RoPE::eval_gpu] output");
+    params.data4[2] = offset_storage.offset_base;
+    params.data4[3] = 0;
 
     auto& pool = wgpu::device().uniform_pool();
     WGPUBuffer uniform_buf = pool.acquire(

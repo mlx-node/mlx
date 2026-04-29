@@ -13,6 +13,7 @@
 #include "mlx/primitives.h"
 
 #include <cassert>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -22,9 +23,33 @@ namespace mlx::core {
 namespace {
 
 static CopyType infer_copy_type(const array& arr) {
-  if (arr.data_size() == 1) return CopyType::Scalar;
-  if (arr.flags().row_contiguous) return CopyType::Vector;
+  if (arr.data_size() == 1)
+    return CopyType::Scalar;
+  if (arr.flags().row_contiguous)
+    return CopyType::Vector;
   return CopyType::General;
+}
+
+uint32_t shader_elem_offset(const array& arr, const char* op_name) {
+  uint64_t offset = static_cast<uint64_t>(arr.offset()) /
+      static_cast<uint64_t>(arr.itemsize());
+  if (offset > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string(op_name) + " array offset exceeds WebGPU u32 indexing");
+  }
+  return static_cast<uint32_t>(offset);
+}
+
+void reject_packed_bf16_indexing(const array& arr, const char* op_name) {
+  if (arr.dtype() != bfloat16) {
+    return;
+  }
+  const auto* wbuf = static_cast<const wgpu::WebGPUBuffer*>(arr.buffer().ptr());
+  if (wbuf && wbuf->storage_mode == wgpu::StorageMode::PackedBf16) {
+    throw std::runtime_error(
+        std::string("[WebGPU ") + op_name +
+        "] PackedBf16 storage is not supported by indexing kernels.");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -46,9 +71,9 @@ struct GatherParams {
   uint32_t src_ndim;
   uint32_t nidx;
   uint32_t idx_ndim;
+  uint32_t src_offset;
+  uint32_t out_offset;
   uint32_t _pad0;
-  uint32_t _pad1;
-  uint32_t _pad2;
   // Followed by variable-length data in storage buffers
 };
 
@@ -71,22 +96,22 @@ std::string make_gather_kernel(
     << "  src_ndim: u32,\n"
     << "  nidx: u32,\n"
     << "  idx_ndim: u32,\n"
+    << "  src_offset: u32,\n"
+    << "  out_offset: u32,\n"
     << "  _pad0: u32,\n"
-    << "  _pad1: u32,\n"
-    << "  _pad2: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> src: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(1) var<storage, read_write> out: array<"
-    << val_type << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read> src: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(1) var<storage, read_write> out: array<" << val_type
+    << ">;\n"
     << "@group(0) @binding(2) var<uniform> params: GatherParams;\n"
     << "@group(0) @binding(3) var<storage, read> metadata: array<i32>;\n";
 
   // Index arrays: binding 4..4+nidx-1
   for (int i = 0; i < nidx; ++i) {
-    s << "@group(0) @binding(" << (4 + i) << ") var<storage, read> idx_"
-      << i << ": array<" << idx_type << ">;\n";
+    s << "@group(0) @binding(" << (4 + i) << ") var<storage, read> idx_" << i
+      << ": array<" << idx_type << ">;\n";
   }
   s << "\n";
 
@@ -103,8 +128,16 @@ std::string make_gather_kernel(
     << "fn get_slice_size_dim(i: u32) -> u32 { return u32(metadata[2u * params.src_ndim + i]); }\n"
     << "fn get_axis(i: u32) -> u32 { return u32(metadata[3u * params.src_ndim + i]); }\n";
 
-  // Index element-to-loc for strided index access
-  if (idx_ndim > 0 && nidx > 0) {
+  if (nidx > 0) {
+    s << "fn get_idx_offset(idx_i: u32) -> u32 {\n"
+      << "  let base = 3u * params.src_ndim + params.nidx + params.nidx * 2u * params.idx_ndim;\n"
+      << "  return u32(metadata[base + idx_i]);\n"
+      << "}\n";
+  }
+
+  // Index element-to-loc for strided index access. Scalar indices have
+  // idx_ndim == 0; the loop below naturally returns loc 0 for them.
+  if (nidx > 0) {
     s << "\nfn get_idx_shape(idx_i: u32, dim: u32) -> u32 {\n"
       << "  let base = 3u * params.src_ndim + params.nidx + idx_i * 2u * params.idx_ndim;\n"
       << "  return u32(metadata[base + dim]);\n"
@@ -129,14 +162,13 @@ std::string make_gather_kernel(
   // Helper to read from the i-th index array
   for (int i = 0; i < nidx; ++i) {
     s << "fn read_idx_" << i << "(loc: u32) -> i32 {\n"
-      << "  return i32(idx_" << i << "[loc]);\n"
+      << "  return i32(idx_" << i << "[get_idx_offset(" << i << "u) + loc]);\n"
       << "}\n";
   }
   s << "\n";
 
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let out_idx = gid.x;\n"
     << "  if (out_idx >= params.out_size) { return; }\n"
     << "\n"
@@ -144,21 +176,19 @@ std::string make_gather_kernel(
     << "  let slice_part = out_idx % params.slice_size;\n"
     << "\n"
     << "  // Compute source offset from index arrays\n"
-    << "  var src_offset: i32 = 0;\n";
+    << "  var src_offset: i32 = i32(params.src_offset);\n";
 
   // For each index array, look up the index value and compute offset
   for (int i = 0; i < nidx; ++i) {
-    if (idx_ndim > 0) {
-      s << "  {\n"
-        << "    let idx_loc = idx_elem_to_loc(idx_part, " << i << "u);\n"
-        << "    var index_val = read_idx_" << i << "(idx_loc);\n"
-        << "    let ax = get_axis(" << i << "u);\n"
-        << "    // Handle negative indices\n"
-        << "    let dim_size = i32(get_src_shape(ax));\n"
-        << "    if (index_val < 0) { index_val = index_val + dim_size; }\n"
-        << "    src_offset += index_val * get_src_stride(ax);\n"
-        << "  }\n";
-    }
+    s << "  {\n"
+      << "    let idx_loc = idx_elem_to_loc(idx_part, " << i << "u);\n"
+      << "    var index_val = read_idx_" << i << "(idx_loc);\n"
+      << "    let ax = get_axis(" << i << "u);\n"
+      << "    // Handle negative indices\n"
+      << "    let dim_size = i32(get_src_shape(ax));\n"
+      << "    if (index_val < 0) { index_val = index_val + dim_size; }\n"
+      << "    src_offset += index_val * get_src_stride(ax);\n"
+      << "  }\n";
   }
 
   // Add slice offset
@@ -173,7 +203,7 @@ std::string make_gather_kernel(
     << "    }\n"
     << "  }\n"
     << "\n"
-    << "  out[out_idx] = src[u32(src_offset)];\n"
+    << "  out[params.out_offset + out_idx] = src[u32(src_offset)];\n"
     << "}\n";
 
   return s.str();
@@ -186,16 +216,21 @@ std::string make_gather_kernel(
 // (for axis=1, for example)
 
 struct GatherAxisParams {
-  uint32_t idx_size_pre;   // product of dims before axis
-  uint32_t idx_size_axis;  // size along axis
-  uint32_t idx_size_post;  // product of dims after axis
-  uint32_t src_axis_size;  // src.shape(axis)
+  uint32_t idx_size_pre; // product of dims before axis
+  uint32_t idx_size_axis; // size along axis
+  uint32_t idx_size_post; // product of dims after axis
+  uint32_t src_axis_size; // src.shape(axis)
   int32_t src_axis_stride; // src.strides(axis)
   int32_t idx_axis_stride; // idx.strides(axis)
-  uint32_t ndim_no_axis;   // ndim - 1
-  uint32_t total_size;     // total output elements
+  uint32_t ndim_no_axis; // ndim - 1
+  uint32_t total_size; // total output elements
+  uint32_t src_offset;
+  uint32_t idx_offset;
+  uint32_t out_offset;
+  uint32_t _pad0;
   // Followed by metadata in storage buffer:
-  // shape (ndim_no_axis), src_strides (ndim_no_axis), idx_strides (ndim_no_axis)
+  // shape (ndim_no_axis), src_strides (ndim_no_axis), idx_strides
+  // (ndim_no_axis)
 };
 
 std::string make_gather_axis_kernel(
@@ -217,25 +252,29 @@ std::string make_gather_axis_kernel(
     << "  idx_axis_stride: i32,\n"
     << "  ndim_no_axis: u32,\n"
     << "  total_size: u32,\n"
+    << "  src_offset: u32,\n"
+    << "  idx_offset: u32,\n"
+    << "  out_offset: u32,\n"
+    << "  _pad0: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> src: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> idx: array<"
-    << idx_type << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<"
-    << val_type << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read> src: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(1) var<storage, read> idx: array<" << idx_type
+    << ">;\n"
+    << "@group(0) @binding(2) var<storage, read_write> out: array<" << val_type
+    << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: GatherAxisParams;\n"
     << "@group(0) @binding(4) var<storage, read> metadata: array<i32>;\n\n";
 
-  // Metadata: shape[ndim_no_axis], src_strides[ndim_no_axis], idx_strides[ndim_no_axis]
+  // Metadata: shape[ndim_no_axis], src_strides[ndim_no_axis],
+  // idx_strides[ndim_no_axis]
   s << "fn get_shape_na(i: u32) -> u32 { return u32(metadata[i]); }\n"
     << "fn get_src_stride_na(i: u32) -> i32 { return metadata[params.ndim_no_axis + i]; }\n"
     << "fn get_idx_stride_na(i: u32) -> i32 { return metadata[2u * params.ndim_no_axis + i]; }\n\n";
 
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let flat = gid.x;\n"
     << "  if (flat >= params.total_size) { return; }\n"
     << "\n"
@@ -248,8 +287,8 @@ std::string make_gather_axis_kernel(
     << "\n"
     << "  // Compute location in src and idx using strides\n"
     << "  // For dims other than the gather axis\n"
-    << "  var src_loc: i32 = 0;\n"
-    << "  var idx_loc: i32 = 0;\n"
+    << "  var src_loc: i32 = i32(params.src_offset);\n"
+    << "  var idx_loc: i32 = i32(params.idx_offset);\n"
     << "  var pre_rem = pre;\n"
     << "  var post_rem = post;\n"
     << "\n"
@@ -275,7 +314,7 @@ std::string make_gather_axis_kernel(
     << "  // Add axis contribution for src using the looked-up index\n"
     << "  src_loc += index_val * params.src_axis_stride;\n"
     << "\n"
-    << "  out[flat] = src[u32(src_loc)];\n"
+    << "  out[params.out_offset + flat] = src[u32(src_loc)];\n"
     << "}\n";
 
   return s.str();
@@ -294,8 +333,8 @@ struct ScatterParams {
   uint32_t nidx;
   uint32_t idx_ndim;
   uint32_t upd_ndim;
-  uint32_t _pad0;
-  uint32_t _pad1;
+  uint32_t upd_offset;
+  uint32_t out_offset;
 };
 
 std::string make_scatter_kernel(
@@ -316,21 +355,21 @@ std::string make_scatter_kernel(
     << "  nidx: u32,\n"
     << "  idx_ndim: u32,\n"
     << "  upd_ndim: u32,\n"
-    << "  _pad0: u32,\n"
-    << "  _pad1: u32,\n"
+    << "  upd_offset: u32,\n"
+    << "  out_offset: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> upd: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(1) var<storage, read_write> out: array<"
-    << val_type << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read> upd: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(1) var<storage, read_write> out: array<" << val_type
+    << ">;\n"
     << "@group(0) @binding(2) var<uniform> params: ScatterParams;\n"
     << "@group(0) @binding(3) var<storage, read> metadata: array<i32>;\n";
 
   // Index arrays: binding 4..4+nidx-1
   for (int i = 0; i < nidx; ++i) {
-    s << "@group(0) @binding(" << (4 + i) << ") var<storage, read> idx_"
-      << i << ": array<" << idx_type << ">;\n";
+    s << "@group(0) @binding(" << (4 + i) << ") var<storage, read> idx_" << i
+      << ": array<" << idx_type << ">;\n";
   }
   s << "\n";
 
@@ -357,6 +396,9 @@ std::string make_scatter_kernel(
       << "fn get_idx_stride(idx_i: u32, dim: u32) -> i32 {\n"
       << "  return metadata[idx_meta_base() + idx_i * 2u * params.idx_ndim + params.idx_ndim + dim];\n"
       << "}\n"
+      << "fn get_idx_offset(idx_i: u32) -> u32 {\n"
+      << "  return u32(metadata[idx_meta_base() + params.nidx * 2u * params.idx_ndim + idx_i]);\n"
+      << "}\n"
       << "fn idx_elem_to_loc(flat_idx: u32, idx_i: u32) -> u32 {\n"
       << "  var loc: i32 = 0;\n"
       << "  var rem: u32 = flat_idx;\n"
@@ -373,7 +415,7 @@ std::string make_scatter_kernel(
   // Read from index arrays
   for (int i = 0; i < nidx; ++i) {
     s << "fn read_idx_" << i << "(loc: u32) -> i32 {\n"
-      << "  return i32(idx_" << i << "[loc]);\n"
+      << "  return i32(idx_" << i << "[get_idx_offset(" << i << "u) + loc]);\n"
       << "}\n";
   }
   s << "\n";
@@ -392,13 +434,12 @@ std::string make_scatter_kernel(
     << "}\n\n";
 
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let upd_idx = gid.x;\n"
     << "  if (upd_idx >= params.upd_size) { return; }\n"
     << "\n"
     << "  // Read the update value\n"
-    << "  let upd_loc = upd_elem_to_loc(upd_idx);\n"
+    << "  let upd_loc = params.upd_offset + upd_elem_to_loc(upd_idx);\n"
     << "  let val = upd[upd_loc];\n"
     << "\n"
     << "  // Compute the index part and slice part of the update\n"
@@ -406,7 +447,7 @@ std::string make_scatter_kernel(
     << "  let slice_part = upd_idx % params.upd_post_idx_size;\n"
     << "\n"
     << "  // Compute destination offset in out\n"
-    << "  var out_offset: i32 = 0;\n";
+    << "  var out_offset: i32 = i32(params.out_offset);\n";
 
   // For each index array, compute offset into out
   for (int i = 0; i < nidx; ++i) {
@@ -424,7 +465,7 @@ std::string make_scatter_kernel(
   s << "  // Add offset from slice coordinates\n"
     << "  var slice_rem: u32 = slice_part;\n"
     << "  for (var d: u32 = params.out_ndim - 1u; d < params.out_ndim; d = d - 1u) {\n"
-    << "    let dim_size = get_out_shape(d);\n"
+    << "    let dim_size = get_upd_shape(params.idx_ndim + d);\n"
     << "    if (dim_size > 0u) {\n"
     << "      let coord = slice_rem % dim_size;\n"
     << "      out_offset += i32(coord) * get_out_stride(d);\n"
@@ -453,9 +494,9 @@ struct ScatterAxisParams {
   uint32_t ndim_no_axis;
   uint32_t total_size;
   int32_t out_axis_stride; // populated from out.strides()[axis]
-  uint32_t _pad0;
-  uint32_t _pad1;
-  uint32_t _pad2;
+  uint32_t upd_offset;
+  uint32_t idx_offset;
+  uint32_t out_offset;
 };
 
 std::string make_scatter_axis_kernel(
@@ -478,30 +519,30 @@ std::string make_scatter_axis_kernel(
     << "  ndim_no_axis: u32,\n"
     << "  total_size: u32,\n"
     << "  out_axis_stride: i32,\n"
-    << "  _pad0: u32,\n"
-    << "  _pad1: u32,\n"
-    << "  _pad2: u32,\n"
+    << "  upd_offset: u32,\n"
+    << "  idx_offset: u32,\n"
+    << "  out_offset: u32,\n"
     << "}\n\n";
 
-  s << "@group(0) @binding(0) var<storage, read> upd: array<"
-    << val_type << ">;\n"
-    << "@group(0) @binding(1) var<storage, read> idx: array<"
-    << idx_type << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<"
-    << val_type << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read> upd: array<" << val_type
+    << ">;\n"
+    << "@group(0) @binding(1) var<storage, read> idx: array<" << idx_type
+    << ">;\n"
+    << "@group(0) @binding(2) var<storage, read_write> out: array<" << val_type
+    << ">;\n"
     << "@group(0) @binding(3) var<uniform> params: ScatterAxisParams;\n"
     << "@group(0) @binding(4) var<storage, read> metadata: array<i32>;\n\n";
 
   // Metadata: shape_no_axis[ndim_no_axis], upd_strides_no_axis[ndim_no_axis],
-  //           idx_strides_no_axis[ndim_no_axis], out_strides_no_axis[ndim_no_axis]
+  //           idx_strides_no_axis[ndim_no_axis],
+  //           out_strides_no_axis[ndim_no_axis]
   s << "fn get_shape_na(i: u32) -> u32 { return u32(metadata[i]); }\n"
     << "fn get_upd_stride_na(i: u32) -> i32 { return metadata[params.ndim_no_axis + i]; }\n"
     << "fn get_idx_stride_na(i: u32) -> i32 { return metadata[2u * params.ndim_no_axis + i]; }\n"
     << "fn get_out_stride_na(i: u32) -> i32 { return metadata[3u * params.ndim_no_axis + i]; }\n\n";
 
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
     << "  let flat = gid.x;\n"
     << "  if (flat >= params.total_size) { return; }\n"
     << "\n"
@@ -513,9 +554,9 @@ std::string make_scatter_axis_kernel(
     << "  let post = rem % params.idx_size_post;\n"
     << "\n"
     << "  // Compute upd, idx, and out locations for non-axis dims\n"
-    << "  var upd_loc: i32 = 0;\n"
-    << "  var idx_loc: i32 = 0;\n"
-    << "  var out_loc: i32 = 0;\n"
+    << "  var upd_loc: i32 = i32(params.upd_offset);\n"
+    << "  var idx_loc: i32 = i32(params.idx_offset);\n"
+    << "  var out_loc: i32 = i32(params.out_offset);\n"
     << "  var combined = pre * params.idx_size_post + post;\n"
     << "  for (var d: u32 = params.ndim_no_axis - 1u; d < params.ndim_no_axis; d = d - 1u) {\n"
     << "    let dim_size = get_shape_na(d);\n"
@@ -572,8 +613,9 @@ std::vector<int32_t> build_gather_metadata(
   }
   // slice_sizes
   for (int i = 0; i < src.ndim(); ++i) {
-    meta.push_back(static_cast<int32_t>(
-        i < static_cast<int>(slice_sizes.size()) ? slice_sizes[i] : 1));
+    meta.push_back(
+        static_cast<int32_t>(
+            i < static_cast<int>(slice_sizes.size()) ? slice_sizes[i] : 1));
   }
   // axes
   for (int i = 0; i < nidx; ++i) {
@@ -588,6 +630,10 @@ std::vector<int32_t> build_gather_metadata(
     for (int d = 0; d < idx_ndim; ++d) {
       meta.push_back(static_cast<int32_t>(idx_arr.strides()[d]));
     }
+  }
+  for (int i = 0; i < nidx; ++i) {
+    meta.push_back(
+        static_cast<int32_t>(shader_elem_offset(inputs[i + 1], "Gather")));
   }
 
   return meta;
@@ -633,6 +679,10 @@ std::vector<int32_t> build_scatter_metadata(
       meta.push_back(static_cast<int32_t>(idx_arr.strides()[d]));
     }
   }
+  for (int i = 0; i < nidx; ++i) {
+    meta.push_back(
+        static_cast<int32_t>(shader_elem_offset(inputs[i + 1], "Scatter")));
+  }
 
   return meta;
 }
@@ -648,6 +698,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   assert(inputs.size() > 0);
   const auto& src = inputs[0];
+  reject_packed_bf16_indexing(src, "Gather");
 
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   if (out.size() == 0) {
@@ -664,18 +715,18 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       std::multiplies<uint32_t>());
 
   const char* val_type = wgpu::dtype_to_wgsl(out.dtype());
-  const char* idx_type = nidx > 0 ? wgpu::dtype_to_wgsl(inputs[1].dtype()) : "i32";
+  const char* idx_type =
+      nidx > 0 ? wgpu::dtype_to_wgsl(inputs[1].dtype()) : "i32";
 
-  std::string entry_name = std::string("gather_") + val_type + "_" +
-      idx_type + "_n" + std::to_string(nidx);
+  std::string entry_name = std::string("gather_") + val_type + "_" + idx_type +
+      "_n" + std::to_string(nidx) + "_src" + std::to_string(src.ndim()) +
+      "_idx" + std::to_string(idx_ndim);
 
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_gather_kernel(
-            entry_name, val_type, idx_type, nidx, src.ndim(), idx_ndim);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_gather_kernel(
+        entry_name, val_type, idx_type, nidx, src.ndim(), idx_ndim);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -691,20 +742,22 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.src_ndim = static_cast<uint32_t>(src.ndim());
   params.nidx = static_cast<uint32_t>(nidx);
   params.idx_ndim = static_cast<uint32_t>(idx_ndim);
+  params.src_offset = shader_elem_offset(src, "Gather");
+  params.out_offset = shader_elem_offset(out, "Gather");
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
       pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(GatherParams));
 
   // Build metadata
-  auto meta = build_gather_metadata(
-      src, inputs, axes_, slice_sizes_, nidx, idx_ndim);
+  auto meta =
+      build_gather_metadata(src, inputs, axes_, slice_sizes_, nidx, idx_ndim);
   // Ensure at least 4 bytes for the storage buffer
   if (meta.empty()) {
     meta.push_back(0);
   }
-  WGPUBuffer meta_buf = wgpu::create_storage_buffer(
-      meta.data(), meta.size() * sizeof(int32_t));
+  WGPUBuffer meta_buf =
+      wgpu::create_storage_buffer(meta.data(), meta.size() * sizeof(int32_t));
 
   // Build bind group entries
   std::vector<std::pair<WGPUBuffer, uint64_t>> bind_entries;
@@ -714,8 +767,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back({src_buf, wgpu::wgpu_bind_size(src)});
   bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(GatherParams)});
-  bind_entries.push_back(
-      {meta_buf, meta.size() * sizeof(int32_t)});
+  bind_entries.push_back({meta_buf, meta.size() * sizeof(int32_t)});
 
   for (int i = 0; i < nidx; ++i) {
     WGPUBuffer idx_buf = wgpu::wgpu_buffer(inputs[i + 1]);
@@ -729,11 +781,11 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
+  encoder.add_completed_handler([uniform_buf, meta_buf]() {
     wgpu::device().uniform_pool().release(uniform_buf);
+    wgpuBufferDestroy(meta_buf);
+    wgpuBufferRelease(meta_buf);
   });
-  wgpuBufferDestroy(meta_buf);
-  wgpuBufferRelease(meta_buf);
 }
 
 // ===========================================================================
@@ -746,6 +798,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 2);
   const auto& src = inputs[0];
   const auto& idx = inputs[1];
+  reject_packed_bf16_indexing(src, "GatherAxis");
 
   out.set_data(allocator::malloc(wgpu::wgpu_alloc_size(out)));
   if (out.size() == 0) {
@@ -759,11 +812,9 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
       std::string("gather_axis_") + val_type + "_" + idx_type;
 
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_gather_axis_kernel(entry_name, val_type, idx_type);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_gather_axis_kernel(entry_name, val_type, idx_type);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -791,10 +842,13 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.idx_axis_stride = static_cast<int32_t>(idx.strides()[axis_]);
   params.ndim_no_axis = static_cast<uint32_t>(src.ndim() - 1);
   params.total_size = static_cast<uint32_t>(idx.size());
+  params.src_offset = shader_elem_offset(src, "GatherAxis");
+  params.idx_offset = shader_elem_offset(idx, "GatherAxis");
+  params.out_offset = shader_elem_offset(out, "GatherAxis");
 
   auto& pool = wgpu::device().uniform_pool();
-  WGPUBuffer uniform_buf =
-      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(GatherAxisParams));
+  WGPUBuffer uniform_buf = pool.acquire(
+      wgpu::device().gpu_queue(), &params, sizeof(GatherAxisParams));
 
   // Build metadata: shape_no_axis, src_strides_no_axis, idx_strides_no_axis
   std::vector<int32_t> meta;
@@ -817,8 +871,8 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
     meta.push_back(0);
   }
 
-  WGPUBuffer meta_buf = wgpu::create_storage_buffer(
-      meta.data(), meta.size() * sizeof(int32_t));
+  WGPUBuffer meta_buf =
+      wgpu::create_storage_buffer(meta.data(), meta.size() * sizeof(int32_t));
 
   WGPUBuffer src_buf = wgpu::wgpu_buffer(src);
   WGPUBuffer idx_buf = wgpu::wgpu_buffer(idx);
@@ -829,8 +883,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(idx)});
   bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(GatherAxisParams)});
-  bind_entries.push_back(
-      {meta_buf, meta.size() * sizeof(int32_t)});
+  bind_entries.push_back({meta_buf, meta.size() * sizeof(int32_t)});
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
@@ -839,11 +892,11 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
+  encoder.add_completed_handler([uniform_buf, meta_buf]() {
     wgpu::device().uniform_pool().release(uniform_buf);
+    wgpuBufferDestroy(meta_buf);
+    wgpuBufferRelease(meta_buf);
   });
-  wgpuBufferDestroy(meta_buf);
-  wgpuBufferRelease(meta_buf);
 }
 
 // ===========================================================================
@@ -854,10 +907,13 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
 
   assert(inputs.size() > 1);
+  const auto& src = inputs[0];
   const auto& upd = inputs.back();
+  reject_packed_bf16_indexing(src, "Scatter");
+  reject_packed_bf16_indexing(upd, "Scatter");
 
   // Copy src into out first
-  copy_gpu(inputs[0], out, infer_copy_type(inputs[0]), s);
+  copy_gpu(src, out, infer_copy_type(src), s);
 
   // Empty update -- done
   if (upd.size() == 0) {
@@ -874,18 +930,16 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
       std::multiplies<int32_t>());
 
   const char* val_type = wgpu::dtype_to_wgsl(out.dtype());
-  const char* idx_type = nidx > 0 ? wgpu::dtype_to_wgsl(inputs[1].dtype()) : "i32";
+  const char* idx_type =
+      nidx > 0 ? wgpu::dtype_to_wgsl(inputs[1].dtype()) : "i32";
 
-  std::string entry_name = std::string("scatter_") + val_type + "_" +
-      idx_type + "_n" + std::to_string(nidx);
+  std::string entry_name = std::string("scatter_") + val_type + "_" + idx_type +
+      "_n" + std::to_string(nidx);
 
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_scatter_kernel(
-            entry_name, val_type, idx_type, nidx);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_scatter_kernel(entry_name, val_type, idx_type, nidx);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -902,18 +956,19 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   params.nidx = static_cast<uint32_t>(nidx);
   params.idx_ndim = static_cast<uint32_t>(idx_ndim);
   params.upd_ndim = static_cast<uint32_t>(upd.ndim());
+  params.upd_offset = shader_elem_offset(upd, "Scatter");
+  params.out_offset = shader_elem_offset(out, "Scatter");
 
   auto& pool = wgpu::device().uniform_pool();
   WGPUBuffer uniform_buf =
       pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ScatterParams));
 
-  auto meta = build_scatter_metadata(
-      upd, out, inputs, axes_, nidx, idx_ndim);
+  auto meta = build_scatter_metadata(upd, out, inputs, axes_, nidx, idx_ndim);
   if (meta.empty()) {
     meta.push_back(0);
   }
-  WGPUBuffer meta_buf = wgpu::create_storage_buffer(
-      meta.data(), meta.size() * sizeof(int32_t));
+  WGPUBuffer meta_buf =
+      wgpu::create_storage_buffer(meta.data(), meta.size() * sizeof(int32_t));
 
   // Build bind group
   std::vector<std::pair<WGPUBuffer, uint64_t>> bind_entries;
@@ -923,8 +978,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back({upd_buf, wgpu::wgpu_bind_size(upd)});
   bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(ScatterParams)});
-  bind_entries.push_back(
-      {meta_buf, meta.size() * sizeof(int32_t)});
+  bind_entries.push_back({meta_buf, meta.size() * sizeof(int32_t)});
 
   for (int i = 0; i < nidx; ++i) {
     WGPUBuffer idx_buf = wgpu::wgpu_buffer(inputs[i + 1]);
@@ -938,11 +992,11 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
+  encoder.add_completed_handler([uniform_buf, meta_buf]() {
     wgpu::device().uniform_pool().release(uniform_buf);
+    wgpuBufferDestroy(meta_buf);
+    wgpuBufferRelease(meta_buf);
   });
-  wgpuBufferDestroy(meta_buf);
-  wgpuBufferRelease(meta_buf);
 }
 
 // ===========================================================================
@@ -956,6 +1010,8 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   const auto& src = inputs[0];
   const auto& idx = inputs[1];
   const auto& upd = inputs[2];
+  reject_packed_bf16_indexing(src, "ScatterAxis");
+  reject_packed_bf16_indexing(upd, "ScatterAxis");
 
   // Copy src into out first
   copy_gpu(src, out, infer_copy_type(src), s);
@@ -972,11 +1028,9 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
       std::string("scatter_axis_") + val_type + "_" + idx_type;
 
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() {
-        return make_scatter_axis_kernel(entry_name, val_type, idx_type);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_scatter_axis_kernel(entry_name, val_type, idx_type);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -1008,10 +1062,13 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   // equals idx_size_post (the previous hardcoded value), but for other
   // layouts it must come from out.strides()[axis] to scatter correctly.
   params.out_axis_stride = static_cast<int32_t>(out.strides()[axis_]);
+  params.upd_offset = shader_elem_offset(upd, "ScatterAxis");
+  params.idx_offset = shader_elem_offset(idx, "ScatterAxis");
+  params.out_offset = shader_elem_offset(out, "ScatterAxis");
 
   auto& pool = wgpu::device().uniform_pool();
-  WGPUBuffer uniform_buf =
-      pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ScatterAxisParams));
+  WGPUBuffer uniform_buf = pool.acquire(
+      wgpu::device().gpu_queue(), &params, sizeof(ScatterAxisParams));
 
   // Build metadata: shape_no_axis, upd_strides_no_axis,
   //                 idx_strides_no_axis, out_strides_no_axis
@@ -1040,8 +1097,8 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
     meta.push_back(0);
   }
 
-  WGPUBuffer meta_buf = wgpu::create_storage_buffer(
-      meta.data(), meta.size() * sizeof(int32_t));
+  WGPUBuffer meta_buf =
+      wgpu::create_storage_buffer(meta.data(), meta.size() * sizeof(int32_t));
 
   WGPUBuffer upd_buf = wgpu::wgpu_buffer(upd);
   WGPUBuffer idx_buf = wgpu::wgpu_buffer(idx);
@@ -1052,8 +1109,7 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   bind_entries.push_back({idx_buf, wgpu::wgpu_bind_size(idx)});
   bind_entries.push_back({out_buf, wgpu::wgpu_bind_size(out)});
   bind_entries.push_back({uniform_buf, sizeof(ScatterAxisParams)});
-  bind_entries.push_back(
-      {meta_buf, meta.size() * sizeof(int32_t)});
+  bind_entries.push_back({meta_buf, meta.size() * sizeof(int32_t)});
 
   WGPUBindGroup bg = wgpu::create_bind_group(pe.layout, bind_entries);
 
@@ -1062,11 +1118,11 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
+  encoder.add_completed_handler([uniform_buf, meta_buf]() {
     wgpu::device().uniform_pool().release(uniform_buf);
+    wgpuBufferDestroy(meta_buf);
+    wgpuBufferRelease(meta_buf);
   });
-  wgpuBufferDestroy(meta_buf);
-  wgpuBufferRelease(meta_buf);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

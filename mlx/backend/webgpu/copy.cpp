@@ -9,6 +9,7 @@
 #include "gen/wgsl_sources.h"
 
 #include <cassert>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -44,6 +45,44 @@ WGPUShaderModule get_copy_shader_module() {
   return dev.get_or_create_shader_module(
       "copy_kernels",
       []() { return std::string(wgpu::kernels::copy()); });
+}
+
+int64_t dynamic_offset_value(
+    const std::optional<array>& offset,
+    const Stream& s) {
+  if (!offset.has_value()) {
+    return 0;
+  }
+
+  // Dynamic slice offsets are tiny scalar tensors. WebGPU computes them via a
+  // CPU fallback in slicing.cpp; read the scalar here and fold it into the
+  // static element offset before dispatching the copy shader.
+  wgpu::get_command_encoder(s).synchronize();
+
+  const array& arr = *offset;
+  if (arr.size() == 0) {
+    return 0;
+  }
+
+  switch (arr.dtype().val()) {
+    case Dtype::Val::int32:
+      return static_cast<int64_t>(arr.data<int32_t>()[0]);
+    case Dtype::Val::uint32:
+      return static_cast<int64_t>(arr.data<uint32_t>()[0]);
+    case Dtype::Val::int64:
+      return arr.data<int64_t>()[0];
+    case Dtype::Val::uint64: {
+      auto v = arr.data<uint64_t>()[0];
+      if (v > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::runtime_error(
+            "[WebGPU] dynamic copy offset exceeds int64 range");
+      }
+      return static_cast<int64_t>(v);
+    }
+    default:
+      throw std::runtime_error(
+          "[WebGPU] dynamic copy offset must be an integer scalar");
+  }
 }
 
 // Map CopyType to the WGSL entry point name.
@@ -196,6 +235,11 @@ void copy_gpu(const array& in, array& out, CopyType ctype, const Stream& s) {
   // output (e.g. AsType with same-sized types). The copy dispatch would then
   // bind the same buffer as both read-only and read-write, which WebGPU forbids.
   wgpu::ensure_no_alias(out, in);
+  // set_copy_output_data is shared with CPU/Metal/CUDA and allocates using
+  // logical CPU itemsize. WebGPU stores bf16/bool as 32-bit lanes, so size the
+  // physical output before the copy kernel writes it. Without this, a later
+  // wgpu_buffer(out) call would resize a GPU-only output and drop data.
+  wgpu::ensure_wgpu_size(out);
   if (ctype == CopyType::GeneralGeneral) {
     ctype = CopyType::General;
   }
@@ -217,6 +261,11 @@ void copy_gpu_inplace(
   if (out.size() == 0) {
     return;
   }
+
+  wgpu::ensure_wgpu_size(out);
+
+  i_offset += dynamic_offset_value(dynamic_i_offset, s);
+  o_offset += dynamic_offset_value(dynamic_o_offset, s);
 
   auto& encoder = wgpu::get_command_encoder(s);
   encoder.set_input_array(in);

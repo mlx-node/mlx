@@ -6,8 +6,9 @@
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
 
-#include <cstring>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 
 namespace mlx::core {
 
@@ -91,12 +92,7 @@ array compute_dynamic_offset(
 
   auto& encoder = wgpu::get_command_encoder(s);
 
-  // Prepare output array for a single int64 offset value.
-  array offset({1}, int64, nullptr, {});
-  offset.set_data(allocator::malloc(offset.itemsize()));
-  encoder.add_temporary(offset);
   encoder.set_input_array(indices);
-  encoder.set_output_array(offset);
 
   // Synchronize to ensure indices are available for CPU readback.
   encoder.synchronize();
@@ -136,33 +132,23 @@ array compute_dynamic_offset(
     }
   }
 
-  // Write the computed offset into the GPU buffer via a staging buffer.
-  auto& dev = wgpu::device();
-
-  WGPUBufferDescriptor buf_desc = {};
-  buf_desc.size = sizeof(int64_t);
-  buf_desc.usage = WGPUBufferUsage_CopySrc;
-  buf_desc.mappedAtCreation = true;
-
-  WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.gpu_device(), &buf_desc);
-  if (staging) {
-    void* mapped = wgpuBufferGetMappedRange(staging, 0, sizeof(int64_t));
-    std::memcpy(mapped, &acc, sizeof(int64_t));
-    wgpuBufferUnmap(staging);
-
-    WGPUCommandEncoderDescriptor enc_desc = {};
-    WGPUCommandEncoder cmd_enc =
-        wgpuDeviceCreateCommandEncoder(dev.gpu_device(), &enc_desc);
-    WGPUBuffer dst_buf = wgpu::wgpu_buffer(offset);
-    wgpuCommandEncoderCopyBufferToBuffer(
-        cmd_enc, staging, 0, dst_buf, 0, sizeof(int64_t));
-    WGPUCommandBuffer cmd_buf = wgpuCommandEncoderFinish(cmd_enc, nullptr);
-    wgpuQueueSubmit(dev.gpu_queue(), 1, &cmd_buf);
-    wgpuCommandBufferRelease(cmd_buf);
-    wgpuCommandEncoderRelease(cmd_enc);
-    wgpuBufferDestroy(staging);
-    wgpuBufferRelease(staging);
+  if (acc < 0 ||
+      acc > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::runtime_error(
+        "[WebGPU] dynamic slice offset exceeds WebGPU i32 range");
   }
+  int32_t acc32 = static_cast<int32_t>(acc);
+
+  // Return a single int32 offset value. WebGPU copy kernels index storage
+  // buffers with 32-bit element offsets, and copy.cpp reads this scalar back
+  // before folding it into the static copy offset.
+  array offset({1}, int32, nullptr, {});
+  offset.set_data(allocator::malloc(wgpu::wgpu_alloc_size(offset)));
+
+  auto& dev = wgpu::device();
+  WGPUBuffer dst_buf = wgpu::wgpu_buffer(offset);
+  wgpuQueueWriteBuffer(
+      dev.gpu_queue(), dst_buf, 0, &acc32, sizeof(acc32));
 
   return offset;
 }
