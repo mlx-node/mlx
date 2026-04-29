@@ -162,6 +162,7 @@ std::string make_contiguous_scan_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct ScanParams {\n"
     << "  data: vec4<u32>,\n"   // [n_rows, axis_size, stride, ndim]
@@ -180,8 +181,10 @@ std::string make_contiguous_scan_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let row = gid.x;\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let row = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let n_rows = params.data.x;\n"
     << "  let axis_size = params.data.y;\n"
     << "  if (row >= n_rows) { return; }\n"
@@ -238,6 +241,7 @@ std::string make_strided_scan_kernel(
   s << "\n";
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct ScanParams {\n"
     << "  data: vec4<u32>,\n"   // [n_rows, axis_size, axis_stride, ndim]
@@ -290,8 +294,10 @@ std::string make_strided_scan_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let row = gid.x;\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let row = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let n_rows = params.data.x;\n"
     << "  let axis_size = params.data.y;\n"
     << "  let axis_stride = params.data.z;\n"
@@ -461,7 +467,8 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   uint32_t n_workgroups =
       (static_cast<uint32_t>(n_rows) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, n_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(n_workgroups, "[WebGPU scan]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

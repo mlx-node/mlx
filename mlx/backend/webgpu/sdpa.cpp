@@ -41,8 +41,10 @@
 // - Workgroup size: 128 threads. For D ≤ 128 each thread owns one output
 //   lane; for D = 256 each thread owns D_PER_THREAD = 2 lanes via a
 //   strided loop (tid, tid + 128).
-// - Single-pass: one workgroup per (batch * n_heads). Dispatch = (B*H, 1, 1).
-// - 2-pass: pass 1 dispatches (B*H*nblocks, 1, 1), pass 2 dispatches (B*H, 1, 1).
+// - Single-pass: one workgroup per (batch * n_heads), linearized across a
+//   2D dispatch to respect WebGPU's per-dimension workgroup limit.
+// - 2-pass: pass 1 dispatches B*H*nblocks logical workgroups, pass 2
+//   dispatches B*H logical workgroups, both linearized across 2D grids.
 // - Head dim D is baked into the WGSL source as a `const`, so loops over D
 //   unroll and the pipeline cache keys by (dtype, D, has_mask, subgroups).
 // - bf16 arrays arrive on the GPU already promoted to f32 (see
@@ -140,6 +142,7 @@ std::string make_sdpa_vector_kernel(
   s << "const WORKGROUP_SIZE: u32 = " << SDPA_WORKGROUP_SIZE << "u;\n";
   s << "const D: u32 = " << D << "u;\n";
   s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct SdpaParams {\n"
     << "  B: u32,\n"
@@ -197,9 +200,11 @@ std::string make_sdpa_vector_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let tid = lid.x;\n"
-    << "  let wg = wg_id.x;\n"
+    << "  let wg = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (wg >= params.B * params.H) { return; }\n"
     << "  let H = params.H;\n"
     << "  let H_kv = params.H_kv;\n"
     << "  let L = params.L;\n"
@@ -439,6 +444,7 @@ std::string make_sdpa_vector_2pass_1_kernel(
   s << "const D: u32 = " << D << "u;\n";
   s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n";
   s << "const BLOCK_L: u32 = " << SDPA_BLOCK_L << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct SdpaParams {\n"
     << "  B: u32,\n"
@@ -491,15 +497,17 @@ std::string make_sdpa_vector_2pass_1_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let tid = lid.x;\n"
-    << "  let wg = wg_id.x;\n"
+    << "  let wg = linear_workgroup_id(wg_id, nwg);\n"
     << "  let H = params.H;\n"
     << "  let H_kv = params.H_kv;\n"
     << "  let L = params.L;\n"
     << "  let gqa = params.gqa_factor;\n"
     << "  let scale = params.scale;\n"
     << "  let nblocks = params.nblocks;\n"
+    << "  if (wg >= params.B * H * nblocks) { return; }\n"
     << "\n"
     << "  // Decompose wg into (bh, block_idx)\n"
     << "  let block_idx = wg % nblocks;\n"
@@ -673,6 +681,7 @@ std::string make_sdpa_vector_2pass_2_kernel(
   s << "const WORKGROUP_SIZE: u32 = " << SDPA_WORKGROUP_SIZE << "u;\n";
   s << "const D: u32 = " << D << "u;\n";
   s << "const D_PER_THREAD: u32 = " << d_per_thread << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct SdpaParams {\n"
     << "  B: u32,\n"
@@ -716,10 +725,12 @@ std::string make_sdpa_vector_2pass_2_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let tid = lid.x;\n"
-    << "  let bh = wg_id.x;\n"
+    << "  let bh = linear_workgroup_id(wg_id, nwg);\n"
     << "  let H = params.H;\n"
+    << "  if (bh >= params.B * H) { return; }\n"
     << "  let nblocks = params.nblocks;\n"
     << "  let b = bh / H;\n"
     << "  let h = bh % H;\n"
@@ -1469,7 +1480,8 @@ void ScaledDotProductAttention::eval_gpu(
         encoder.set_input_array(*mask_c_opt);
       }
       encoder.set_output_array(out);
-      encoder.dispatch_compute(pe.pipeline, bg, B * H, 1u, 1u);
+      auto [wg_x, wg_y] = wgpu::get_2d_grid(B * H, "[WebGPU sdpa_vector]");
+      encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y, 1u);
 
       wgpuBindGroupRelease(bg);
       encoder.add_completed_handler([uniform_buf]() {
@@ -1563,8 +1575,10 @@ void ScaledDotProductAttention::eval_gpu(
       encoder.set_output_array(inter_o);
       encoder.set_output_array(inter_maxs);
       encoder.set_output_array(inter_sums);
+      auto [p1_wg_x, p1_wg_y] =
+          wgpu::get_2d_grid(BH * nblocks, "[WebGPU sdpa_vector_p1]");
       encoder.dispatch_compute(
-          p1_pe.pipeline, p1_bg_obj, BH * nblocks, 1u, 1u);
+          p1_pe.pipeline, p1_bg_obj, p1_wg_x, p1_wg_y, 1u);
       wgpuBindGroupRelease(p1_bg_obj);
 
       // ---- Pass 2: merge partials and write final output ----
@@ -1597,7 +1611,9 @@ void ScaledDotProductAttention::eval_gpu(
       encoder.set_input_array(inter_maxs);
       encoder.set_input_array(inter_sums);
       encoder.set_output_array(out);
-      encoder.dispatch_compute(p2_pe.pipeline, p2_bg_obj, BH, 1u, 1u);
+      auto [p2_wg_x, p2_wg_y] =
+          wgpu::get_2d_grid(BH, "[WebGPU sdpa_vector_p2]");
+      encoder.dispatch_compute(p2_pe.pipeline, p2_bg_obj, p2_wg_x, p2_wg_y, 1u);
       wgpuBindGroupRelease(p2_bg_obj);
 
       encoder.add_completed_handler([uniform_buf]() {

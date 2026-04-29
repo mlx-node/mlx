@@ -215,6 +215,7 @@ std::string make_all_reduce_kernel(
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
   s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct AllReduceParams {\n"
     << "  data: vec4<u32>,\n"
@@ -245,9 +246,12 @@ std::string make_all_reduce_kernel(
     << "  let input_size = params.data.x;\n"
     << "  let input_offset = params.data.y;\n"
     << "  let output_offset = params.data.z;\n"
+    << "  let logical_workgroups = params.data.w;\n"
     << "  let tid = lid.x;\n"
-    << "  let total_threads = nwg.x * WORKGROUP_SIZE;\n"
-    << "  let global_tid = wg_id.x * WORKGROUP_SIZE + tid;\n"
+    << "  let wg_linear = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (wg_linear >= logical_workgroups) { return; }\n"
+    << "  let total_threads = logical_workgroups * WORKGROUP_SIZE;\n"
+    << "  let global_tid = wg_linear * WORKGROUP_SIZE + tid;\n"
     << "\n"
     << "  // Each thread accumulates multiple elements with strided access\n"
     << "  var acc: " << acc_type << " = " << identity << ";\n"
@@ -274,7 +278,7 @@ std::string make_all_reduce_kernel(
   s << "\n"
     << "  // Thread 0 writes the workgroup result\n"
     << "  if (tid == 0u) {\n"
-    << "    output[output_offset + wg_id.x] = " << out_type << "(shared_data[0]);\n"
+    << "    output[output_offset + wg_linear] = " << out_type << "(shared_data[0]);\n"
     << "  }\n"
     << "}\n";
 
@@ -323,6 +327,7 @@ std::string make_row_reduce_kernel(
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
   s << "const N_READS: u32 = " << wgpu::N_READS << "u;\n\n";
+  s << wgpu::wgsl_linear_workgroup_id();
 
   s << "struct RowReduceParams {\n"
     << "  row_size_num_rows: vec4<u32>,\n"
@@ -398,10 +403,13 @@ std::string make_row_reduce_kernel(
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
     << "(@builtin(local_invocation_id) lid: vec3u,\n"
-    << " @builtin(workgroup_id) wg_id: vec3u) {\n"
+    << " @builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let row_size = params.row_size_num_rows.x;\n"
+    << "  let num_rows = params.row_size_num_rows.y;\n"
     << "  let tid = lid.x;\n"
-    << "  let out_idx = wg_id.x;\n"
+    << "  let out_idx = linear_workgroup_id(wg_id, nwg);\n"
+    << "  if (out_idx >= num_rows) { return; }\n"
     << "\n";
 
   if (general) {
@@ -489,6 +497,7 @@ std::string make_col_reduce_kernel(
   }
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct ColReduceParams {\n"
     << "  data: vec4<u32>,\n"
@@ -559,7 +568,9 @@ std::string make_col_reduce_kernel(
   // Each thread handles one output element, loops over the reduction axis.
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let reduction_size = params.data.x;\n"
     << "  let reduction_stride = params.data.y;\n"
     << "  let ndim = params.data.z;\n"
@@ -567,7 +578,7 @@ std::string make_col_reduce_kernel(
     << "  let non_col_reductions = params.extra.x;\n"
     << "  let out_size = params.extra.y;\n"
     << "\n"
-    << "  let out_idx = gid.x;\n"
+    << "  let out_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (out_idx >= out_size) { return; }\n"
     << "\n"
     << "  let column = out_idx % reduction_stride;\n"
@@ -610,6 +621,7 @@ std::string make_init_reduce_kernel(
   }
 
   s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct InitParams {\n"
     << "  data: vec4<u32>,\n" // [size, pad, pad, pad]
@@ -625,8 +637,10 @@ std::string make_init_reduce_kernel(
 
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
     << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let idx = gid.x;\n"
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  let size = params.data.x;\n"
     << "  if (idx >= size) { return; }\n"
     << "  output[idx] = " << out_type << "(" << identity << ");\n"
@@ -689,7 +703,9 @@ void gpu_init_reduce(
   uint32_t num_workgroups =
       (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU init_reduce]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
@@ -760,6 +776,7 @@ void gpu_all_reduce(
     params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
     params.data[2] =
         static_cast<uint32_t>(intermediate.offset() / intermediate.itemsize());
+    params.data[3] = num_workgroups;
     WGPUBuffer uniform_buf =
         pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
@@ -774,7 +791,9 @@ void gpu_all_reduce(
          {inter_buf, inter_buf_size},
          {uniform_buf, sizeof(AllReduceParams)}});
 
-    encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+    auto [wg_x, wg_y] =
+        wgpu::get_2d_grid(num_workgroups, "[WebGPU all_reduce]");
+    encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
     wgpuBindGroupRelease(bg);
     encoder.add_completed_handler([uniform_buf]() {
       wgpu::device().uniform_pool().release(uniform_buf);
@@ -802,6 +821,7 @@ void gpu_all_reduce(
     params2.data[1] =
         static_cast<uint32_t>(intermediate.offset() / intermediate.itemsize());
     params2.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
+    params2.data[3] = 1;
     WGPUBuffer uniform_buf2 =
         pool.acquire(wgpu::device().gpu_queue(), &params2, sizeof(AllReduceParams));
 
@@ -827,6 +847,7 @@ void gpu_all_reduce(
     params.data[0] = input_size;
     params.data[1] = static_cast<uint32_t>(in.offset() / in.itemsize());
     params.data[2] = static_cast<uint32_t>(out.offset() / out.itemsize());
+    params.data[3] = 1;
     WGPUBuffer uniform_buf =
         pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(AllReduceParams));
 
@@ -965,7 +986,9 @@ void gpu_row_reduce(
 
   // One workgroup per output row
   uint32_t num_workgroups = static_cast<uint32_t>(out.size());
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU row_reduce]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {
@@ -1090,7 +1113,9 @@ void gpu_col_reduce(
   uint32_t num_workgroups =
       (static_cast<uint32_t>(out.size()) + wgpu::WORKGROUP_SIZE - 1) /
       wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU col_reduce]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf]() {

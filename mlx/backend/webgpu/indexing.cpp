@@ -90,6 +90,9 @@ std::string make_gather_kernel(
     s << "enable f16;\n\n";
   }
 
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
+
   s << "struct GatherParams {\n"
     << "  out_size: u32,\n"
     << "  slice_size: u32,\n"
@@ -167,9 +170,12 @@ std::string make_gather_kernel(
   }
   s << "\n";
 
-  s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let out_idx = gid.x;\n"
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let out_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (out_idx >= params.out_size) { return; }\n"
     << "\n"
     << "  let idx_part = out_idx / params.slice_size;\n"
@@ -243,6 +249,9 @@ std::string make_gather_axis_kernel(
     s << "enable f16;\n\n";
   }
 
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
+
   s << "struct GatherAxisParams {\n"
     << "  idx_size_pre: u32,\n"
     << "  idx_size_axis: u32,\n"
@@ -273,9 +282,12 @@ std::string make_gather_axis_kernel(
     << "fn get_src_stride_na(i: u32) -> i32 { return metadata[params.ndim_no_axis + i]; }\n"
     << "fn get_idx_stride_na(i: u32) -> i32 { return metadata[2u * params.ndim_no_axis + i]; }\n\n";
 
-  s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let flat = gid.x;\n"
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let flat = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (flat >= params.total_size) { return; }\n"
     << "\n"
     << "  // Decompose flat index into (pre, axis, post)\n"
@@ -347,6 +359,9 @@ std::string make_scatter_kernel(
   if (val_type == "f16") {
     s << "enable f16;\n\n";
   }
+
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
 
   s << "struct ScatterParams {\n"
     << "  upd_size: u32,\n"
@@ -433,9 +448,12 @@ std::string make_scatter_kernel(
     << "  return u32(loc);\n"
     << "}\n\n";
 
-  s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let upd_idx = gid.x;\n"
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let upd_idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (upd_idx >= params.upd_size) { return; }\n"
     << "\n"
     << "  // Read the update value\n"
@@ -509,6 +527,9 @@ std::string make_scatter_axis_kernel(
     s << "enable f16;\n\n";
   }
 
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n\n";
+  s << wgpu::wgsl_linear_thread_id();
+
   s << "struct ScatterAxisParams {\n"
     << "  idx_size_pre: u32,\n"
     << "  idx_size_axis: u32,\n"
@@ -541,9 +562,12 @@ std::string make_scatter_axis_kernel(
     << "fn get_idx_stride_na(i: u32) -> i32 { return metadata[2u * params.ndim_no_axis + i]; }\n"
     << "fn get_out_stride_na(i: u32) -> i32 { return metadata[3u * params.ndim_no_axis + i]; }\n\n";
 
-  s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let flat = gid.x;\n"
+  s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
+    << "fn " << entry_name
+    << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let flat = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (flat >= params.total_size) { return; }\n"
     << "\n"
     << "  // Decompose flat index into (pre, axis, post)\n"
@@ -778,7 +802,8 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (params.out_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU gather]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf, meta_buf]() {
@@ -889,7 +914,9 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (params.total_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU gather_axis]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf, meta_buf]() {
@@ -989,7 +1016,8 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (params.upd_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU scatter]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf, meta_buf]() {
@@ -1115,7 +1143,9 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   uint32_t num_workgroups =
       (params.total_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] =
+      wgpu::get_2d_grid(num_workgroups, "[WebGPU scatter_axis]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf, meta_buf]() {
