@@ -138,8 +138,9 @@ std::string format_constant_for_wgsl(
     }
     default:
       throw std::runtime_error(
-          std::string("[WebGPU compiled] unsupported constant dtype for "
-                      "inlining in fused kernel (dtype=") +
+          std::string(
+              "[WebGPU compiled] unsupported constant dtype for "
+              "inlining in fused kernel (dtype=") +
           std::to_string(static_cast<int>(x.dtype().val())) + ")");
   }
 }
@@ -159,8 +160,9 @@ std::string build_tape_expression(
   if (is_static_cast(prim)) {
     if (in_tmps.size() != 1) {
       throw std::runtime_error(
-          std::string("[WebGPU compiled] static cast primitive with != 1 "
-                      "inputs in kernel ") +
+          std::string(
+              "[WebGPU compiled] static cast primitive with != 1 "
+              "inputs in kernel ") +
           kernel_lib);
     }
     return out_type + "(" + in_tmps[0] + ")";
@@ -221,13 +223,15 @@ std::string build_compiled_kernel(
 
   // Determine whether we need the f16 extension.
   auto needs_f16 = [&](Dtype d) {
-    return d == float16 &&
-        std::string(wgpu::dtype_to_wgsl_safe(d)) == "f16";
+    return d == float16 && std::string(wgpu::dtype_to_wgsl_safe(d)) == "f16";
   };
   bool any_f16 = false;
-  for (auto& x : inputs) any_f16 = any_f16 || needs_f16(x.dtype());
-  for (auto& x : outputs) any_f16 = any_f16 || needs_f16(x.dtype());
-  for (auto& x : tape) any_f16 = any_f16 || needs_f16(x.dtype());
+  for (auto& x : inputs)
+    any_f16 = any_f16 || needs_f16(x.dtype());
+  for (auto& x : outputs)
+    any_f16 = any_f16 || needs_f16(x.dtype());
+  for (auto& x : tape)
+    any_f16 = any_f16 || needs_f16(x.dtype());
 
   if (any_f16) {
     s << "enable f16;\n\n";
@@ -251,20 +255,20 @@ std::string build_compiled_kernel(
   // strided) the strides storage buffer.
   uint32_t binding = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
-    if (is_constant(i)) continue;
+    if (is_constant(i))
+      continue;
     const auto& x = inputs[i];
     auto& xname = namer.get_name(x);
     const char* wgsl_type = wgpu::dtype_to_wgsl_safe(x.dtype());
-    s << "@group(0) @binding(" << binding++ << ") var<storage, read> "
-      << xname << ": array<" << wgsl_type << ">;\n";
+    s << "@group(0) @binding(" << binding++ << ") var<storage, read> " << xname
+      << ": array<" << wgsl_type << ">;\n";
   }
   for (size_t o = 0; o < outputs.size(); ++o) {
     const auto& x = outputs[o];
     auto& xname = namer.get_name(x);
     const char* wgsl_type = wgpu::dtype_to_wgsl_safe(x.dtype());
-    s << "@group(0) @binding(" << binding++
-      << ") var<storage, read_write> " << xname << ": array<" << wgsl_type
-      << ">;\n";
+    s << "@group(0) @binding(" << binding++ << ") var<storage, read_write> "
+      << xname << ": array<" << wgsl_type << ">;\n";
   }
   s << "@group(0) @binding(" << binding++
     << ") var<uniform> params: CompiledParams;\n";
@@ -298,12 +302,15 @@ std::string build_compiled_kernel(
       << "}\n\n";
   }
 
+  s << wgpu::wgsl_linear_thread_id();
+
   // Compute entry point.
   s << "@compute @workgroup_size(WORKGROUP_SIZE)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
     << "  let size = params.size_ndim.x;\n"
-    << "  let base = gid.x * N_READS;\n"
+    << "  let base = linear_thread_id(wg_id, lid, nwg) * N_READS;\n"
     << "  if (base >= size) { return; }\n"
     << "  let end = min(base + N_READS, size);\n";
 
@@ -315,7 +322,7 @@ std::string build_compiled_kernel(
   s << "  for (var i: u32 = base; i < end; i = i + 1u) {\n";
 
   // Read the inputs into tmp variables.
-  uint32_t in_offset_slot = 0;  // index into offsets[] array for inputs
+  uint32_t in_offset_slot = 0; // index into offsets[] array for inputs
   uint32_t stride_input_idx = 0; // index into strided input list
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& x = inputs[i];
@@ -376,17 +383,14 @@ std::string build_compiled_kernel(
     // single representative type is safe to feed to get_binary_op_expr.
     std::string in_type_hint = step_wgsl_type;
     for (const auto& inp : step.inputs()) {
-      if (inp.dtype() == bool_) continue;
+      if (inp.dtype() == bool_)
+        continue;
       in_type_hint = wgpu::dtype_to_wgsl_safe(inp.dtype());
       break;
     }
 
     std::string expr = build_tape_expression(
-        step.primitive(),
-        in_tmps,
-        in_type_hint,
-        step_wgsl_type,
-        kernel_lib);
+        step.primitive(), in_tmps, in_type_hint, step_wgsl_type, kernel_lib);
 
     s << "    let " << tmp_name << ": " << step_wgsl_type << " = " << expr
       << ";\n";
@@ -483,17 +487,16 @@ void Compiled::eval_gpu(
   std::string entry_name = kernel_lib_;
   entry_name += "_dt";
   for (size_t i = 0; i < inputs_.size(); ++i) {
-    if (is_constant_(i)) continue;
-    entry_name += "_i" +
-        std::to_string(static_cast<int>(inputs_[i].dtype().val()));
+    if (is_constant_(i))
+      continue;
+    entry_name +=
+        "_i" + std::to_string(static_cast<int>(inputs_[i].dtype().val()));
   }
   for (const auto& t : tape_) {
-    entry_name += "_t" +
-        std::to_string(static_cast<int>(t.dtype().val()));
+    entry_name += "_t" + std::to_string(static_cast<int>(t.dtype().val()));
   }
   for (const auto& o : outputs_) {
-    entry_name += "_o" +
-        std::to_string(static_cast<int>(o.dtype().val()));
+    entry_name += "_o" + std::to_string(static_cast<int>(o.dtype().val()));
   }
   if (contiguous) {
     entry_name += "_c";
@@ -502,18 +505,17 @@ void Compiled::eval_gpu(
   }
 
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name, [&]() {
-        return build_compiled_kernel(
-            entry_name,
-            inputs_,
-            outputs_,
-            tape_,
-            is_constant_,
-            contiguous,
-            ndim,
-            kernel_lib_);
-      });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return build_compiled_kernel(
+        entry_name,
+        inputs_,
+        outputs_,
+        tape_,
+        is_constant_,
+        contiguous,
+        ndim,
+        kernel_lib_);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   // Populate uniform buffer.
@@ -541,7 +543,8 @@ void Compiled::eval_gpu(
   // Populate per-input offsets.
   uint32_t in_slot = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
-    if (is_constant_(i)) continue;
+    if (is_constant_(i))
+      continue;
     const auto& x = inputs[i];
     params.offsets[in_slot++] =
         static_cast<uint32_t>(x.offset() / x.itemsize());
@@ -572,9 +575,11 @@ void Compiled::eval_gpu(
     // lock-step.
     size_t strides_idx = 1; // [0] is output
     for (size_t i = 0; i < inputs.size(); ++i) {
-      if (is_constant_(i)) continue;
+      if (is_constant_(i))
+        continue;
       const auto& x = inputs[i];
-      if (is_scalar(x)) continue;
+      if (is_scalar(x))
+        continue;
       // Pull the next strides row.
       if (strides_idx >= strides.size()) {
         throw std::runtime_error(
@@ -609,7 +614,8 @@ void Compiled::eval_gpu(
   bg_entries.reserve(num_binding_inputs + outputs.size() + 2);
 
   for (size_t i = 0; i < inputs.size(); ++i) {
-    if (is_constant_(i)) continue;
+    if (is_constant_(i))
+      continue;
     const auto& x = inputs[i];
     encoder.set_input_array(x);
     WGPUBuffer buf = wgpu::wgpu_buffer(x);
@@ -622,8 +628,7 @@ void Compiled::eval_gpu(
   }
   bg_entries.emplace_back(uniform_buf, sizeof(CompiledParams));
   if (strides_buf) {
-    bg_entries.emplace_back(
-        strides_buf, wgpuBufferGetSize(strides_buf));
+    bg_entries.emplace_back(strides_buf, wgpuBufferGetSize(strides_buf));
   }
 
   WGPUBindGroup bg;
@@ -638,25 +643,26 @@ void Compiled::eval_gpu(
     // WebGPU validators reject for storage bindings).
     std::ostringstream diag;
     diag << "[WebGPU compiled] " << e.what() << " kernel=" << kernel_lib_
-         << " (" << (contiguous ? "c" : "g_nd") << (contiguous ? "" : std::to_string(ndim))
+         << " (" << (contiguous ? "c" : "g_nd")
+         << (contiguous ? "" : std::to_string(ndim))
          << ") entries=" << bg_entries.size()
-         << " inputs=" << num_binding_inputs
-         << " outputs=" << outputs.size()
+         << " inputs=" << num_binding_inputs << " outputs=" << outputs.size()
          << " has_strides=" << (strides_buf ? 1 : 0);
     diag << " bufs=[";
     for (size_t i = 0; i < bg_entries.size() && i < 12; ++i) {
-      if (i) diag << ",";
+      if (i)
+        diag << ",";
       diag << reinterpret_cast<uintptr_t>(bg_entries[i].first);
     }
     diag << "]";
     throw std::runtime_error(diag.str());
   }
 
-  uint32_t total_threads =
-      (total_size + wgpu::N_READS - 1) / wgpu::N_READS;
+  uint32_t total_threads = (total_size + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
       (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU compiled]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
   encoder.add_completed_handler([uniform_buf, strides_buf]() {

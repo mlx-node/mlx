@@ -4,6 +4,7 @@
 
 #include <webgpu/webgpu.h>
 
+#include <algorithm>
 #include <cstring>
 #include <initializer_list>
 #include <sstream>
@@ -23,6 +24,28 @@ namespace mlx::core::wgpu {
 constexpr uint32_t WORKGROUP_SIZE = 256;
 constexpr uint32_t MAX_NDIM = 8;
 constexpr uint32_t N_READS = 4;
+constexpr uint32_t MAX_WORKGROUPS_PER_DIMENSION = 65535;
+
+inline std::pair<uint32_t, uint32_t> get_2d_grid(
+    uint32_t num_workgroups,
+    const char* label) {
+  uint32_t wg_x = std::min(num_workgroups, MAX_WORKGROUPS_PER_DIMENSION);
+  uint32_t wg_y = (num_workgroups + MAX_WORKGROUPS_PER_DIMENSION - 1) /
+      MAX_WORKGROUPS_PER_DIMENSION;
+  if (wg_y > MAX_WORKGROUPS_PER_DIMENSION) {
+    throw std::runtime_error(
+        std::string(label) + " output is too large for a 2D WebGPU dispatch.");
+  }
+  return {wg_x, wg_y};
+}
+
+inline std::string wgsl_linear_thread_id() {
+  return std::string(
+      "fn linear_thread_id(wg_id: vec3u, lid: vec3u, nwg: vec3u) -> u32 {\n"
+      "  let wg_linear = (wg_id.z * nwg.y + wg_id.y) * nwg.x + wg_id.x;\n"
+      "  return wg_linear * WORKGROUP_SIZE + lid.x;\n"
+      "}\n\n");
+}
 
 // Return the GPU-side element size for a dtype.
 // WGSL has no 8-bit or 16-bit integer storage, so:
@@ -32,8 +55,10 @@ constexpr uint32_t N_READS = 4;
 //   everything else -> same as CPU itemsize
 inline size_t wgpu_itemsize(Dtype dtype) {
   switch (dtype.val()) {
-    case Dtype::Val::bool_: return 4;     // bool stored as u32
-    case Dtype::Val::bfloat16: return 4;  // bf16 promoted to f32
+    case Dtype::Val::bool_:
+      return 4; // bool stored as u32
+    case Dtype::Val::bfloat16:
+      return 4; // bf16 promoted to f32
     case Dtype::Val::int64:
     case Dtype::Val::uint64:
       // WGSL has no 64-bit integer storage. MLX uses uint32 for arg-reduce
@@ -43,7 +68,8 @@ inline size_t wgpu_itemsize(Dtype dtype) {
       // CPU upload/readback. This is sufficient for shape/index tensors, which
       // must fit in 32 bits for WebGPU dispatch anyway.
       return 4;
-    default: return dtype.size();
+    default:
+      return dtype.size();
   }
 }
 
@@ -78,9 +104,10 @@ inline std::string wgsl_matmul_params_struct() {
       "  offset_a: u32, offset_b: u32,\n"
       "  _pad: u32,\n"
       "}\n\n"
-      // Multi-dim batch index decomposition (mirrors Metal elem_to_loc_broadcast).
-      // Fast path for batch_ndim==1 avoids the loop + division/modulo overhead
-      // that the general path pays on every thread invocation.
+      // Multi-dim batch index decomposition (mirrors Metal
+      // elem_to_loc_broadcast). Fast path for batch_ndim==1 avoids the loop +
+      // division/modulo overhead that the general path pays on every thread
+      // invocation.
       "fn elem_to_loc_broadcast(elem: u32, ndim: u32, shape: vec4<u32>, "
       "a_strides: vec4<u32>, b_strides: vec4<u32>) -> vec2<u32> {\n"
       "  if (ndim == 1u) {\n"
@@ -138,10 +165,7 @@ inline void ensure_wgpu_size(array& out) {
     return;
   }
   out.set_data(
-      allocator::malloc(needed),
-      out.data_size(),
-      out.strides(),
-      out.flags());
+      allocator::malloc(needed), out.data_size(), out.strides(), out.flags());
 }
 
 // WebGPU forbids the same buffer appearing as both read-only and read-write
@@ -274,8 +298,8 @@ inline uint64_t wgpu_bind_size(const array& arr) {
     return static_cast<uint64_t>(wbuf->size);
   }
 
-  const uint64_t elem_offset =
-      static_cast<uint64_t>(arr.offset()) / static_cast<uint64_t>(arr.itemsize());
+  const uint64_t elem_offset = static_cast<uint64_t>(arr.offset()) /
+      static_cast<uint64_t>(arr.itemsize());
   uint64_t max_elem = elem_offset;
   for (int i = 0; i < arr.ndim(); ++i) {
     if (arr.shape(i) == 0) {
@@ -369,7 +393,9 @@ inline const char* dtype_to_wgsl_safe(Dtype dtype) {
 }
 
 // Emit "enable f16;\n\n" if any of the given types is "f16"
-inline void emit_f16_enable(std::ostringstream& s, std::initializer_list<std::string_view> types) {
+inline void emit_f16_enable(
+    std::ostringstream& s,
+    std::initializer_list<std::string_view> types) {
   for (auto t : types) {
     if (t == "f16") {
       s << "enable f16;\n\n";
@@ -399,8 +425,10 @@ inline void emit_elem_to_loc(
 
 // Fill vec4 pairs for shape and stride params
 inline void fill_vec4_params(
-    uint32_t* shape_0, uint32_t* shape_1,
-    int32_t* strides_0, int32_t* strides_1,
+    uint32_t* shape_0,
+    uint32_t* shape_1,
+    int32_t* strides_0,
+    int32_t* strides_1,
     const std::vector<int32_t>& shape,
     const std::vector<int64_t>& strides,
     uint32_t ndim) {
@@ -424,8 +452,8 @@ inline void emit_unrolled_reduction(
     uint32_t workgroup_size = WORKGROUP_SIZE) {
   for (uint32_t stride = workgroup_size / 2; stride >= 1; stride /= 2) {
     s << "  if (tid < " << stride << "u) {\n"
-      << "    " << shared_name << "[tid] = " << reduce_op << "("
-      << shared_name << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
+      << "    " << shared_name << "[tid] = " << reduce_op << "(" << shared_name
+      << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
       << "  }\n  workgroupBarrier();\n";
   }
 }
@@ -448,10 +476,12 @@ inline void emit_unrolled_reduction(
 // emit_subgroup_reduction's constant-folded WGSL assumes.
 inline int effective_subgroup_size() {
   auto& dev = device();
-  if (!dev.has_subgroups()) return 0;
+  if (!dev.has_subgroups())
+    return 0;
   uint32_t lo = dev.subgroup_size_min();
   uint32_t hi = dev.subgroup_size_max();
-  if (lo == 0 || hi == 0 || lo != hi) return 0;
+  if (lo == 0 || hi == 0 || lo != hi)
+    return 0;
   return static_cast<int>(lo);
 }
 
@@ -466,7 +496,8 @@ inline int effective_subgroup_size() {
 // is constant-folded for a specific lane count.
 inline std::string subgroup_suffix() {
   int sg = effective_subgroup_size();
-  if (sg == 0) return "";
+  if (sg == 0)
+    return "";
   return "_sg" + std::to_string(sg);
 }
 
@@ -510,16 +541,18 @@ inline void emit_subgroup_reduction(
 
   // Step 1: subgroup-level reduction
   s << "  // Subgroup reduction\n"
-    << "  var " << sg_var << " = " << subgroup_builtin << "(" << acc_var << ");\n"
+    << "  var " << sg_var << " = " << subgroup_builtin << "(" << acc_var
+    << ");\n"
     << "  let " << sg_id << " = tid / " << subgroup_size << "u;\n"
-    << "  if (subgroupElect()) { " << shared_name << "[" << sg_id << "] = " << sg_var << "; }\n"
+    << "  if (subgroupElect()) { " << shared_name << "[" << sg_id
+    << "] = " << sg_var << "; }\n"
     << "  workgroupBarrier();\n";
 
   // Step 2: tree-reduce across subgroup results (only num_subgroups values)
   for (uint32_t stride = num_subgroups / 2; stride >= 1; stride /= 2) {
     s << "  if (tid < " << stride << "u) {\n"
-      << "    " << shared_name << "[tid] = " << reduce_op << "("
-      << shared_name << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
+      << "    " << shared_name << "[tid] = " << reduce_op << "(" << shared_name
+      << "[tid], " << shared_name << "[tid + " << stride << "u]);\n"
       << "  }\n  workgroupBarrier();\n";
   }
 }

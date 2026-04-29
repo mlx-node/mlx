@@ -1,14 +1,13 @@
 // Copyright 2026 Apple Inc.
 
 #include "mlx/backend/gpu/copy.h"
+#include "gen/wgsl_sources.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/webgpu/allocator.h"
 #include "mlx/backend/webgpu/device.h"
 #include "mlx/backend/webgpu/utils.h"
 #include "mlx/utils.h"
-#include "gen/wgsl_sources.h"
 
-#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <sstream>
@@ -32,20 +31,19 @@ namespace {
 //   Total: 112 bytes
 struct CopyParams {
   uint32_t size_ndim_offsets[4]; // [size, ndim, in_offset, out_offset]
-  uint32_t shape_0[4];          // shape[0..3]
-  uint32_t shape_1[4];          // shape[4..7]
-  int32_t in_strides_0[4];      // in_strides[0..3]
-  int32_t in_strides_1[4];      // in_strides[4..7]
-  int32_t out_strides_0[4];     // out_strides[0..3]
-  int32_t out_strides_1[4];     // out_strides[4..7]
+  uint32_t shape_0[4]; // shape[0..3]
+  uint32_t shape_1[4]; // shape[4..7]
+  int32_t in_strides_0[4]; // in_strides[0..3]
+  int32_t in_strides_1[4]; // in_strides[4..7]
+  int32_t out_strides_0[4]; // out_strides[0..3]
+  int32_t out_strides_1[4]; // out_strides[4..7]
 };
 
 // Get or create the shader module for copy kernels.
 WGPUShaderModule get_copy_shader_module() {
   auto& dev = wgpu::device();
   return dev.get_or_create_shader_module(
-      "copy_kernels",
-      []() { return std::string(wgpu::kernels::copy()); });
+      "copy_kernels", []() { return std::string(wgpu::kernels::copy()); });
 }
 
 int64_t dynamic_offset_value(
@@ -119,8 +117,7 @@ void dispatch_copy(
   const char* entry_point = copy_type_to_entry_point(ctype);
   std::string pipeline_key = std::string("copy_") + entry_point;
 
-  auto pe =
-      dev.get_or_create_pipeline(pipeline_key, shader, entry_point);
+  auto pe = dev.get_or_create_pipeline(pipeline_key, shader, entry_point);
 
   // Compute the effective element offsets into array<u32> buffers.
   // arr.offset() returns a byte offset from the buffer base pointer.
@@ -128,12 +125,12 @@ void dispatch_copy(
   // On GPU, all types occupy one u32 slot (bf16→f32, bool→u32), so
   // element offset = u32 index. Convert byte offset → element offset
   // by dividing by CPU itemsize, then add the parameter element offset.
-  uint32_t in_elem =
-      static_cast<uint32_t>(in.offset()) / static_cast<uint32_t>(in.itemsize())
-      + static_cast<uint32_t>(in_offset);
-  uint32_t out_elem =
-      static_cast<uint32_t>(out.offset()) / static_cast<uint32_t>(out.itemsize())
-      + static_cast<uint32_t>(out_offset);
+  uint32_t in_elem = static_cast<uint32_t>(in.offset()) /
+          static_cast<uint32_t>(in.itemsize()) +
+      static_cast<uint32_t>(in_offset);
+  uint32_t out_elem = static_cast<uint32_t>(out.offset()) /
+          static_cast<uint32_t>(out.itemsize()) +
+      static_cast<uint32_t>(out_offset);
   // Each element maps to one u32 on GPU (wgpu_itemsize is always 4 currently).
   uint32_t effective_in_offset = in_elem;
   uint32_t effective_out_offset = out_elem;
@@ -160,17 +157,20 @@ void dispatch_copy(
     } else if (out_val == Dtype::Val::bool_) {
       // any type → bool: nonzero → 1, zero → 0
       conversion_mode = 2;
-    } else if (in_val == Dtype::Val::int32 &&
-               (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
-                out_val == Dtype::Val::bfloat16)) {
+    } else if (
+        in_val == Dtype::Val::int32 &&
+        (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
+         out_val == Dtype::Val::bfloat16)) {
       conversion_mode = 3;
-    } else if ((in_val == Dtype::Val::float32 || in_val == Dtype::Val::float16 ||
-                in_val == Dtype::Val::bfloat16) &&
-               out_val == Dtype::Val::int32) {
+    } else if (
+        (in_val == Dtype::Val::float32 || in_val == Dtype::Val::float16 ||
+         in_val == Dtype::Val::bfloat16) &&
+        out_val == Dtype::Val::int32) {
       conversion_mode = 4;
-    } else if (in_val == Dtype::Val::uint32 &&
-               (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
-                out_val == Dtype::Val::bfloat16)) {
+    } else if (
+        in_val == Dtype::Val::uint32 &&
+        (out_val == Dtype::Val::float32 || out_val == Dtype::Val::float16 ||
+         out_val == Dtype::Val::bfloat16)) {
       conversion_mode = 5;
     }
   }
@@ -207,26 +207,16 @@ void dispatch_copy(
 
   // Compute workgroup count:
   // Each thread processes N_READS elements; WORKGROUP_SIZE threads per group.
-  uint32_t total_threads =
-      (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
+  uint32_t total_threads = (elem_count + wgpu::N_READS - 1) / wgpu::N_READS;
   uint32_t num_workgroups =
       (total_threads + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  constexpr uint32_t kMaxWorkgroupsPerDimension = 65535u;
-  uint32_t wg_x = std::min(num_workgroups, kMaxWorkgroupsPerDimension);
-  uint32_t wg_y =
-      (num_workgroups + kMaxWorkgroupsPerDimension - 1) /
-      kMaxWorkgroupsPerDimension;
-  if (wg_y > kMaxWorkgroupsPerDimension) {
-    throw std::runtime_error(
-        "[WebGPU copy] output is too large for a 2D WebGPU dispatch.");
-  }
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU copy]");
 
   encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 } // namespace
@@ -243,7 +233,8 @@ void copy_gpu(const array& in, array& out, CopyType ctype, const Stream& s) {
   // WebGPU: prevent buffer aliasing between input and output bindings.
   // This can happen when set_copy_output_data donates the input buffer to the
   // output (e.g. AsType with same-sized types). The copy dispatch would then
-  // bind the same buffer as both read-only and read-write, which WebGPU forbids.
+  // bind the same buffer as both read-only and read-write, which WebGPU
+  // forbids.
   wgpu::ensure_no_alias(out, in);
   // set_copy_output_data is shared with CPU/Metal/CUDA and allocates using
   // logical CPU itemsize. WebGPU stores bf16/bool as 32-bit lanes, so size the
@@ -293,10 +284,8 @@ void copy_gpu_inplace(
         env::get_var("MLX_WGPU_METADATA_FAST_PATH", 1) != 0;
     if (metadata_fast_path && ctype == CopyType::Vector &&
         in.dtype() == out.dtype()) {
-      auto* in_wb =
-          static_cast<const wgpu::WebGPUBuffer*>(in.buffer().ptr());
-      auto* out_wb =
-          static_cast<const wgpu::WebGPUBuffer*>(out.buffer().ptr());
+      auto* in_wb = static_cast<const wgpu::WebGPUBuffer*>(in.buffer().ptr());
+      auto* out_wb = static_cast<const wgpu::WebGPUBuffer*>(out.buffer().ptr());
       // Restrict to Upconverted. A PackedBf16 buffer stores two bf16 values
       // per u32, so its real byte size is ((N+1)/2)*4 — not
       // data_size * wgpu_itemsize(bfloat16) = data_size*4, which is double.
@@ -330,19 +319,14 @@ void copy_gpu_inplace(
           WGPUBuffer in_buf = wgpu::wgpu_buffer(in);
           WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
           encoder.copy_buffer_to_buffer(
-              in_buf,
-              in_byte_offset,
-              out_buf,
-              out_byte_offset,
-              byte_count);
+              in_buf, in_byte_offset, out_buf, out_byte_offset, byte_count);
           return;
         }
       }
     }
     // For array<u32> buffers, element count = total bytes / 4.
     // For 4-byte types this equals data_size; for other sizes we adjust.
-    uint32_t byte_count =
-        static_cast<uint32_t>(out.data_size()) *
+    uint32_t byte_count = static_cast<uint32_t>(out.data_size()) *
         static_cast<uint32_t>(wgpu::wgpu_itemsize(out.dtype()));
     uint32_t elem_count = (byte_count + 3u) / 4u;
     dispatch_copy(
@@ -356,9 +340,7 @@ void copy_gpu_inplace(
   // case for WebGPU which maps all types to 32-bit equivalents). For sub-32-bit
   // types, strides would need scaling by itemsize/4.
   auto [shape_collapsed, strides_vec] = collapse_contiguous_dims(
-      data_shape,
-      std::vector<Strides>{strides_in, strides_out},
-      INT32_MAX);
+      data_shape, std::vector<Strides>{strides_in, strides_out}, INT32_MAX);
 
   uint32_t total_size = 1;
   for (auto& dim : shape_collapsed) {
@@ -389,8 +371,7 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
   encoder.set_input_array(val);
   encoder.set_output_array(out);
 
-  uint32_t byte_count =
-      static_cast<uint32_t>(out.data_size()) *
+  uint32_t byte_count = static_cast<uint32_t>(out.data_size()) *
       static_cast<uint32_t>(wgpu::wgpu_itemsize(out.dtype()));
   uint32_t elem_count = (byte_count + 3u) / 4u;
   dispatch_copy(

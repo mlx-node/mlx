@@ -62,14 +62,18 @@ std::string make_arange_kernel(
       << "}\n\n";
   }
 
-  s << "@group(0) @binding(0) var<storage, read_write> out: array<"
-    << out_type << ">;\n"
+  s << "@group(0) @binding(0) var<storage, read_write> out: array<" << out_type
+    << ">;\n"
     << "@group(0) @binding(1) var<uniform> params: ArangeParams;\n\n";
 
+  s << "const WORKGROUP_SIZE: u32 = " << wgpu::WORKGROUP_SIZE << "u;\n";
+  s << wgpu::wgsl_linear_thread_id();
+
   s << "@compute @workgroup_size(256)\n"
-    << "fn " << entry_name
-    << "(@builtin(global_invocation_id) gid: vec3u) {\n"
-    << "  let idx = gid.x;\n"
+    << "fn " << entry_name << "(@builtin(workgroup_id) wg_id: vec3u,\n"
+    << " @builtin(local_invocation_id) lid: vec3u,\n"
+    << " @builtin(num_workgroups) nwg: vec3u) {\n"
+    << "  let idx = linear_thread_id(wg_id, lid, nwg);\n"
     << "  if (idx >= params.size) { return; }\n";
 
   if (is_integer) {
@@ -108,9 +112,9 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   std::string entry_name =
       std::string("arange_") + out_type + (is_integer ? "_int" : "_float");
   auto& dev = wgpu::device();
-  WGPUShaderModule shader = dev.get_or_create_shader_module(
-      entry_name,
-      [&]() { return make_arange_kernel(entry_name, out_type, is_integer); });
+  WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
+    return make_arange_kernel(entry_name, out_type, is_integer);
+  });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
   auto& encoder = wgpu::get_command_encoder(s);
@@ -126,15 +130,15 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
     params.size = data_size;
     params.start = static_cast<int32_t>(start_);
     params.step = static_cast<int32_t>(step_);
-    uniform_buf =
-        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsInt));
+    uniform_buf = pool.acquire(
+        wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsInt));
   } else {
     ArangeParamsFloat params{};
     params.size = data_size;
     params.start = static_cast<float>(start_);
     params.step = static_cast<float>(step_);
-    uniform_buf =
-        pool.acquire(wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsFloat));
+    uniform_buf = pool.acquire(
+        wgpu::device().gpu_queue(), &params, sizeof(ArangeParamsFloat));
   }
 
   WGPUBuffer out_buf = wgpu::wgpu_buffer(out);
@@ -145,18 +149,16 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
       is_integer ? sizeof(ArangeParamsInt) : sizeof(ArangeParamsFloat);
 
   WGPUBindGroup bg = wgpu::create_bind_group(
-      pe.layout,
-      {{out_buf, out_buf_size},
-       {uniform_buf, params_size}});
+      pe.layout, {{out_buf, out_buf_size}, {uniform_buf, params_size}});
 
   uint32_t num_workgroups =
       (data_size + wgpu::WORKGROUP_SIZE - 1) / wgpu::WORKGROUP_SIZE;
-  encoder.dispatch_compute(pe.pipeline, bg, num_workgroups);
+  auto [wg_x, wg_y] = wgpu::get_2d_grid(num_workgroups, "[WebGPU arange]");
+  encoder.dispatch_compute(pe.pipeline, bg, wg_x, wg_y);
 
   wgpuBindGroupRelease(bg);
-  encoder.add_completed_handler([uniform_buf]() {
-    wgpu::device().uniform_pool().release(uniform_buf);
-  });
+  encoder.add_completed_handler(
+      [uniform_buf]() { wgpu::device().uniform_pool().release(uniform_buf); });
 }
 
 } // namespace mlx::core
