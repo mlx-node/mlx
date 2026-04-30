@@ -1025,11 +1025,11 @@ CommandEncoder::~CommandEncoder() {
 }
 
 void CommandEncoder::set_input_array(const array& arr) {
-  bytes_tracked_ += arr.data_size() * arr.itemsize();
+  bytes_tracked_ += wgpu_data_size(arr);
 }
 
 void CommandEncoder::set_output_array(const array& arr) {
-  bytes_tracked_ += arr.data_size() * arr.itemsize();
+  bytes_tracked_ += wgpu_data_size(arr);
   // Mark that this buffer will have meaningful GPU data after compute.
   // Invalidate any cached CPU pointer — the GPU is about to overwrite
   // the buffer contents, so the old CPU copy would be stale.
