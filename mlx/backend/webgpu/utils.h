@@ -146,6 +146,32 @@ inline std::string wgsl_unpack_bf16_pair() {
       "}\n\n");
 }
 
+// CAS-loop atomic float add for the scatter Sum-reduce (scatter_add) path.
+// WGSL has no native atomic<f32>, so the output buffer is viewed as
+// array<atomic<u32>> and each add reinterprets bits via bitcast. Emitted into
+// the scatter kernels, which name their output storage binding `out`.
+// Precondition: `out` must already hold the accumulation base before dispatch
+// (the scatter eval_gpu paths seed it via copy_gpu — zeros for Gather::vjp);
+// the adds accumulate onto whatever base is there. f32 0.0 has u32 bit-pattern
+// 0, so a zero-seeded buffer reads back as 0.0. WebGPU's per-pass dispatch
+// ordering makes that seeding copy visible to the atomicLoad here.
+// Correctness-first: a hot index (e.g. a token id repeated in an
+// embedding-gradient scatter) serializes its adds through the
+// compare-exchange retry — correct, but can be slow under heavy contention.
+// A workgroup-local-partials optimization can come later if profiling needs it.
+inline std::string wgsl_atomic_add_f32() {
+  return std::string(
+      "fn atomic_add_f32(idx: u32, v: f32) {\n"
+      "  var old_bits = atomicLoad(&out[idx]);\n"
+      "  loop {\n"
+      "    let new_bits = bitcast<u32>(bitcast<f32>(old_bits) + v);\n"
+      "    let res = atomicCompareExchangeWeak(&out[idx], old_bits, new_bits);\n"
+      "    if (res.exchanged) { break; }\n"
+      "    old_bits = res.old_value;\n"
+      "  }\n"
+      "}\n\n");
+}
+
 // Ensure the output array's buffer is large enough for GPU-side element sizes.
 // Call after set_*_output_data() which allocates based on CPU itemsize.
 // For types where GPU elements are larger (bool, bfloat16), this reallocates.
