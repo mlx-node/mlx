@@ -353,7 +353,8 @@ std::string make_scatter_kernel(
     const std::string& entry_name,
     const std::string& val_type,
     const std::string& idx_type,
-    int nidx) {
+    int nidx,
+    bool sum_reduce) {
   std::ostringstream s;
 
   if (val_type == "f16") {
@@ -375,10 +376,15 @@ std::string make_scatter_kernel(
     << "}\n\n";
 
   s << "@group(0) @binding(0) var<storage, read> upd: array<" << val_type
-    << ">;\n"
-    << "@group(0) @binding(1) var<storage, read_write> out: array<" << val_type
-    << ">;\n"
-    << "@group(0) @binding(2) var<uniform> params: ScatterParams;\n"
+    << ">;\n";
+  if (sum_reduce) {
+    s << "@group(0) @binding(1) var<storage, read_write> out: "
+         "array<atomic<u32>>;\n";
+  } else {
+    s << "@group(0) @binding(1) var<storage, read_write> out: array<"
+      << val_type << ">;\n";
+  }
+  s << "@group(0) @binding(2) var<uniform> params: ScatterParams;\n"
     << "@group(0) @binding(3) var<storage, read> metadata: array<i32>;\n";
 
   // Index arrays: binding 4..4+nidx-1
@@ -387,6 +393,10 @@ std::string make_scatter_kernel(
       << ": array<" << idx_type << ">;\n";
   }
   s << "\n";
+
+  if (sum_reduce) {
+    s << wgpu::wgsl_atomic_add_f32();
+  }
 
   // Metadata layout:
   // [0..upd_ndim-1]: upd_shape
@@ -489,11 +499,19 @@ std::string make_scatter_kernel(
     << "      out_offset += i32(coord) * get_out_stride(d);\n"
     << "      slice_rem = slice_rem / dim_size;\n"
     << "    }\n"
-    << "  }\n"
-    << "\n"
-    << "  // Write (last-write-wins for conflicts)\n"
-    << "  out[u32(out_offset)] = val;\n"
-    << "}\n";
+    << "  }\n";
+
+  if (sum_reduce) {
+    s << "\n"
+      << "  // Accumulate (Sum-reduce): atomic float-add for colliding indices\n"
+      << "  atomic_add_f32(u32(out_offset), val);\n"
+      << "}\n";
+  } else {
+    s << "\n"
+      << "  // Write (last-write-wins for conflicts)\n"
+      << "  out[u32(out_offset)] = val;\n"
+      << "}\n";
+  }
 
   return s.str();
 }
@@ -520,7 +538,8 @@ struct ScatterAxisParams {
 std::string make_scatter_axis_kernel(
     const std::string& entry_name,
     const std::string& val_type,
-    const std::string& idx_type) {
+    const std::string& idx_type,
+    bool sum_reduce) {
   std::ostringstream s;
 
   if (val_type == "f16") {
@@ -548,11 +567,20 @@ std::string make_scatter_axis_kernel(
   s << "@group(0) @binding(0) var<storage, read> upd: array<" << val_type
     << ">;\n"
     << "@group(0) @binding(1) var<storage, read> idx: array<" << idx_type
-    << ">;\n"
-    << "@group(0) @binding(2) var<storage, read_write> out: array<" << val_type
-    << ">;\n"
-    << "@group(0) @binding(3) var<uniform> params: ScatterAxisParams;\n"
+    << ">;\n";
+  if (sum_reduce) {
+    s << "@group(0) @binding(2) var<storage, read_write> out: "
+         "array<atomic<u32>>;\n";
+  } else {
+    s << "@group(0) @binding(2) var<storage, read_write> out: array<"
+      << val_type << ">;\n";
+  }
+  s << "@group(0) @binding(3) var<uniform> params: ScatterAxisParams;\n"
     << "@group(0) @binding(4) var<storage, read> metadata: array<i32>;\n\n";
+
+  if (sum_reduce) {
+    s << wgpu::wgsl_atomic_add_f32();
+  }
 
   // Metadata: shape_no_axis[ndim_no_axis], upd_strides_no_axis[ndim_no_axis],
   //           idx_strides_no_axis[ndim_no_axis],
@@ -605,10 +633,17 @@ std::string make_scatter_axis_kernel(
     << "  // output; non-contiguous outputs would silently write to the\n"
     << "  // wrong location.\n"
     << "  out_loc += index_val * params.out_axis_stride;\n"
-    << "\n"
-    << "  // Write the update value\n"
-    << "  out[u32(out_loc)] = upd[u32(upd_loc)];\n"
-    << "}\n";
+    << "\n";
+
+  if (sum_reduce) {
+    s << "  // Accumulate (Sum-reduce): atomic float-add\n"
+      << "  atomic_add_f32(u32(out_loc), upd[u32(upd_loc)]);\n"
+      << "}\n";
+  } else {
+    s << "  // Write the update value\n"
+      << "  out[u32(out_loc)] = upd[u32(upd_loc)];\n"
+      << "}\n";
+  }
 
   return s.str();
 }
@@ -939,6 +974,34 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   reject_packed_bf16_indexing(src, "Scatter");
   reject_packed_bf16_indexing(upd, "Scatter");
 
+  // Resolve the reduce mode BEFORE any GPU side effect is recorded. Sum-reduce
+  // (scatter_add, e.g. the embedding-table gradient from Gather::vjp) must
+  // ACCUMULATE on colliding indices via an atomic float-add; the default None
+  // path overwrites (last-write-wins). Validating up front keeps the op
+  // fail-closed: a rejected reduce/dtype must not leave a queued copy/dispatch
+  // in the command encoder.
+  bool sum_reduce = false;
+  switch (reduce_type_) {
+    case None:
+      break;
+    case Sum:
+      if (out.dtype() != float32) {
+        throw std::runtime_error(
+            "[WebGPU] Scatter Sum-reduce (scatter_add) is only implemented for "
+            "float32 outputs; got a non-float32 dtype. bf16/f16 accumulation "
+            "needs a wider atomic path that is not yet implemented.");
+      }
+      sum_reduce = true;
+      break;
+    case Max:
+    case Min:
+    case Prod:
+      throw std::runtime_error(
+          "[WebGPU] Scatter Max/Min/Prod reduce is not implemented on the "
+          "WebGPU backend yet (only None and Sum are supported). TODO: add "
+          "atomic max/min/prod kernels if a use case needs them.");
+  }
+
   // Copy src into out first
   copy_gpu(src, out, infer_copy_type(src), s);
 
@@ -960,12 +1023,13 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   const char* idx_type =
       nidx > 0 ? wgpu::dtype_to_wgsl(inputs[1].dtype()) : "i32";
 
-  std::string entry_name = std::string("scatter_") + val_type + "_" + idx_type +
-      "_n" + std::to_string(nidx);
+  std::string entry_name = std::string("scatter_") +
+      (sum_reduce ? "sum_" : "none_") + val_type + "_" + idx_type + "_n" +
+      std::to_string(nidx);
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
-    return make_scatter_kernel(entry_name, val_type, idx_type, nidx);
+    return make_scatter_kernel(entry_name, val_type, idx_type, nidx, sum_reduce);
   });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
@@ -1041,6 +1105,24 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   reject_packed_bf16_indexing(src, "ScatterAxis");
   reject_packed_bf16_indexing(upd, "ScatterAxis");
 
+  // Resolve the reduce mode (ScatterAxis supports Sum and None only) BEFORE any
+  // GPU side effect is recorded, so a rejected non-f32 Sum stays fail-closed
+  // and never leaves a queued copy/dispatch in the command encoder.
+  bool sum_reduce = false;
+  switch (reduce_type_) {
+    case None:
+      break;
+    case Sum:
+      if (out.dtype() != float32) {
+        throw std::runtime_error(
+            "[WebGPU] ScatterAxis Sum-reduce is only implemented for float32 "
+            "outputs; got a non-float32 dtype. bf16/f16 accumulation needs a "
+            "wider atomic path that is not yet implemented.");
+      }
+      sum_reduce = true;
+      break;
+  }
+
   // Copy src into out first
   copy_gpu(src, out, infer_copy_type(src), s);
 
@@ -1052,12 +1134,12 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   const char* val_type = wgpu::dtype_to_wgsl(out.dtype());
   const char* idx_type = wgpu::dtype_to_wgsl(idx.dtype());
 
-  std::string entry_name =
-      std::string("scatter_axis_") + val_type + "_" + idx_type;
+  std::string entry_name = std::string("scatter_axis_") +
+      (sum_reduce ? "sum_" : "none_") + val_type + "_" + idx_type;
 
   auto& dev = wgpu::device();
   WGPUShaderModule shader = dev.get_or_create_shader_module(entry_name, [&]() {
-    return make_scatter_axis_kernel(entry_name, val_type, idx_type);
+    return make_scatter_axis_kernel(entry_name, val_type, idx_type, sum_reduce);
   });
   auto pe = dev.get_or_create_pipeline(entry_name, shader, entry_name.c_str());
 
