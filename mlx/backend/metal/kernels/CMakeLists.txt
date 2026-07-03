@@ -155,9 +155,22 @@ if(NOT MLX_METAL_JIT)
   build_kernel(gemv_masked steel/utils.h)
   build_kernel(steel/attn/kernels/steel_attention ${STEEL_ATTN_HEADERS})
 
+  # MLX_METAL_FORCE_NAX builds the NAX kernels into a metallib whose deployment
+  # floor is below macOS 26.2. The kernels themselves always target at least
+  # 26.2: they require the macOS 26.2 tensor-ops ABI (lower targets select
+  # MetalPerformancePrimitives' pre-26.2 compatibility intrinsics, which
+  # miscompute for these kernels). Runtime dispatch (is_nax_available) requires
+  # macOS 26.2, so machines below that never instantiate the 26.2-targeted
+  # functions in the lower-floor library.
   if(MLX_METAL_VERSION GREATER_EQUAL 400
      AND MACOS_SDK_VERSION VERSION_GREATER_EQUAL 26.2
-     AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26.2)
+     AND (MLX_METAL_FORCE_NAX OR CMAKE_OSX_DEPLOYMENT_TARGET
+                                 VERSION_GREATER_EQUAL 26.2))
+
+    block(PROPAGATE KERNEL_AIR)
+    if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 26.2)
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "26.2")
+    endif()
 
     build_kernel(steel/gemm/kernels/steel_gemm_fused_nax ${STEEL_NAX_HEADERS})
     build_kernel(steel/gemm/kernels/steel_gemm_gather_nax ${STEEL_NAX_HEADERS})
@@ -171,6 +184,7 @@ if(NOT MLX_METAL_JIT)
 
     build_kernel(steel/attn/kernels/steel_attention_nax
                  ${STEEL_NAX_ATTN_HEADERS})
+    endblock()
 
   else()
     message(
