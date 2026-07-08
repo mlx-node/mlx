@@ -437,8 +437,22 @@ void Compiled::eval_gpu(
   }
 
   // Collapse contiguous dims to route to a faster kernel if possible.
-  auto [contiguous, shape, strides] =
+  //
+  // Upstream #3720: `contiguous` is now false whenever any input has
+  // negative strides (e.g. from flip / negative-step slicing), which routes
+  // those inputs to the strided ("g") kernel below. Metal/CUDA additionally
+  // force 64-bit "large index" mode on `negative_strides` because their
+  // small-index kernels did unsigned index math; WGSL has no i64, so large
+  // mode cannot exist here. It is also not needed: the strided path is
+  // already sign-correct — strides are bound as `array<i32>`, elem_to_loc
+  // accumulates `var loc: i32` via `loc += i32(idx_rem % dim_size) *
+  // dim_stride`, and the read site computes `u32(elem_to_loc(...) +
+  // i32(get_offset(...)))`, where the sum is >= 0 for any in-bounds element.
+  // The pre-existing i32-range limit on offsets applies to positive and
+  // negative strides alike, so `negative_strides` needs no extra routing.
+  auto [contiguous, negative_strides, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
+  (void)negative_strides;
 
   // Allocate outputs with input donation (same semantics as Metal / CPU).
   // Note: compiled_allocate_outputs uses the CPU itemsize. For dtypes where
