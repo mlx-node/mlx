@@ -15,6 +15,14 @@ namespace mlx::core::fast {
 
 namespace {
 
+bool d256_full_sdpa_enabled() {
+  // Keep the new, still-experimental D=256 path independently reversible.
+  // The value is intentionally process-cached like MLX_ENABLE_TF32, so A/B
+  // runs must use separate processes.
+  static bool enabled = env::get_var("MLX_ENABLE_D256_FULL_SDPA", 1);
+  return enabled;
+}
+
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -659,6 +667,32 @@ void sdpa_vector_2pass(
 
 } // namespace
 
+bool d256_full_sdpa_available(bool effective_dtype_is_float32) {
+  // All three inputs are process-stable/cached: the rollback flag above,
+  // `is_nax_available()` in the Metal device layer, and `enable_tf32()` in
+  // MLX's environment helpers. Keep this single capability predicate shared
+  // by dispatch and the mlx-sys probe so the Rust planner cannot advertise a
+  // fused allocation when C++ will materialize the fallback score tensor.
+  return d256_full_sdpa_enabled() && metal::is_nax_available() &&
+      (env::enable_tf32() || !effective_dtype_is_float32);
+}
+
+bool d256_full_sdpa_would_use(
+    bool effective_dtype_is_float32,
+    int32_t query_head_dim,
+    int32_t value_head_dim,
+    int32_t query_length,
+    int32_t key_length,
+    bool do_causal,
+    bool has_array_mask) {
+  // Reject malformed and unsupported D=256 shapes conservatively. The full
+  // dispatcher still owns training, logsumexp, device, and general mask gates;
+  // the q<=k check mirrors `sdpa_full_supported_mask` for this causal route.
+  return query_head_dim == 256 && value_head_dim == 256 &&
+      query_length >= 1024 && key_length >= query_length && do_causal &&
+      !has_array_mask && d256_full_sdpa_available(effective_dtype_is_float32);
+}
+
 bool ScaledDotProductAttention::use_fallback(
     const array& q,
     const array& k,
@@ -694,22 +728,18 @@ bool ScaledDotProductAttention::use_fallback(
        (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
         query_head_dim == 256)) ||
       (query_head_dim == 192 && value_head_dim == 128);
-  // head_dim 256 is only instantiated for the NAX kernel, so it must match
-  // the exact condition under which sdpa_full_self_attention_metal routes
-  // to it. It is further gated to the shapes where the fused kernel beats
-  // the unfused graph (measured on M5 Max): large, nearly-square causal
-  // blocks. On offset rectangles (kL >> qL, i.e. chunked prefill against a
-  // long cache) the causal block-skip amortizes away and the unfused
-  // graph's GEMMs win; below ~2k queries there are too few query blocks to
-  // fill the machine.
-  const bool takes_nax_full_path =
-      metal::is_nax_available() && (env::enable_tf32() || q.dtype() != float32);
   // The head-dim-split kernel beats the unfused graph on every measured
   // causal shape with qL >= 1024, rectangles included (M5 Max); below that
   // there are too few query blocks to fill the machine against a long
   // cache (512x8192 measures 1.08x of unfused).
-  const bool sdpa_full_supported_256 = takes_nax_full_path && do_causal &&
-      !has_arr_mask && query_sequence_length >= 1024;
+  const bool sdpa_full_supported_256 = d256_full_sdpa_would_use(
+      q.dtype() == float32,
+      query_head_dim,
+      value_head_dim,
+      query_sequence_length,
+      key_sequence_length,
+      do_causal,
+      has_arr_mask);
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
        (query_head_dim == 256 && sdpa_full_supported_256));
