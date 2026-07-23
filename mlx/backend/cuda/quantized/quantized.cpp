@@ -12,16 +12,38 @@
 
 namespace mlx::core {
 
+namespace {
+
+// A K-quant reaches the backend with the same input count as an affine matmul,
+// so the mode is the only thing that separates the two. CUDA has no kernel
+// that decodes the two scale levels, and the supports_* probes below key off
+// the bit width and group size, which a K-quant satisfies for the wrong
+// format. Reject the mode before the probes run.
+void reject_kquant(const char* tag, QuantizationMode mode) {
+  if (quant_super_ratio(mode) > 0) {
+    throw std::runtime_error(
+        fmt::format(
+            "[{}] Quantization mode \"{}\" is not implemented on the CUDA "
+            "backend.",
+            tag,
+            quantization_mode_to_string(mode)));
+  }
+}
+
+} // namespace
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
+  reject_kquant("quantized_matmul", mode_);
+
   array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
   std::optional<array> biases;
-  if (inputs.size() > 3) {
+  if (quant_weight_arrays(mode_) == 2) {
     biases = inputs[3];
   }
 
@@ -155,17 +177,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
+  reject_kquant("gather_qmm", mode_);
+
+  int companions = quant_weight_arrays(mode_);
   array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
   std::optional<array> biases;
-  if (inputs.size() == 6) {
+  if (companions == 2) {
     biases = inputs[3];
   }
-  array lhs_indices =
-      ensure_row_contiguous(inputs[inputs.size() - 2], encoder, s);
-  array rhs_indices =
-      ensure_row_contiguous(inputs[inputs.size() - 1], encoder, s);
+  array lhs_indices = ensure_row_contiguous(inputs[2 + companions], encoder, s);
+  array rhs_indices = ensure_row_contiguous(inputs[3 + companions], encoder, s);
 
   int M = out.ndim() > 1 ? out.shape(-2) : 1;
   int N = out.shape(-1);
@@ -281,6 +304,11 @@ void fast::Quantize::eval_gpu(
   nvtx3::scoped_range r("Quantize::eval_gpu");
   auto& s = stream();
   auto& enc = cu::get_command_encoder(s);
+
+  // Everything that is not affine falls through to the shared exponent path
+  // below, which would read a K-quant's sub-block scales as a block exponent.
+  reject_kquant(dequantize_ ? "dequantize" : "quantize", mode_);
+
   if (dequantize_) {
     auto wq = ensure_row_contiguous(inputs[0], enc, s);
     auto scales = ensure_row_contiguous(inputs[1], enc, s);

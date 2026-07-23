@@ -38,7 +38,7 @@ get_quant_cutlass_types(const char* ctype_x, int bits, QuantizationMode mode) {
     return {"cutlass::float_e4m3_t", "cutlass::float_ue8m0_t"};
   } else if (mode == QuantizationMode::Nvfp4) {
     return {"cutlass::float_e2m1_t", "cutlass::float_e4m3_t"};
-  } else {
+  } else if (mode == QuantizationMode::Affine) {
     if (bits == 2) {
       return {"cutlass::uint2b_t", ctype_x};
     } else if (bits == 3) {
@@ -57,6 +57,11 @@ get_quant_cutlass_types(const char* ctype_x, int bits, QuantizationMode mode) {
               "[quantized_matmul] {}-bit quantization is not supported.",
               bits));
     }
+  } else {
+    throw std::invalid_argument(
+        fmt::format(
+            "[quantized_matmul] Quantization mode '{}' is not supported.",
+            quantization_mode_to_string(mode)));
   }
 }
 

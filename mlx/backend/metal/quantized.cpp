@@ -16,8 +16,42 @@ namespace mlx::core {
 
 namespace {
 
+// Metal carries two quantized kernel families: affine's per-group scale/bias
+// grid and the shared-exponent block used by mxfp4/mxfp8/nvfp4. A mode that
+// names neither is rejected rather than defaulted into one of them, because
+// the JIT build would then compile and run a kernel for the wrong format.
+const char* quantized_kernel_family(
+    std::string_view tag,
+    const std::string& mode) {
+  if (mode == "affine") {
+    return "affine_";
+  }
+  if (mode == "mxfp4" || mode == "mxfp8" || mode == "nvfp4") {
+    return "fp_";
+  }
+  std::ostringstream msg;
+  msg << "[" << tag << "] Quantization mode '" << mode
+      << "' has no Metal kernel family.";
+  throw std::invalid_argument(msg.str());
+}
+
+// A K-quant reaches the backend with the same input count as an affine
+// matmul, so the mode is the only thing that separates the two. No Metal
+// kernel decodes the two scale levels yet, so reject the mode before any
+// buffer is allocated or any kernel is picked.
+void reject_kquant(const char* tag, QuantizationMode mode) {
+  if (quant_super_ratio(mode) > 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Quantization mode '"
+        << quantization_mode_to_string(mode)
+        << "' is not implemented on the Metal backend.";
+    throw std::runtime_error(msg.str());
+  }
+}
+
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
+    std::string_view tag,
     metal::Device& d,
     const std::string& name,
     const std::string& func,
@@ -27,7 +61,7 @@ auto get_quantized_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  std::string fname = quantized_kernel_family(tag, mode) + func;
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
@@ -35,6 +69,7 @@ auto get_quantized_kernel_wrapped(
 
 template <typename... Args>
 auto get_qmm_nax_kernel_wrapped(
+    std::string_view tag,
     metal::Device& d,
     const std::string& name,
     const std::string& func,
@@ -44,7 +79,7 @@ auto get_qmm_nax_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  std::string fname = quantized_kernel_family(tag, mode) + func;
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_qmm_nax_kernel(d, name, template_def, mode);
@@ -187,7 +222,8 @@ void qmv_quad(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    std::string_view tag) {
   int B = out.size() / M / N;
 
   constexpr int quads_per_simd = 8;
@@ -213,7 +249,7 @@ void qmv_quad(
       K,
       B > 1 ? "_batch_1" : "_batch_0");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmv_quad", mode, type_string, group_size, bits, K, B > 1);
+      tag, d, kname, "qmv_quad", mode, type_string, group_size, bits, K, B > 1);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -245,7 +281,8 @@ void qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    std::string_view tag) {
   int B = out.size() / M / N;
 
   int bn = 8;
@@ -268,6 +305,7 @@ void qmv(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
   auto kernel = get_quantized_kernel_wrapped(
+      tag,
       d,
       kname,
       (fast ? "qmv_fast" : "qmv"),
@@ -315,7 +353,8 @@ void qmv_wide(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    std::string_view tag) {
   // vecs_per_tg is the per-threadgroup input-vector tile. Each tile re-reads
   // the weights, so use the fewest tiles, then the smallest tile that fills
   // them.
@@ -355,6 +394,7 @@ void qmv_wide(
       k_lanes,
       batched ? "_batch_1" : "_batch_0");
   auto kernel = get_quantized_kernel_wrapped(
+      tag,
       d,
       kname,
       "qmv_wide",
@@ -466,7 +506,15 @@ void qvm_split_k(
 
   // Encode and dispatch kernel
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qvm_split_k", mode, type_string, group_size, bits, split_k);
+      "quantized_matmul",
+      d,
+      kname,
+      "qvm_split_k",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      split_k);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -541,7 +589,15 @@ void qvm(
       bits,
       B > 1 ? "_batch_1" : "_batch_0");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qvm", mode, type_string, group_size, bits, B > 1);
+      "quantized_matmul",
+      d,
+      kname,
+      "qvm",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      B > 1);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -614,6 +670,7 @@ void qmm_nax(
   MTL::ComputePipelineState* kernel;
   if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
+        "quantized_matmul",
         d,
         kname,
         "qmm_t_nax",
@@ -630,6 +687,7 @@ void qmm_nax(
         wn);
   } else {
     kernel = get_qmm_nax_kernel_wrapped(
+        "quantized_matmul",
         d,
         kname,
         "qmm_n_nax",
@@ -718,6 +776,7 @@ void gather_qmm_nax(
   MTL::ComputePipelineState* kernel;
   if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
+        "gather_qmm",
         d,
         kname,
         "gather_qmm_t_nax_",
@@ -733,6 +792,7 @@ void gather_qmm_nax(
         wn);
   } else {
     kernel = get_qmm_nax_kernel_wrapped(
+        "gather_qmm",
         d,
         kname,
         "gather_qmm_n_nax_",
@@ -831,6 +891,7 @@ void qmm(
   MTL::ComputePipelineState* kernel;
   if (transpose) {
     kernel = get_quantized_kernel_wrapped(
+        "quantized_matmul",
         d,
         kname,
         "qmm_t",
@@ -842,7 +903,15 @@ void qmm(
         batched);
   } else {
     kernel = get_quantized_kernel_wrapped(
-        d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
+        "quantized_matmul",
+        d,
+        kname,
+        "qmm_n",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        batched);
   }
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -933,7 +1002,15 @@ void qmm_splitk(
       bits,
       aligned ? "_alN_true" : "_alN_false");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      "quantized_matmul",
+      d,
+      kname,
+      "qmm_t_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      aligned);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1025,10 +1102,25 @@ void gather_qmm(
   MTL::ComputePipelineState* kernel;
   if (transpose) {
     kernel = get_quantized_kernel_wrapped(
-        d, kname, "gather_qmm_t", mode, type_string, group_size, bits, aligned);
+        "gather_qmm",
+        d,
+        kname,
+        "gather_qmm_t",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        aligned);
   } else {
     kernel = get_quantized_kernel_wrapped(
-        d, kname, "gather_qmm_n", mode, type_string, group_size, bits);
+        "gather_qmm",
+        d,
+        kname,
+        "gather_qmm_n",
+        mode,
+        type_string,
+        group_size,
+        bits);
   }
 
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -1090,6 +1182,7 @@ void gather_qmv(
       bits);
 
   auto kernel = get_quantized_kernel_wrapped(
+      "gather_qmm",
       d,
       kname,
       (fast ? "gather_qmv_fast" : "gather_qmv"),
@@ -1155,7 +1248,14 @@ void gather_qvm(
       "_b_",
       bits);
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "gather_qvm", mode, type_string, group_size, bits);
+      "gather_qmm",
+      d,
+      kname,
+      "gather_qvm",
+      mode,
+      type_string,
+      group_size,
+      bits);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1226,7 +1326,9 @@ void gather_qmm_rhs_nax(
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
-  // Make the kernel name
+  // Make the kernel name. The source is picked from the mode further down in
+  // get_gather_qmm_nax_kernel, so reject a mode with no family up front.
+  quantized_kernel_family("gather_qmm", mode);
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
@@ -1377,7 +1479,9 @@ void gather_qmm_rhs(
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
-  // Make the kernel name
+  // Make the kernel name. The source is picked from the mode further down in
+  // get_gather_qmm_kernel, so reject a mode with no family up front.
+  quantized_kernel_family("gather_qmm", mode);
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
@@ -1471,25 +1575,30 @@ void dispatch_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    std::string_view tag) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
-    qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    qmv_quad(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode, tag);
     return;
   }
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
   if (M >= 2 && use_qmv_wide(mode, d)) {
-    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    qmv_wide(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode, tag);
     return;
   }
-  qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+  qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode, tag);
 }
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
+
+  reject_kquant("quantized_matmul", mode_);
 
   out.set_data(allocator::malloc(out.nbytes()));
 
@@ -1499,7 +1608,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
   array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
-  if (inputs.size() == 4) {
+  if (quant_weight_arrays(mode_) == 2) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
   }
 
@@ -1540,7 +1649,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Run of the mill qmv
   if (transpose_) {
     dispatch_qmv(
-        x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode,
+        "quantized_matmul");
     return;
   }
 
@@ -1560,17 +1682,20 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  reject_kquant("gather_qmm", mode_);
+
   out.set_data(allocator::malloc(out.nbytes()));
 
+  int companions = quant_weight_arrays(mode_);
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
   array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
-  if (inputs.size() == 6) {
+  if (companions == 2) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
   }
-  const array& lhs_indices = inputs[inputs.size() - 2];
-  const array& rhs_indices = inputs[inputs.size() - 1];
+  const array& lhs_indices = inputs[2 + companions];
+  const array& rhs_indices = inputs[3 + companions];
 
   int K = x.shape(-1);
   int M = x.shape(-2);
@@ -1688,7 +1813,14 @@ void quantize_dequantize(
       "_b_",
       bits);
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "quantize_dequantize", mode, type_string, group_size, bits);
+      "qqmm",
+      d,
+      kname,
+      "quantize_dequantize",
+      mode,
+      type_string,
+      group_size,
+      bits);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1714,6 +1846,8 @@ void quantize_dequantize(
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
+
+  reject_kquant("qqmm", mode_);
 
   auto mode = quantization_mode_to_string(mode_);
   bool w_quantized = (inputs[1].dtype() == uint32);
@@ -1761,7 +1895,8 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        "qqmm");
     return;
   } else {
     throw std::runtime_error("[QQMatmul] NYI for the general case");
@@ -1816,6 +1951,7 @@ void fast::Quantize::eval_gpu(
       "_b_",
       bits_);
   auto kernel = get_quantized_kernel_wrapped(
+      dequantize_ ? "dequantize" : "quantize",
       d,
       kname,
       dequantize_ ? "dequantize" : "quantize",

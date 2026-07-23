@@ -3462,9 +3462,17 @@ std::string quantization_mode_to_string(QuantizationMode mode) {
     case QuantizationMode::Mxfp8:
       return "mxfp8";
     case QuantizationMode::Nvfp4:
-    default:
       return "nvfp4";
+    case QuantizationMode::Q6K:
+      return "q6k";
+    case QuantizationMode::Q4K:
+      return "q4k";
+    case QuantizationMode::Q5K:
+      return "q5k";
   }
+  throw std::invalid_argument(
+      "[quantization_mode_to_string] Unknown quantization mode with value " +
+      std::to_string(static_cast<int>(mode)) + ".");
 }
 
 QuantizationMode string_to_quantization_mode(
@@ -3478,6 +3486,12 @@ QuantizationMode string_to_quantization_mode(
     return QuantizationMode::Mxfp8;
   } else if (mode == "nvfp4") {
     return QuantizationMode::Nvfp4;
+  } else if (mode == "q6k") {
+    return QuantizationMode::Q6K;
+  } else if (mode == "q4k") {
+    return QuantizationMode::Q4K;
+  } else if (mode == "q5k") {
+    return QuantizationMode::Q5K;
   }
   std::string msg;
   if (!tag.empty()) {
@@ -3509,8 +3523,8 @@ std::vector<array> QuantizedMatmul::vjp(
           cotangents[0],
           primals[1],
           primals[2],
-          mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                            : std::nullopt,
+          quant_weight_arrays(mode_) == 2 ? std::optional<array>(primals[3])
+                                          : std::nullopt,
           !transpose_,
           group_size_,
           bits_,
@@ -3573,8 +3587,8 @@ std::vector<array> QuantizedMatmul::jvp(
       tangents[0],
       primals[1],
       primals[2],
-      mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                        : std::nullopt,
+      quant_weight_arrays(mode_) == 2 ? std::optional<array>(primals[3])
+                                      : std::nullopt,
       transpose_,
       group_size_,
       bits_,
@@ -3688,14 +3702,14 @@ std::vector<array> GatherQMM::vjp(
 
   auto& cotan = cotangents[0];
 
+  int companions = quant_weight_arrays(mode_);
   auto& x = primals[0];
   auto& w = primals[1];
   auto& scales = primals[2];
-  auto& lhs_indices = primals[primals.size() - 2];
-  auto& rhs_indices = primals[primals.size() - 1];
-  auto biases = (mode_ == QuantizationMode::Affine)
-      ? std::optional<array>(primals[3])
-      : std::nullopt;
+  auto& lhs_indices = primals[2 + companions];
+  auto& rhs_indices = primals[3 + companions];
+  auto biases =
+      (companions == 2) ? std::optional<array>(primals[3]) : std::nullopt;
 
   int M = cotan.shape(-2);
   int K = x.shape(-1);
@@ -3736,7 +3750,7 @@ std::vector<array> GatherQMM::vjp(
     }
 
     // gradient wrt to the indices is undefined
-    else if (arg > 3) {
+    else if (arg >= 2 + companions) {
       throw std::runtime_error(
           "[GatherQMM::vjp] cannot compute the gradient wrt the indices.");
     }
@@ -3816,8 +3830,7 @@ bool GatherQMM::is_equivalent(const Primitive& other) const {
 std::vector<Shape> GatherQMM::output_shapes(const std::vector<array>& inputs) {
   const auto& x = inputs[0];
   const auto& w = inputs[1];
-  const auto& lhs_indices =
-      (mode_ == QuantizationMode::Affine) ? inputs[4] : inputs[3];
+  const auto& lhs_indices = inputs[2 + quant_weight_arrays(mode_)];
   int w_outer = transpose_ ? w.shape(-2) : w.shape(-1) * 32 / bits_;
   auto out_shape = lhs_indices.shape();
   out_shape.push_back(x.shape(-2));

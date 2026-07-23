@@ -410,6 +410,23 @@ get_columnwise_quantize_launch_args(size_t size, int group_size, int M, int K) {
 
 } // namespace cu
 
+namespace {
+
+// The kernels below are selected by (bits, group size) alone, so a pair that
+// belongs to no floating point format would otherwise reach the mxfp4
+// instantiation and decode the arrays as the wrong format.
+std::string fp_quant_config_error(const char* tag, int bits, int group_size) {
+  return fmt::format(
+      "[{}] Unsupported floating point quantization with {} bits and group size {}. "
+      "Supported are mxfp8 (8 bits, group size 32), mxfp4 (4 bits, group size 32) "
+      "and nvfp4 (4 bits, group size 16).",
+      tag,
+      bits,
+      group_size);
+}
+
+} // namespace
+
 void fp_quantize_dequantize(
     const array& w,
     array& what,
@@ -427,10 +444,13 @@ void fp_quantize_dequantize(
     using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     if constexpr (!std::is_same_v<T, double>) {
       auto kernel = cu::fp_quantize_dequantize<T, 32, 4, true, false>;
-      if (bits == 8) {
+      if (bits == 8 && group_size == 32) {
         kernel = cu::fp_quantize_dequantize<T, 32, 8, true, false>;
-      } else if (group_size == 16) {
+      } else if (bits == 4 && group_size == 16) {
         kernel = cu::fp_quantize_dequantize<T, 16, 4, false, false>;
+      } else if (bits != 4 || group_size != 32) {
+        throw std::invalid_argument(
+            fp_quant_config_error("fp_quantize_dequantize", bits, group_size));
       }
       bool large = w.size() > UINT_MAX;
       auto [num_blocks, block_dims] =
@@ -471,10 +491,13 @@ void fp_quantize(
         auto M = w.shape(-2);
         auto K = w.shape(-1);
         auto kernel = cu::fp_quantize_columnwise<T, 32, 4, true, false>;
-        if (bits == 8) {
+        if (bits == 8 && group_size == 32) {
           kernel = cu::fp_quantize_columnwise<T, 32, 8, true, false>;
-        } else if (group_size == 16) {
+        } else if (bits == 4 && group_size == 16) {
           kernel = cu::fp_quantize_columnwise<T, 16, 4, false, false>;
+        } else if (bits != 4 || group_size != 32) {
+          throw std::invalid_argument(fp_quant_config_error(
+              "fp_quantize_columnwise", bits, group_size));
         }
         auto [num_blocks, block_dims] =
             cu::get_columnwise_quantize_launch_args(w.size(), group_size, M, K);
@@ -500,10 +523,13 @@ void fp_quantize(
       using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       if constexpr (!std::is_same_v<T, double>) {
         auto kernel = cu::fp_quantize_rowwise<T, 32, 4, true, false>;
-        if (bits == 8) {
+        if (bits == 8 && group_size == 32) {
           kernel = cu::fp_quantize_rowwise<T, 32, 8, true, false>;
-        } else if (group_size == 16) {
+        } else if (bits == 4 && group_size == 16) {
           kernel = cu::fp_quantize_rowwise<T, 16, 4, false, false>;
+        } else if (bits != 4 || group_size != 32) {
+          throw std::invalid_argument(
+              fp_quant_config_error("fp_quantize_rowwise", bits, group_size));
         }
         bool large = w.size() > UINT_MAX;
         auto [num_blocks, block_dims] = get_launch_args(
@@ -554,10 +580,13 @@ void fp_dequantize(
     using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     if constexpr (!std::is_same_v<T, double>) {
       auto kernel = cu::fp_dequantize<T, 32, 4, true>;
-      if (bits == 8) {
+      if (bits == 8 && group_size == 32) {
         kernel = cu::fp_dequantize<T, 32, 8, true>;
-      } else if (group_size == 16) {
+      } else if (bits == 4 && group_size == 16) {
         kernel = cu::fp_dequantize<T, 16, 4, false>;
+      } else if (bits != 4 || group_size != 32) {
+        throw std::invalid_argument(
+            fp_quant_config_error("fp_dequantize", bits, group_size));
       }
       auto [num_blocks, block_dims] =
           get_launch_args(size, grid_shape, w.strides(), large);

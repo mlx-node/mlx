@@ -381,7 +381,7 @@ inline void dispatch_quant_types(
     f.template operator()<cutlass::float_e4m3_t, cutlass::float_ue8m0_t, 32>();
   } else if (mode == QuantizationMode::Nvfp4) {
     f.template operator()<cutlass::float_e2m1_t, cutlass::float_e4m3_t, 16>();
-  } else {
+  } else if (mode == QuantizationMode::Affine) {
     dispatch_groups(group_size, tag, [&]<int group_size>() {
       if (bits == 2) {
         f.template operator()<cutlass::uint2b_t, T, group_size>();
@@ -400,6 +400,12 @@ inline void dispatch_quant_types(
             fmt::format("{} {}-bit quantization is not supported.", tag, bits));
       }
     });
+  } else {
+    throw std::invalid_argument(
+        fmt::format(
+            "{} Quantization mode '{}' is not supported.",
+            tag,
+            quantization_mode_to_string(mode)));
   }
 }
 

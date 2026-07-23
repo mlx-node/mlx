@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <stdexcept>
 #include <unordered_set>
 
 #include "mlx/api.h"
@@ -152,7 +153,68 @@ class MLX_API UnaryPrimitive : public Primitive {
   UnaryPrimitive& operator=(UnaryPrimitive&& other) = delete;
 };
 
-enum class QuantizationMode { Affine, Mxfp4, Mxfp8, Nvfp4 };
+// The enumerator ordinal is a serialized wire format: QuantizedMatmul,
+// QQMatmul and GatherQMM put the mode in their state() tuple, which export.cpp
+// writes to and reads back from exported function files. Append new modes at
+// the end only. Reordering or removing one reinterprets every previously
+// exported graph as a different quantization format.
+enum class QuantizationMode { Affine, Mxfp4, Mxfp8, Nvfp4, Q6K, Q4K, Q5K };
+
+// How many companion arrays a mode stores next to the packed weights. The
+// affine and K-quant modes carry both scales and biases, the floating point
+// modes carry scales alone.
+constexpr int quant_weight_arrays(QuantizationMode mode) {
+  switch (mode) {
+    case QuantizationMode::Affine:
+    case QuantizationMode::Q6K:
+    case QuantizationMode::Q4K:
+    case QuantizationMode::Q5K:
+      return 2;
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4:
+      return 1;
+  }
+  throw std::invalid_argument(
+      "[quant_weight_arrays] Unknown quantization mode.");
+}
+
+// Whether a mode pairs every scale with a minimum. Q4K and Q5K are asymmetric
+// and interleave (sub-scale, sub-min) in the scales array and (super-scale,
+// super-min) in the biases array, so both companions hold two values per group.
+constexpr bool quant_has_sub_min(QuantizationMode mode) {
+  switch (mode) {
+    case QuantizationMode::Q4K:
+    case QuantizationMode::Q5K:
+      return true;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4:
+    case QuantizationMode::Q6K:
+      return false;
+  }
+  throw std::invalid_argument("[quant_has_sub_min] Unknown quantization mode.");
+}
+
+// How many groups a K-quant super-block spans, or 0 for a mode that has no
+// second scale level. A super-block always covers group_size * ratio == 256
+// weights, so a non-zero value also identifies the K-quant modes.
+constexpr int quant_super_ratio(QuantizationMode mode) {
+  switch (mode) {
+    case QuantizationMode::Q6K:
+      return 16;
+    case QuantizationMode::Q4K:
+    case QuantizationMode::Q5K:
+      return 8;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4:
+      return 0;
+  }
+  throw std::invalid_argument("[quant_super_ratio] Unknown quantization mode.");
+}
 
 std::string quantization_mode_to_string(QuantizationMode mode);
 QuantizationMode string_to_quantization_mode(

@@ -86,6 +86,7 @@ void validate_quantized_input(
     const array& scales,
     int group_size,
     int bits,
+    QuantizationMode mode,
     const std::optional<array>& biases = std::nullopt) {
   if (w.dtype() != uint32) {
     std::ostringstream msg;
@@ -94,7 +95,15 @@ void validate_quantized_input(
     throw std::invalid_argument(msg.str());
   }
 
-  if (biases && scales.shape() != biases->shape()) {
+  // A K-quant keeps ggml's integer sub-block scales in `scales` and the
+  // float16 super-block scales in `biases`, so the two companions have
+  // different lengths along the last axis and are sized separately below.
+  int super_ratio = quant_super_ratio(mode);
+  // Q4K and Q5K interleave a minimum next to every scale at both levels, so
+  // each of their companions holds two values per group instead of one.
+  int per_group = quant_has_sub_min(mode) ? 2 : 1;
+
+  if (biases && super_ratio == 0 && scales.shape() != biases->shape()) {
     std::ostringstream msg;
     msg << "[" << tag << "] Scales and biases should have the same shape. "
         << "Received scales with shape " << scales.shape()
@@ -102,23 +111,56 @@ void validate_quantized_input(
     throw std::invalid_argument(msg.str());
   }
 
-  if (!std::equal(
-          w.shape().begin(), w.shape().end() - 2, scales.shape().begin())) {
-    std::ostringstream msg;
-    msg << "[" << tag
-        << "] Weight and scales should have the same batch shape. "
-        << "Received weight with shape " << w.shape() << ", scales with "
-        << scales.shape() << ".";
-    throw std::invalid_argument(msg.str());
-  }
+  auto check_batch_shape = [&](const array& a, const char* name) {
+    if (a.ndim() != w.ndim() ||
+        !std::equal(
+            w.shape().begin(), w.shape().end() - 2, a.shape().begin())) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Weight and " << name
+          << " should have the same batch shape. "
+          << "Received weight with shape " << w.shape() << ", " << name
+          << " with " << a.shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  check_batch_shape(scales, "scales");
 
-  if (w.shape(-1) * 32 / bits != scales.shape(-1) * group_size) {
+  int el_per_row = w.shape(-1) * 32 / bits;
+  if (el_per_row * per_group != scales.shape(-1) * group_size) {
     std::ostringstream msg;
     msg << "[" << tag << "] The shapes of the weight and scales are "
         << "incompatible based on bits and group_size. w.shape() == "
         << w.shape() << " and scales.shape() == " << scales.shape()
         << " with group_size=" << group_size << " and bits=" << bits;
     throw std::invalid_argument(msg.str());
+  }
+
+  if (super_ratio > 0) {
+    if (!biases) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Biases must be provided for "
+          << quantization_mode_to_string(mode) << " quantization.";
+      throw std::invalid_argument(msg.str());
+    }
+    int super_size = group_size * super_ratio;
+    if (el_per_row % super_size != 0) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << quantization_mode_to_string(mode)
+          << " quantization needs the last dimension to be divisible by the "
+          << "super-block size " << super_size
+          << " but w.shape() == " << w.shape() << " expands to " << el_per_row
+          << " elements per row.";
+      throw std::invalid_argument(msg.str());
+    }
+    check_batch_shape(*biases, "biases");
+    if (el_per_row * per_group != biases->shape(-1) * super_size) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] The shapes of the weight and biases are "
+          << "incompatible based on the " << super_size
+          << " element super-block. w.shape() == " << w.shape()
+          << " and biases.shape() == " << biases->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
   }
 }
 
@@ -130,8 +172,9 @@ std::pair<int, int> extract_quantized_matmul_dims(
     const std::optional<array>& biases,
     bool transpose,
     int group_size,
-    int bits) {
-  validate_quantized_input(tag, w, scales, group_size, bits, biases);
+    int bits,
+    QuantizationMode mode) {
+  validate_quantized_input(tag, w, scales, group_size, bits, mode, biases);
 
   int x_inner_dims = x.shape(-1);
 
@@ -4517,11 +4560,14 @@ array conv_general(
 }
 
 std::pair<int, int> quantization_params_from_mode(
+    std::string_view tag,
     QuantizationMode mode,
     std::optional<int> group_size_,
     std::optional<int> bits_) {
-  int default_group_size;
-  int default_bits;
+  // Left negative when a mode has no entry below, so an unhandled mode is
+  // rejected instead of reading an indeterminate value.
+  int default_group_size = -1;
+  int default_bits = -1;
   switch (mode) {
     case QuantizationMode::Affine:
       default_group_size = 64;
@@ -4539,10 +4585,63 @@ std::pair<int, int> quantization_params_from_mode(
       default_group_size = 32;
       default_bits = 8;
       break;
+    case QuantizationMode::Q6K:
+      default_group_size = 16;
+      default_bits = 6;
+      break;
+    case QuantizationMode::Q4K:
+      default_group_size = 32;
+      default_bits = 4;
+      break;
+    case QuantizationMode::Q5K:
+      default_group_size = 32;
+      default_bits = 5;
+      break;
   }
-  return {
-      group_size_.has_value() ? *group_size_ : default_group_size,
-      bits_.has_value() ? *bits_ : default_bits};
+  if (default_group_size < 0 || default_bits < 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Quantization mode with value "
+        << static_cast<int>(mode) << " has no group size and bit width.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int group_size = group_size_.has_value() ? *group_size_ : default_group_size;
+  int bits = bits_.has_value() ? *bits_ : default_bits;
+
+  // Every op that takes these two divides by them: `w.shape(-1) * 32 / bits`
+  // to recover the element count of a row, `shape % group_size` to check the
+  // row splits into whole groups. A caller-supplied zero reaches those
+  // divisions as a fault rather than as an error, so screen both here, on the
+  // one path that hands the pair to all of them.
+  if (bits <= 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Invalid value for bits: " << bits;
+    throw std::invalid_argument(msg.str());
+  }
+  if (group_size <= 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Invalid value for group_size: " << group_size;
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Affine spans a range of both parameters, but every other mode is defined
+  // by exactly one (group size, bits) pair. Any other pair means the caller's
+  // mode and parameters disagree about which format the arrays hold, and the
+  // backends resolve that disagreement inconsistently: the CPU and the Metal
+  // JIT decode by (group size, bits), CUDA decodes by mode, and the Metal
+  // metallib build misses a kernel name. Reject it here so every backend sees
+  // the same error.
+  if (mode != QuantizationMode::Affine &&
+      (group_size != default_group_size || bits != default_bits)) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] " << quantization_mode_to_string(mode)
+        << " quantization requires group size " << default_group_size << " and "
+        << default_bits << " bits but got group size " << group_size << " and "
+        << bits << " bits.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  return {group_size, bits};
 }
 
 std::pair<Dtype, QuantizationMode> validate_mode_with_type(
@@ -4578,17 +4677,45 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
     } else {
       return {dtype, qmode};
     }
-  } else if (scales.dtype() != uint8) {
-    std::ostringstream msg;
-    msg << "[" << tag << "] Scale type must be uint8 but received type "
-        << scales.dtype() << ".";
-    throw std::invalid_argument(msg.str());
-  }
-  if (biases) {
-    std::ostringstream msg;
-    msg << "[" << tag << "] Biases must be null for quantization mode '" << mode
-        << "'.";
-    throw std::invalid_argument(msg.str());
+  } else if (quant_super_ratio(qmode) > 0) {
+    // A K-quant carries ggml's integer sub-block scales in `scales` and the
+    // float16 super-block scales in `biases`, so both companions are required
+    // and neither one holds a dequantized floating point value. Q6K is
+    // symmetric and its sub-block scales are signed.
+    auto scales_type = quant_has_sub_min(qmode) ? uint8 : int8;
+    if (scales.dtype() != scales_type) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Scale type must be " << scales_type
+          << " for quantization mode '" << mode << "' but received type "
+          << scales.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (!biases) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Biases must be provided for quantization mode '"
+          << mode << "'.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (biases->dtype() != float16) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Bias type must be " << float16
+          << " for quantization mode '" << mode << "' but received type "
+          << biases->dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  } else {
+    if (scales.dtype() != uint8) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Scale type must be uint8 but received type "
+          << scales.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (biases) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Biases must be null for quantization mode '"
+          << mode << "'.";
+      throw std::invalid_argument(msg.str());
+    }
   }
   if (out_type.has_value()) {
     return {*out_type, qmode};
@@ -4638,11 +4765,19 @@ array quantized_matmul(
   auto [dtype, qmode] = validate_mode_with_type(
       "quantized_matmul", scales, biases, std::nullopt, mode);
 
-  auto [group_size, bits] =
-      quantization_params_from_mode(qmode, group_size_, bits_);
+  auto [group_size, bits] = quantization_params_from_mode(
+      "quantized_matmul", qmode, group_size_, bits_);
   // Check and extract the quantized matrix shape against x
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
-      "quantized_matmul", x, w, scales, biases, transpose, group_size, bits);
+      "quantized_matmul",
+      x,
+      w,
+      scales,
+      biases,
+      transpose,
+      group_size,
+      bits,
+      qmode);
 
   if (qmode == QuantizationMode::Affine) {
     dtype = promote_types(x.dtype(), dtype);
@@ -4660,6 +4795,10 @@ array quantized_matmul(
   if (qmode == QuantizationMode::Affine) {
     inputs = {
         astype(x, dtype), w, astype(scales, dtype), astype(*biases, dtype)};
+  } else if (quant_weight_arrays(qmode) == 2) {
+    // The K-quant companions stay in their stored types: the kernel decodes
+    // the sub-block scale and the super-block scale into a scale/bias pair.
+    inputs = {x, w, scales, *biases};
   } else {
     inputs = {x, w, scales};
   }
@@ -4703,7 +4842,7 @@ void validate_qqmm_inputs(
     }
     // if scales are provided, check compatibility with quantized w
     else {
-      validate_quantized_input("qqmm", w, *scales_w, group_size, bits);
+      validate_quantized_input("qqmm", w, *scales_w, group_size, bits, qmode);
     }
   }
   // if w is not quantized, dtype must be in {f16, bf16, fp32}
@@ -4742,7 +4881,8 @@ std::pair<int, int> extract_qqmm_dims(
     array w,
     std::optional<array> scales_w,
     int group_size,
-    int bits) {
+    int bits,
+    QuantizationMode mode) {
   if (w.dtype() != uint32) {
     // if w is not quantized, check that last dims match
     if (x.shape(-1) != w.shape(-1)) {
@@ -4763,7 +4903,8 @@ std::pair<int, int> extract_qqmm_dims(
         std::nullopt,
         /* transpose = */ true,
         group_size,
-        bits);
+        bits,
+        mode);
   }
 }
 
@@ -4790,7 +4931,7 @@ array qqmm(
   // 1. w is quantized, scales is provided
   // 2. w is not quantized, scales is not provided
   auto [group_size, bits] =
-      quantization_params_from_mode(qmode, group_size_, bits_);
+      quantization_params_from_mode("qqmm", qmode, group_size_, bits_);
 
   // Allow gemv
   auto x = in_x;
@@ -4806,7 +4947,7 @@ array qqmm(
       x, w, scales_w, group_size, bits, global_scale_x, global_scale_w, qmode);
   // validate and extract shapes
   auto [w_inner_dims, w_outer_dims] =
-      extract_qqmm_dims(x, w, scales_w, group_size, bits);
+      extract_qqmm_dims(x, w, scales_w, group_size, bits, qmode);
   std::vector<array> inputs = {
       x,
       w,
@@ -5065,7 +5206,17 @@ std::vector<array> quantize(
     StreamOrDevice s /* = {} */) {
   auto qmode = string_to_quantization_mode(mode, "quantize");
   auto [group_size, bits] =
-      quantization_params_from_mode(qmode, group_size_, bits_);
+      quantization_params_from_mode("quantize", qmode, group_size_, bits_);
+  // The K-quant formats are only ever read. Producing them needs ggml's
+  // iterative make_qkx2_quants sub-block search, which has no counterpart
+  // here, and rounding into them with a plain min/max fit would emit weights
+  // that no longer match the file they came from.
+  if (quant_super_ratio(qmode) > 0) {
+    std::ostringstream msg;
+    msg << "[quantize] Quantization mode '" << mode
+        << "' can be read but not produced.";
+    throw std::invalid_argument(msg.str());
+  }
   if (!issubdtype(w.dtype(), floating)) {
     std::ostringstream msg;
     msg << "[quantize] Only real floating types can be quantized "
@@ -5332,17 +5483,7 @@ array dequantize(
   auto [out_type, qmode] =
       validate_mode_with_type("dequantize", scales, biases, dtype, mode);
   auto [group_size, bits] =
-      quantization_params_from_mode(qmode, group_size_, bits_);
-  if (bits <= 0) {
-    std::ostringstream msg;
-    msg << "[dequantize] Invalid value for bits: " << bits;
-    throw std::invalid_argument(msg.str());
-  }
-  if (group_size <= 0) {
-    std::ostringstream msg;
-    msg << "[dequantize] Invalid value for group_size: " << group_size;
-    throw std::invalid_argument(msg.str());
-  }
+      quantization_params_from_mode("dequantize", qmode, group_size_, bits_);
   if (w.dtype() != uint32) {
     throw std::invalid_argument(
         "[dequantize] The matrix should be given as a uint32");
@@ -5367,6 +5508,13 @@ array dequantize(
         affine_dequantize(w, scales, *biases, group_size, bits, s),
         out_type,
         s);
+  } else if (quant_super_ratio(qmode) > 0) {
+    validate_quantized_input(
+        "dequantize", w, scales, group_size, bits, qmode, biases);
+    std::ostringstream msg;
+    msg << "[dequantize] Quantization mode '" << mode
+        << "' is not yet implemented.";
+    throw std::invalid_argument(msg.str());
   } else {
     return fp_dequantize(
         w,
@@ -5435,9 +5583,9 @@ array gather_qmm(
   auto [out_type, qmode] =
       validate_mode_with_type("gather_qmm", scales, biases, std::nullopt, mode);
   auto [group_size, bits] =
-      quantization_params_from_mode(qmode, group_size_, bits_);
+      quantization_params_from_mode("gather_qmm", qmode, group_size_, bits_);
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
-      "gather_qmm", x, w, scales, biases, transpose, group_size, bits);
+      "gather_qmm", x, w, scales, biases, transpose, group_size, bits, qmode);
   if (qmode == QuantizationMode::Affine) {
     out_type = promote_types(x.dtype(), out_type);
   } else {
@@ -5487,6 +5635,16 @@ array gather_qmm(
         std::move(w),
         astype(scales, out_type, s),
         astype(*biases, out_type, s),
+        std::move(lhs_indices),
+        std::move(rhs_indices)};
+  } else if (quant_weight_arrays(qmode) == 2) {
+    // The K-quant companions stay in their stored types: the kernel decodes
+    // the sub-block scale and the super-block scale into a scale/bias pair.
+    inputs = {
+        astype(x, out_type, s),
+        std::move(w),
+        scales,
+        *biases,
         std::move(lhs_indices),
         std::move(rhs_indices)};
   } else {

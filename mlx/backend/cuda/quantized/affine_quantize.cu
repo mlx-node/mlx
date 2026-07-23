@@ -226,8 +226,11 @@ __global__ void affine_dequantize(
 
 } // namespace cu
 
+// A group size or bit width with no case below would skip the callback, and
+// with it the kernel node, leaving the freshly allocated outputs holding
+// uninitialized memory. Both dispatchers throw instead of falling through.
 template <typename F>
-void dispatch_groups(int group_size, F&& f) {
+void dispatch_groups(int group_size, const char* tag, F&& f) {
   switch (group_size) {
     case 32:
       f(std::integral_constant<int, 32>{});
@@ -238,11 +241,17 @@ void dispatch_groups(int group_size, F&& f) {
     case 128:
       f(std::integral_constant<int, 128>{});
       break;
+    default:
+      throw std::invalid_argument(
+          fmt::format(
+              "[{}] Affine quantization group size {} is not supported. Supported are 32, 64 and 128.",
+              tag,
+              group_size));
   }
 }
 
 template <typename F>
-void dispatch_bits(int bits, F&& f) {
+void dispatch_bits(int bits, const char* tag, F&& f) {
   switch (bits) {
     case 2:
       f(std::integral_constant<int, 2>{});
@@ -262,6 +271,12 @@ void dispatch_bits(int bits, F&& f) {
     case 8:
       f(std::integral_constant<int, 8>{});
       break;
+    default:
+      throw std::invalid_argument(
+          fmt::format(
+              "[{}] Affine quantization with {} bits is not supported. Supported are 2, 3, 4, 5, 6 and 8.",
+              tag,
+              bits));
   }
 }
 
@@ -288,8 +303,8 @@ void affine_quantize(
   enc.set_output_array(scales);
   enc.set_output_array(biases);
   dispatch_float_types(w.dtype(), "affine_quantize", [&](auto type_tag) {
-    dispatch_groups(group_size_, [&](auto group_size) {
-      dispatch_bits(bits_, [&](auto bits) {
+    dispatch_groups(group_size_, "affine_quantize", [&](auto group_size) {
+      dispatch_bits(bits_, "affine_quantize", [&](auto bits) {
         using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         auto kernel = cu::affine_quantize<T, group_size.value, bits.value>;
         auto [num_blocks, block_dims] =
@@ -343,8 +358,8 @@ void affine_dequantize(
   enc.set_input_array(biases);
   enc.set_output_array(w);
   dispatch_float_types(w.dtype(), "affine_dequantize", [&](auto type_tag) {
-    dispatch_groups(group_size_, [&](auto group_size) {
-      dispatch_bits(bits_, [&](auto bits) {
+    dispatch_groups(group_size_, "affine_dequantize", [&](auto group_size) {
+      dispatch_bits(bits_, "affine_dequantize", [&](auto bits) {
         using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         auto kernel = cu::affine_dequantize<T, group_size.value, bits.value>;
         auto [num_blocks, block_dims] =

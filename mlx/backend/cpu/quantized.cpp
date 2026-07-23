@@ -376,7 +376,8 @@ void _qmm_dispatch_typed(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
       break;
     default:
-      throw std::invalid_argument("Quantization bits must be 2, 3, 4, 6 or 8.");
+      throw std::invalid_argument(
+          "Quantization bits must be 2, 3, 4, 5, 6 or 8.");
   }
 }
 
@@ -652,8 +653,97 @@ void fp_qmm_dispatch_mode(
   }
 }
 
+std::string
+fp_quant_config_error(std::string_view tag, int bits, int group_size) {
+  std::ostringstream msg;
+  msg << "[" << tag << "] Unsupported floating point quantization with " << bits
+      << " bits and group size " << group_size
+      << ". Supported are mxfp8 (8 bits, group size 32), mxfp4 (4 bits, group "
+      << "size 32) and nvfp4 (4 bits, group size 16).";
+  return msg.str();
+}
+
+void validate_fp_quant_config(std::string_view tag, int bits, int group_size) {
+  bool supported = (bits == 8 && group_size == 32) ||
+      (bits == 4 && group_size == 32) || (bits == 4 && group_size == 16);
+  if (!supported) {
+    throw std::invalid_argument(fp_quant_config_error(tag, bits, group_size));
+  }
+}
+
+// The affine kernels are instantiated for these bit widths and group sizes
+// alone. quantized_matmul and gather_qmm accept any pair for the affine mode,
+// so an unsupported one is only caught here.
+void validate_affine_quant_config(
+    std::string_view tag,
+    int bits,
+    int group_size) {
+  if (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 &&
+      bits != 8) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] Affine quantization bits must be 2, 3, 4, 5, 6 or 8 but got "
+        << bits << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (group_size != 32 && group_size != 64 && group_size != 128) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] Affine quantization group size must be 32, 64 or 128 but got "
+        << group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+// The kernels are instantiated for these three types. float64 also satisfies
+// the floating point check the op layer applies, and reaches the backend.
+void validate_quant_type(std::string_view tag, Dtype dtype) {
+  if (dtype != float32 && dtype != float16 && dtype != bfloat16) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] Only float32, float16 and bfloat16 are supported but got "
+        << dtype << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+// A K-quant reaches the backend with the same input count as an affine matmul,
+// so the mode is the only thing that separates the two. Nothing here decodes
+// the two scale levels yet, and both the affine and the floating point
+// dispatch would read the companions as a format they are not.
+void reject_kquant(std::string_view tag, QuantizationMode mode) {
+  if (quant_super_ratio(mode) > 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Quantization mode '"
+        << quantization_mode_to_string(mode)
+        << "' is not implemented on the CPU backend.";
+    throw std::runtime_error(msg.str());
+  }
+}
+
+// Checks everything the dispatch chains select on: the mode, the element type,
+// the bit width and the group size. Called on the thread that evaluates the
+// primitive, because the chains themselves run inside encoder.dispatch(...) on
+// the scheduler thread, where an escaping exception terminates the process
+// instead of reaching the caller.
+void validate_qmm_dispatch(
+    std::string_view tag,
+    QuantizationMode mode,
+    Dtype dtype,
+    int bits,
+    int group_size) {
+  reject_kquant(tag, mode);
+  validate_quant_type(tag, dtype);
+  if (mode == QuantizationMode::Affine) {
+    validate_affine_quant_config(tag, bits, group_size);
+  } else {
+    validate_fp_quant_config(tag, bits, group_size);
+  }
+}
+
 template <typename T>
 void fp_qmm_dispatch_typed(
+    std::string_view tag,
     array& out,
     const array& x,
     const array& w,
@@ -661,16 +751,19 @@ void fp_qmm_dispatch_typed(
     int group_size,
     int bits,
     bool transposed_w) {
-  if (bits == 8) {
+  if (bits == 8 && group_size == 32) {
     fp_qmm_dispatch_mode<T, 32, 8>(out, x, w, scales, transposed_w);
-  } else if (group_size == 32) {
+  } else if (bits == 4 && group_size == 32) {
     fp_qmm_dispatch_mode<T, 32, 4>(out, x, w, scales, transposed_w);
-  } else {
+  } else if (bits == 4 && group_size == 16) {
     fp_qmm_dispatch_mode<T, 16, 4>(out, x, w, scales, transposed_w);
+  } else {
+    throw std::invalid_argument(fp_quant_config_error(tag, bits, group_size));
   }
 }
 
 void fp_qmm_dispatch(
+    std::string_view tag,
     array& out,
     const array& x,
     const array& w,
@@ -681,19 +774,20 @@ void fp_qmm_dispatch(
   switch (x.dtype()) {
     case bfloat16:
       fp_qmm_dispatch_typed<bfloat16_t>(
-          out, x, w, scales, group_size, bits, transposed_w);
+          tag, out, x, w, scales, group_size, bits, transposed_w);
       break;
     case float16:
       fp_qmm_dispatch_typed<float16_t>(
-          out, x, w, scales, group_size, bits, transposed_w);
+          tag, out, x, w, scales, group_size, bits, transposed_w);
       break;
     case float32:
       fp_qmm_dispatch_typed<float>(
-          out, x, w, scales, group_size, bits, transposed_w);
+          tag, out, x, w, scales, group_size, bits, transposed_w);
       break;
     default:
-      throw std::invalid_argument(
-          "[quantized_matmul] only floating types are supported");
+      std::ostringstream msg;
+      msg << "[" << tag << "] only floating types are supported";
+      throw std::invalid_argument(msg.str());
   }
 }
 
@@ -845,6 +939,7 @@ void fp_bs_qmm_dispatch_mode(
 
 template <typename T>
 void fp_bs_qmm_dispatch_typed(
+    std::string_view tag,
     array& out,
     const array& x,
     const array& w,
@@ -854,19 +949,22 @@ void fp_bs_qmm_dispatch_typed(
     int group_size,
     int bits,
     bool transposed_w) {
-  if (bits == 8) {
+  if (bits == 8 && group_size == 32) {
     fp_bs_qmm_dispatch_mode<T, 32, 8>(
         out, x, w, scales, lhs_indices, rhs_indices, transposed_w);
-  } else if (group_size == 32) {
+  } else if (bits == 4 && group_size == 32) {
     fp_bs_qmm_dispatch_mode<T, 32, 4>(
         out, x, w, scales, lhs_indices, rhs_indices, transposed_w);
-  } else {
+  } else if (bits == 4 && group_size == 16) {
     fp_bs_qmm_dispatch_mode<T, 16, 4>(
         out, x, w, scales, lhs_indices, rhs_indices, transposed_w);
+  } else {
+    throw std::invalid_argument(fp_quant_config_error(tag, bits, group_size));
   }
 }
 
 void fp_bs_qmm_dispatch(
+    std::string_view tag,
     array& out,
     const array& x,
     const array& w,
@@ -879,6 +977,7 @@ void fp_bs_qmm_dispatch(
   switch (x.dtype()) {
     case float32:
       fp_bs_qmm_dispatch_typed<float>(
+          tag,
           out,
           x,
           w,
@@ -891,6 +990,7 @@ void fp_bs_qmm_dispatch(
       break;
     case float16:
       fp_bs_qmm_dispatch_typed<float16_t>(
+          tag,
           out,
           x,
           w,
@@ -903,6 +1003,7 @@ void fp_bs_qmm_dispatch(
       break;
     case bfloat16:
       fp_bs_qmm_dispatch_typed<bfloat16_t>(
+          tag,
           out,
           x,
           w,
@@ -914,8 +1015,9 @@ void fp_bs_qmm_dispatch(
           transposed_w);
       break;
     default:
-      throw std::invalid_argument(
-          "[quantized_matmul] only floating types are supported");
+      std::ostringstream msg;
+      msg << "[" << tag << "] only floating types are supported";
+      throw std::invalid_argument(msg.str());
   }
 }
 
@@ -925,6 +1027,9 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto& x_pre = inputs[0];
   auto& w_pre = inputs[1];
   auto& scales_pre = inputs[2];
+
+  validate_qmm_dispatch(
+      "quantized_matmul", mode_, x_pre.dtype(), bits_, group_size_);
 
   auto& encoder = cpu::get_command_encoder(stream());
   auto x = ensure_row_contiguous(x_pre, encoder, stream());
@@ -958,7 +1063,15 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
                       group_size_ = group_size_,
                       bits_ = bits_,
                       transpose_ = transpose_]() mutable {
-      fp_qmm_dispatch(out, x, w, scales, group_size_, bits_, transpose_);
+      fp_qmm_dispatch(
+          "quantized_matmul",
+          out,
+          x,
+          w,
+          scales,
+          group_size_,
+          bits_,
+          transpose_);
     });
   }
 }
@@ -967,8 +1080,12 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto& x_pre = inputs[0];
   auto& w_pre = inputs[1];
   auto& scales_pre = inputs[2];
-  auto& lhs_indices = inputs[inputs.size() - 2];
-  auto& rhs_indices = inputs[inputs.size() - 1];
+
+  validate_qmm_dispatch("gather_qmm", mode_, x_pre.dtype(), bits_, group_size_);
+
+  int companions = quant_weight_arrays(mode_);
+  auto& lhs_indices = inputs[2 + companions];
+  auto& rhs_indices = inputs[3 + companions];
 
   auto& encoder = cpu::get_command_encoder(stream());
   auto ensure_row_contiguous_last_dims = [s = stream(),
@@ -1033,6 +1150,7 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
                       bits_ = bits_,
                       transpose_ = transpose_]() mutable {
       fp_bs_qmm_dispatch(
+          "gather_qmm",
           out,
           x,
           w,
@@ -1229,6 +1347,21 @@ void dispatch_quantize(
 void fast::Quantize::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  // The kernel below packs a per-group scale and bias, which is the affine
+  // layout. Every other mode reaches the CPU through the fallback graph, so a
+  // mode that arrives here would be decoded as a format it is not. Checked
+  // ahead of the dispatch, which runs on the scheduler thread where a throw
+  // terminates the process.
+  if (mode_ != QuantizationMode::Affine) {
+    std::ostringstream msg;
+    msg << "[quantize] Quantization mode '"
+        << quantization_mode_to_string(mode_)
+        << "' is not implemented on the CPU backend.";
+    throw std::runtime_error(msg.str());
+  }
+  validate_quant_type("quantize", inputs[0].dtype());
+  validate_affine_quant_config("quantize", bits_, group_size_);
+
   auto& encoder = cpu::get_command_encoder(stream());
   auto w = ensure_row_contiguous(inputs[0], encoder, stream());
   auto& out = outputs[0];
@@ -1320,6 +1453,19 @@ void fast::ConvertFP8::eval_cpu(
 }
 
 void QQMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
+  // Both halves of the path below read a shared exponent block format: x is
+  // rounded through it and w is decoded from it. An affine or K-quant mode
+  // carries companions this never reads. Checked ahead of the dispatch, which
+  // runs on the scheduler thread where a throw terminates the process.
+  reject_kquant("qqmm", mode_);
+  if (mode_ == QuantizationMode::Affine) {
+    throw std::runtime_error(
+        "[qqmm] Quantization mode 'affine' is not implemented on the CPU "
+        "backend.");
+  }
+  validate_quant_type("qqmm", inputs[0].dtype());
+  validate_fp_quant_config("qqmm", bits_, group_size_);
+
   auto& encoder = cpu::get_command_encoder(stream());
 
   bool w_quantized = (inputs[1].dtype() == uint32);
@@ -1351,7 +1497,7 @@ void QQMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
                       group_size_ = group_size_,
                       bits_ = bits_]() mutable {
       dispatch_quantize_dequantize(x, xhat, bits_, group_size_);
-      fp_qmm_dispatch(out, xhat, w, scales, group_size_, bits_, true);
+      fp_qmm_dispatch("qqmm", out, xhat, w, scales, group_size_, bits_, true);
     });
     return;
   } else {

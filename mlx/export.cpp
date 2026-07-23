@@ -153,7 +153,18 @@ T deserialize(Reader& is) {
     }
     return v;
   } else if constexpr (std::is_enum_v<T>) {
-    return static_cast<T>(deserialize<int>(is));
+    auto v = static_cast<T>(deserialize<int>(is));
+    if constexpr (std::is_same_v<T, QuantizationMode>) {
+      // The ordinal comes straight out of the file, and every switch on the
+      // mode assumes that some enumerator names it. A corrupt file, or one
+      // written by a build that has more modes than this one, would otherwise
+      // reach those switches with a value none of them handle.
+      // quantization_mode_to_string names every enumerator and throws on
+      // anything else, so calling it here range-checks the value without a
+      // bound this file would have to keep in sync.
+      quantization_mode_to_string(v);
+    }
+    return v;
   } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
     return nullptr;
   } else if constexpr (is_iterable<T>) {

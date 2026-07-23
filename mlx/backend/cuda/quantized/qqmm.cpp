@@ -77,6 +77,14 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& device = encoder.device();
   bool w_quantized = (inputs[1].dtype() == uint32);
 
+  // A K-quant carries a second companion array that the paths below never
+  // read, and no kernel here decodes its two scale levels.
+  if (quant_super_ratio(mode_) > 0) {
+    throw std::runtime_error(
+        "[qqmm] Quantization mode \"" + quantization_mode_to_string(mode_) +
+        "\" is not implemented on the CUDA backend.");
+  }
+
   // - 2 inputs: x, w (non-quantized w)
   // - 3 inputs: x, w, scales_w (quantized w)
   int base_size = w_quantized ? 3 : 2;
