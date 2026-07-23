@@ -25,6 +25,7 @@ const char* hadamard();
 const char* logsumexp();
 const char* quantized_utils();
 const char* quantized();
+const char* kquant();
 const char* fp_quantized();
 const char* ternary();
 const char* scan();

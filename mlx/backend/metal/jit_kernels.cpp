@@ -3,6 +3,7 @@
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/primitives.h"
 
 using namespace fmt::literals;
 
@@ -955,6 +956,19 @@ MTL::ComputePipelineState* get_fft_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+// One source per kernel family: affine's per-group scale/bias grid, the
+// shared-exponent block behind mxfp4/mxfp8/nvfp4, and the K-quants' two-level
+// integer scale decode.
+static const char* quantized_source(const std::string& mode) {
+  if (mode == "affine") {
+    return metal::quantized();
+  }
+  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+    return metal::kquant();
+  }
+  return metal::fp_quantized();
+}
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -968,7 +982,7 @@ MTL::ComputePipelineState* get_quantized_kernel(
         metal::utils(),
         metal::gemm(),
         metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
+        quantized_source(mode),
         template_def);
     return kernel_source;
   });
@@ -995,22 +1009,41 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     std::string kernel_source;
     concatenate(
         kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
-    bool is_affine = mode == "affine";
-    concatenate(
-        kernel_source,
-        is_affine ? metal::quantized() : metal::fp_quantized(),
-        get_template_definition(
-            lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs"),
-            get_type_string(x.dtype()),
-            group_size,
-            bits,
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            transpose));
+    auto qmode = string_to_quantization_mode(mode, "gather_qmm");
+    int super_ratio = quant_super_ratio(qmode);
+    std::string func = mode == "affine" ? "affine_gather_qmm_rhs"
+        : super_ratio > 0               ? "kquant_gather_qmm_rhs"
+                                        : "fp_gather_qmm_rhs";
+    // The K-quant kernels take the super-block ratio and the sub-minimum flag
+    // right after bits; every later template parameter matches the other
+    // families.
+    auto template_def = super_ratio > 0 ? get_template_definition(
+                                              lib_name,
+                                              func,
+                                              get_type_string(x.dtype()),
+                                              group_size,
+                                              bits,
+                                              super_ratio,
+                                              quant_has_sub_min(qmode),
+                                              bm,
+                                              bn,
+                                              bk,
+                                              wm,
+                                              wn,
+                                              transpose)
+                                        : get_template_definition(
+                                              lib_name,
+                                              func,
+                                              get_type_string(x.dtype()),
+                                              group_size,
+                                              bits,
+                                              bm,
+                                              bn,
+                                              bk,
+                                              wm,
+                                              wn,
+                                              transpose);
+    concatenate(kernel_source, quantized_source(mode), template_def);
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);

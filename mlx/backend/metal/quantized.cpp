@@ -16,10 +16,18 @@ namespace mlx::core {
 
 namespace {
 
-// Metal carries two quantized kernel families: affine's per-group scale/bias
-// grid and the shared-exponent block used by mxfp4/mxfp8/nvfp4. A mode that
-// names neither is rejected rather than defaulted into one of them, because
-// the JIT build would then compile and run a kernel for the wrong format.
+// The three K-quant modes share one source and one kernel prefix the way the
+// floating point modes share `fp_`. Derived from the enum so the list here
+// cannot drift from primitives.h.
+bool is_kquant_mode(const std::string& mode) {
+  return quant_super_ratio(string_to_quantization_mode(mode)) > 0;
+}
+
+// Metal carries three quantized kernel families: affine's per-group scale/bias
+// grid, the shared-exponent block used by mxfp4/mxfp8/nvfp4, and the K-quants'
+// two-level integer scale decode. A mode that names none of them is rejected
+// rather than defaulted into one of them, because the JIT build would then
+// compile and run a kernel for the wrong format.
 const char* quantized_kernel_family(
     std::string_view tag,
     const std::string& mode) {
@@ -29,16 +37,41 @@ const char* quantized_kernel_family(
   if (mode == "mxfp4" || mode == "mxfp8" || mode == "nvfp4") {
     return "fp_";
   }
+  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+    return "kquant_";
+  }
   std::ostringstream msg;
   msg << "[" << tag << "] Quantization mode '" << mode
       << "' has no Metal kernel family.";
   throw std::invalid_argument(msg.str());
 }
 
+// The NAX tensor-op kernels are instantiated for the affine and floating point
+// families only. Deciding whether a K-quant is faster there needs a benchmark
+// on real weights, so they stay on the simdgroup kernels for now. Callers must
+// consult this before taking a NAX branch; the family lookup below is the
+// backstop that turns a missed check into a throw instead of a silent
+// dispatch into the fp NAX kernel.
+bool nax_supports_mode(const std::string& mode) {
+  return !is_kquant_mode(mode);
+}
+
+const char* nax_quantized_kernel_family(
+    std::string_view tag,
+    const std::string& mode) {
+  if (!nax_supports_mode(mode)) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Quantization mode '" << mode
+        << "' has no NAX kernel family.";
+    throw std::invalid_argument(msg.str());
+  }
+  return quantized_kernel_family(tag, mode);
+}
+
 // A K-quant reaches the backend with the same input count as an affine
-// matmul, so the mode is the only thing that separates the two. No Metal
-// kernel decodes the two scale levels yet, so reject the mode before any
-// buffer is allocated or any kernel is picked.
+// matmul, so the mode is the only thing that separates the two. The paths
+// still without a kernel reject the mode before any buffer is allocated or
+// any kernel is picked.
 void reject_kquant(const char* tag, QuantizationMode mode) {
   if (quant_super_ratio(mode) > 0) {
     std::ostringstream msg;
@@ -47,6 +80,35 @@ void reject_kquant(const char* tag, QuantizationMode mode) {
         << "' is not implemented on the Metal backend.";
     throw std::runtime_error(msg.str());
   }
+}
+
+// The K-quant kernels take the super-block ratio and the sub-minimum flag
+// right after bits; every later template parameter matches the affine family.
+template <typename... Args>
+std::string quantized_template_definition(
+    const char* family,
+    const std::string& name,
+    const std::string& func,
+    const std::string& mode,
+    const std::string& type,
+    int group_size,
+    int bits,
+    Args... args) {
+  std::string fname = family + func;
+  if (is_kquant_mode(mode)) {
+    auto qmode = string_to_quantization_mode(mode);
+    return get_template_definition(
+        name,
+        fname,
+        type,
+        group_size,
+        bits,
+        quant_super_ratio(qmode),
+        quant_has_sub_min(qmode),
+        std::forward<Args>(args)...);
+  }
+  return get_template_definition(
+      name, fname, type, group_size, bits, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
@@ -60,10 +122,15 @@ auto get_quantized_kernel_wrapped(
     int group_size,
     int bits,
     Args... args) {
-  std::string template_def;
-  std::string fname = quantized_kernel_family(tag, mode) + func;
-  template_def = get_template_definition(
-      name, fname, type, group_size, bits, std::forward<Args>(args)...);
+  auto template_def = quantized_template_definition(
+      quantized_kernel_family(tag, mode),
+      name,
+      func,
+      mode,
+      type,
+      group_size,
+      bits,
+      std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
 }
 
@@ -78,10 +145,15 @@ auto get_qmm_nax_kernel_wrapped(
     int group_size,
     int bits,
     Args... args) {
-  std::string template_def;
-  std::string fname = quantized_kernel_family(tag, mode) + func;
-  template_def = get_template_definition(
-      name, fname, type, group_size, bits, std::forward<Args>(args)...);
+  auto template_def = quantized_template_definition(
+      nax_quantized_kernel_family(tag, mode),
+      name,
+      func,
+      mode,
+      type,
+      group_size,
+      bits,
+      std::forward<Args>(args)...);
   return get_qmm_nax_kernel(d, name, template_def, mode);
 }
 
@@ -333,9 +405,14 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
+// affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen. A
+// K-quant is the affine kernel with a two-level scale decode, so it has the
+// same ALU-per-load balance and inherits the gen-15 gate.
 inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
-  return mode != "affine" || d.get_architecture_gen() >= 15;
+  if (mode == "affine" || is_kquant_mode(mode)) {
+    return d.get_architecture_gen() >= 15;
+  }
+  return true;
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -364,7 +441,9 @@ void qmv_wide(
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
   // The affine subchunk decode has enough ALU per weight load to favor more
   // rows per simdgroup (kl8); the fp modes' vectorized dot is balanced at 16.
-  int k_lanes = mode == "affine" ? 8 : 16;
+  // The K-quants decode through the affine path and are instantiated at kl8
+  // only, so they must ask for 8.
+  int k_lanes = (mode == "affine" || is_kquant_mode(mode)) ? 8 : 16;
   constexpr int num_simdgroups = 2;
   int B = out.size() / M / N;
   bool batched = B > 1;
@@ -844,8 +923,8 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
-      (env::enable_tf32() || x.dtype() != float32)) {
+  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
+      (K % 64 == 0) && (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
         /* const array& w = */ w,
@@ -1056,8 +1135,8 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
-      (env::enable_tf32() || x.dtype() != float32)) {
+  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
+      (K % 64 == 0) && (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
         /* const array& w = */ w,
@@ -1328,7 +1407,7 @@ void gather_qmm_rhs_nax(
 
   // Make the kernel name. The source is picked from the mode further down in
   // get_gather_qmm_nax_kernel, so reject a mode with no family up front.
-  quantized_kernel_family("gather_qmm", mode);
+  nax_quantized_kernel_family("gather_qmm", mode);
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
@@ -1426,7 +1505,7 @@ void gather_qmm_rhs(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  if (metal::is_nax_available() && transpose &&
+  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
         /* const array& x_ = */ x_,
@@ -1598,8 +1677,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
-  reject_kquant("quantized_matmul", mode_);
-
   out.set_data(allocator::malloc(out.nbytes()));
 
   // Make sure the last two dims of x and w, s, b are contiguous. This should
@@ -1681,8 +1758,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
-
-  reject_kquant("gather_qmm", mode_);
 
   out.set_data(allocator::malloc(out.nbytes()));
 
@@ -1847,6 +1922,8 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
 
+  // QQMatmul quantizes the activations on the fly, which needs a
+  // quantize_dequantize kernel. K-quants are read-only formats and have none.
   reject_kquant("qqmm", mode_);
 
   auto mode = quantization_mode_to_string(mode_);
@@ -1906,11 +1983,12 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  // A K-quant dequantize is a primitive on every device because it has no
-  // graph decomposition, so it arrives here instead of being screened by the
-  // op layer. Without this the kernel name below would be built from a mode
-  // string that no metallib entry matches.
-  reject_kquant(dequantize_ ? "dequantize" : "quantize", mode_);
+  // K-quants are read-only formats: producing one needs ggml's iterative
+  // sub-block search, so kquant.metal instantiates no quantize kernel. The op
+  // layer already throws, but this primitive is also reachable directly.
+  if (!dequantize_) {
+    reject_kquant("quantize", mode_);
+  }
 
   auto& w_pre = inputs[0];
   auto& out = outputs[0];
@@ -1923,7 +2001,9 @@ void fast::Quantize::eval_gpu(
   auto w = ensure_row_contiguous(w_pre, d, s);
   if (dequantize_) {
     auto scales = ensure_row_contiguous(inputs[1], d, s);
-    if (mode_ == QuantizationMode::Affine) {
+    // The affine and K-quant modes both store a second companion array next to
+    // the scales; for a K-quant it holds ggml's super-block scale d.
+    if (quant_weight_arrays(mode_) == 2) {
       auto biases = ensure_row_contiguous(inputs[2], d, s);
       compute_encoder.set_input_array(biases, 2);
     }
