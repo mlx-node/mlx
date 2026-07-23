@@ -1906,6 +1906,12 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  // A K-quant dequantize is a primitive on every device because it has no
+  // graph decomposition, so it arrives here instead of being screened by the
+  // op layer. Without this the kernel name below would be built from a mode
+  // string that no metallib entry matches.
+  reject_kquant(dequantize_ ? "dequantize" : "quantize", mode_);
+
   auto& w_pre = inputs[0];
   auto& out = outputs[0];
   out.set_data(allocator::malloc(out.nbytes()));

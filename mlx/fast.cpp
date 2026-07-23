@@ -936,18 +936,33 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
     auto out_shape = w.shape();
     out_shape.back() = out_size;
     return {std::move(out_shape)};
-  } else {
-    auto wq_shape = w.shape();
-    wq_shape.back() = w.shape(-1) * bits_ / 32;
-    auto sshape = w.shape();
-    sshape.back() = w.shape(-1) / group_size_;
-    if (inputs.size() == 2) {
-      return {std::move(wq_shape), std::move(sshape)};
-    } else {
+  }
+
+  auto wq_shape = w.shape();
+  wq_shape.back() = w.shape(-1) * bits_ / 32;
+  auto sshape = w.shape();
+  sshape.back() = w.shape(-1) / group_size_;
+
+  // The mode decides how many companions come out, not the input count: a
+  // second input is the optional nvfp4 global scale, so mxfp4 and mxfp8
+  // quantize from one input and still produce only scales.
+  switch (mode_) {
+    case QuantizationMode::Affine: {
       auto bshape = sshape;
       return {std::move(wq_shape), std::move(sshape), std::move(bshape)};
     }
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4:
+      return {std::move(wq_shape), std::move(sshape)};
+    case QuantizationMode::Q6K:
+    case QuantizationMode::Q4K:
+    case QuantizationMode::Q5K:
+      break;
   }
+  throw std::invalid_argument(
+      "[quantize] Quantization mode '" + quantization_mode_to_string(mode_) +
+      "' can be read but not produced.");
 }
 
 bool ConvertFP8::is_equivalent(const Primitive& other) const {

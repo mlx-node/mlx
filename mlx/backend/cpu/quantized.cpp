@@ -695,6 +695,51 @@ void validate_affine_quant_config(
   }
 }
 
+// Every K-quant mode is defined by exactly one (bits, group size) pair, and
+// the two-level decode below is selected by the mode alone. A pair that
+// disagrees with the mode would walk the companions with the wrong stride, so
+// reject it here as well as at the op layer: an exported graph carries the
+// three numbers independently.
+void validate_kquant_config(
+    std::string_view tag,
+    QuantizationMode mode,
+    int bits,
+    int group_size) {
+  int expected_bits = 0;
+  int expected_group_size = 0;
+  switch (mode) {
+    case QuantizationMode::Q6K:
+      expected_bits = 6;
+      expected_group_size = 16;
+      break;
+    case QuantizationMode::Q4K:
+      expected_bits = 4;
+      expected_group_size = 32;
+      break;
+    case QuantizationMode::Q5K:
+      expected_bits = 5;
+      expected_group_size = 32;
+      break;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4: {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Quantization mode '"
+          << quantization_mode_to_string(mode) << "' is not a K-quant.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  if (bits != expected_bits || group_size != expected_group_size) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] " << quantization_mode_to_string(mode)
+        << " quantization requires group size " << expected_group_size
+        << " and " << expected_bits << " bits but got group size " << group_size
+        << " and " << bits << " bits.";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
 // The kernels are instantiated for these three types. float64 also satisfies
 // the floating point check the op layer applies, and reaches the backend.
 void validate_quant_type(std::string_view tag, Dtype dtype) {
@@ -708,9 +753,9 @@ void validate_quant_type(std::string_view tag, Dtype dtype) {
 }
 
 // A K-quant reaches the backend with the same input count as an affine matmul,
-// so the mode is the only thing that separates the two. Nothing here decodes
-// the two scale levels yet, and both the affine and the floating point
-// dispatch would read the companions as a format they are not.
+// so the mode is the only thing that separates the two. For the ops that have
+// no K-quant path the affine and the floating point dispatch would both read
+// the companions as a format they are not.
 void reject_kquant(std::string_view tag, QuantizationMode mode) {
   if (quant_super_ratio(mode) > 0) {
     std::ostringstream msg;
@@ -732,10 +777,11 @@ void validate_qmm_dispatch(
     Dtype dtype,
     int bits,
     int group_size) {
-  reject_kquant(tag, mode);
   validate_quant_type(tag, dtype);
   if (mode == QuantizationMode::Affine) {
     validate_affine_quant_config(tag, bits, group_size);
+  } else if (quant_super_ratio(mode) > 0) {
+    validate_kquant_config(tag, mode, bits, group_size);
   } else {
     validate_fp_quant_config(tag, bits, group_size);
   }
@@ -1021,6 +1067,588 @@ void fp_bs_qmm_dispatch(
   }
 }
 
+// ---------------------------------------------------------------------------
+// K-quants: ggml Q6_K / Q4_K / Q5_K
+// ---------------------------------------------------------------------------
+// A K-quant is algebraically affine inside a sub-block, value = scale * q +
+// bias, so the kernels below are the affine ones with the per-group scalar
+// load replaced by a two-level decode. ggml stores a small integer scale per
+// sub-block and one float16 scale per 256 element super-block, and the array
+// contract keeps both verbatim:
+//
+//   q6k  bits 6, group size 16, 16 groups per super-block, int8 sub-scales
+//        scale = biases[g / 16] * scales[g]
+//        bias  = -32 * scale                          (symmetric, q - 32)
+//   q4k  bits 4, group size 32, 8 groups per super-block, uint8 sub-scales
+//   q5k  as q4k with a fifth bit plane
+//        scale = biases[2 * (g / 8)]     * scales[2 * g]
+//        bias  = -(biases[2 * (g / 8) + 1] * scales[2 * g + 1])
+//
+// `biases` holds ggml's super-block scale d (and, for q4k/q5k, dmin). It is a
+// SCALE, not a bias. The sidecar name is reused so the checks that treat a
+// `.scales`/`.biases` pair as the "is quantized" sentinel keep working.
+//
+// Both levels are decoded in float32 rather than in T. ggml dequantizes in
+// float32 and every (d, sub-scale) product and every (d, sub-scale, code)
+// product is exactly representable there, so a float32 decode reproduces
+// llama.cpp's numbers exactly. Rounding the sub-scale to bfloat16 first would
+// throw away ten mantissa bits of a value the file stores at full precision.
+// kq_qmm_t accumulates in float for the same reason, which is also what the
+// affine mode ends up doing through _qmm_t_simd.
+
+// Walks the two scale levels in lock step with the group loop of the kernel
+// body. Every row holds a whole number of super-blocks, so the walk stays
+// aligned as it continues across rows, which is how the affine kernels already
+// walk their scales.
+template <int super_ratio, bool has_min>
+class KQScales {
+ public:
+  KQScales(const uint8_t* scales, const float16_t* biases)
+      : scales_(scales), biases_(biases) {}
+
+  void next(float& scale, float& bias) {
+    if (sub_ == 0) {
+      d_ = static_cast<float>(biases_[0]);
+      if constexpr (has_min) {
+        dmin_ = static_cast<float>(biases_[1]);
+        biases_ += 2;
+      } else {
+        biases_ += 1;
+      }
+    }
+    if constexpr (has_min) {
+      scale = d_ * static_cast<float>(scales_[0]);
+      bias = -(dmin_ * static_cast<float>(scales_[1]));
+      scales_ += 2;
+    } else {
+      scale = d_ * static_cast<float>(static_cast<int8_t>(scales_[0]));
+      bias = -32.0f * scale;
+      scales_ += 1;
+    }
+    sub_ = (sub_ + 1 == super_ratio) ? 0 : sub_ + 1;
+  }
+
+ private:
+  const uint8_t* scales_;
+  const float16_t* biases_;
+  float d_ = 0;
+  float dmin_ = 0;
+  int sub_ = 0;
+};
+
+template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+void kq_qmm(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    int M,
+    int N,
+    int K) {
+  constexpr int bitmask = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor(bits, 8);
+  constexpr int bytes_per_pack = get_bytes_per_pack(bits);
+  constexpr int packs_in_group = group_size / pack_factor;
+
+  for (int m = 0; m < M; m++) {
+    const uint8_t* w_local = (const uint8_t*)w;
+    KQScales<super_ratio, has_min> sb(scales, biases);
+
+    std::fill(result, result + N, 0);
+
+    for (int k = 0; k < K; k++) {
+      T* result_local = result;
+      float xi = static_cast<float>(*x++);
+
+      for (int n = 0; n < N; n += group_size) {
+        float scale;
+        float bias;
+        sb.next(scale, bias);
+        for (int ng = 0; ng < packs_in_group; ng++) {
+          if constexpr (bits == 5 || bits == 6) {
+            float wl[pack_factor];
+            extract_bits<float, bits>(w_local, wl);
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              (*result_local++) += static_cast<T>(xi * (scale * wl[p] + bias));
+            }
+            w_local += bytes_per_pack;
+
+          } else {
+            uint8_t wi = *w_local++;
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              (*result_local++) += static_cast<T>(
+                  xi * (scale * static_cast<float>(wi & bitmask) + bias));
+              wi >>= bits;
+            }
+          }
+        }
+      }
+    }
+
+    result += N;
+  }
+}
+
+template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+void kq_qmm_t(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    int M,
+    int N,
+    int K) {
+  constexpr int bitmask = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor(bits, 8);
+  constexpr int bytes_per_pack = get_bytes_per_pack(bits);
+  constexpr int packs_in_group = group_size / pack_factor;
+
+  for (int m = 0; m < M; m++) {
+    const uint8_t* w_local = (const uint8_t*)w;
+    KQScales<super_ratio, has_min> sb(scales, biases);
+
+    for (int n = 0; n < N; n++) {
+      const T* x_local = x;
+      float sum = 0;
+      for (int k = 0; k < K; k += group_size) {
+        float scale;
+        float bias;
+        sb.next(scale, bias);
+
+        for (int kw = 0; kw < packs_in_group; kw++) {
+          if constexpr (bits == 5 || bits == 6) {
+            float wl[pack_factor];
+            extract_bits<float, bits>(w_local, wl);
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              sum += static_cast<float>(x_local[p]) * (scale * wl[p] + bias);
+            }
+            w_local += bytes_per_pack;
+            x_local += pack_factor;
+
+          } else {
+            uint8_t wi = *w_local++;
+#pragma clang loop unroll(full)
+            for (int p = 0; p < pack_factor; p++) {
+              sum += static_cast<float>(*x_local++) *
+                  (scale * static_cast<float>(wi & bitmask) + bias);
+              wi >>= bits;
+            }
+          }
+        }
+      }
+      *result = static_cast<T>(sum);
+      result++;
+    }
+
+    x += K;
+  }
+}
+
+// No SIMD sibling: _qmm_t_simd broadcasts one (scale, bias) pair per group
+// through simd::Simd<float, S> and its extract_bits_simd only covers 4 and 8
+// bits. Q6_K's 6-bit stream has no lane-aligned extraction and its group of 16
+// is shorter than one SIMD register, so all three K-quants take the scalar
+// path here. The Metal kernels are where the throughput comes from.
+template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+void kq_qmm_dispatch_transpose(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    int M,
+    int N,
+    int K,
+    bool transposed_w) {
+  if (transposed_w) {
+    kq_qmm_t<T, bits, group_size, super_ratio, has_min>(
+        result, x, w, scales, biases, M, N, K);
+  } else {
+    kq_qmm<T, bits, group_size, super_ratio, has_min>(
+        result, x, w, scales, biases, M, N, K);
+  }
+}
+
+// Q6_K's sub-block is 16 values, which the affine chain never sees because
+// validate_affine_quant_config only admits 32, 64 and 128.
+template <typename T, int bits, int super_ratio, bool has_min>
+void kq_qmm_dispatch_group(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    int M,
+    int N,
+    int K,
+    int group_size,
+    bool transposed_w) {
+  switch (group_size) {
+    case 16:
+      kq_qmm_dispatch_transpose<T, bits, 16, super_ratio, has_min>(
+          result, x, w, scales, biases, M, N, K, transposed_w);
+      break;
+    case 32:
+      kq_qmm_dispatch_transpose<T, bits, 32, super_ratio, has_min>(
+          result, x, w, scales, biases, M, N, K, transposed_w);
+      break;
+    default:
+      throw std::invalid_argument("K-quant group size must be 16 or 32.");
+  }
+}
+
+template <typename T>
+void kq_qmm_dispatch_typed(
+    T* result,
+    const T* x,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    int M,
+    int N,
+    int K,
+    QuantizationMode mode,
+    int group_size,
+    bool transposed_w) {
+  switch (mode) {
+    case QuantizationMode::Q6K:
+      kq_qmm_dispatch_group<T, 6, 16, false>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::Q4K:
+      kq_qmm_dispatch_group<T, 4, 8, true>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::Q5K:
+      kq_qmm_dispatch_group<T, 5, 8, true>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4: {
+      std::ostringstream msg;
+      msg << "[quantized_matmul] Quantization mode '"
+          << quantization_mode_to_string(mode)
+          << "' does not use the K-quant kernels.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+}
+
+// The two K-quant companions have different lengths along the last axis, so
+// unlike the affine path they need separate per-batch element counts.
+template <typename T>
+void kq_qmm_dispatch_typed(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    QuantizationMode mode,
+    int group_size,
+    bool transposed_w) {
+  int K = x.shape(-1);
+  int M = x.ndim() > 1 ? x.shape(-2) : 1;
+  int N = out.shape(-1);
+  int w_els = w.ndim() > 2 ? w.shape(-1) * w.shape(-2) : 0;
+  int s_els = w.ndim() > 2 ? scales.shape(-1) * scales.shape(-2) : 0;
+  int b_els = w.ndim() > 2 ? biases.shape(-1) * biases.shape(-2) : 0;
+  int batch_size = x.size() / (K * M);
+
+  auto out_ptr = out.data<T>();
+  auto x_ptr = x.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  // Read as bytes for both modes; Q6_K's sign is applied by the decode.
+  auto scales_ptr = scales.data<uint8_t>();
+  auto biases_ptr = biases.data<float16_t>();
+  for (int i = 0; i < batch_size; i++) {
+    kq_qmm_dispatch_typed<T>(
+        out_ptr + i * M * N,
+        x_ptr + elem_to_loc(i * M * K, x.shape(), x.strides()),
+        w_ptr + elem_to_loc(i * w_els, w.shape(), w.strides()),
+        scales_ptr + elem_to_loc(i * s_els, scales.shape(), scales.strides()),
+        biases_ptr + elem_to_loc(i * b_els, biases.shape(), biases.strides()),
+        M,
+        N,
+        K,
+        mode,
+        group_size,
+        transposed_w);
+  }
+}
+
+void kq_qmm_dispatch(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    QuantizationMode mode,
+    int group_size,
+    bool transposed_w) {
+  switch (x.dtype()) {
+    case float32:
+      kq_qmm_dispatch_typed<float>(
+          out, x, w, scales, biases, mode, group_size, transposed_w);
+      break;
+    case float16:
+      kq_qmm_dispatch_typed<float16_t>(
+          out, x, w, scales, biases, mode, group_size, transposed_w);
+      break;
+    case bfloat16:
+      kq_qmm_dispatch_typed<bfloat16_t>(
+          out, x, w, scales, biases, mode, group_size, transposed_w);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[quantized_matmul] only floating types are supported");
+  }
+}
+
+template <typename T>
+void kq_bs_qmm_dispatch_typed(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    QuantizationMode mode,
+    int group_size,
+    bool transposed_w) {
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+
+  int w_els = w.shape(-1) * w.shape(-2);
+  int s_els = scales.shape(-1) * scales.shape(-2);
+  int b_els = biases.shape(-1) * biases.shape(-2);
+
+  auto out_ptr = out.data<T>();
+  auto x_ptr = x.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  auto scales_ptr = scales.data<uint8_t>();
+  auto biases_ptr = biases.data<float16_t>();
+  auto lhs_indices_ptr = lhs_indices.data<uint32_t>();
+  auto rhs_indices_ptr = rhs_indices.data<uint32_t>();
+
+  for (int i = 0; i < lhs_indices.size(); i++) {
+    int x_idx = lhs_indices_ptr[elem_to_loc(
+        i, lhs_indices.shape(), lhs_indices.strides())];
+    int w_idx = rhs_indices_ptr[elem_to_loc(
+        i, rhs_indices.shape(), rhs_indices.strides())];
+    kq_qmm_dispatch_typed<T>(
+        out_ptr + i * M * N,
+        x_ptr + elem_to_loc(x_idx * M * K, x.shape(), x.strides()),
+        w_ptr + elem_to_loc(w_idx * w_els, w.shape(), w.strides()),
+        scales_ptr +
+            elem_to_loc(w_idx * s_els, scales.shape(), scales.strides()),
+        biases_ptr +
+            elem_to_loc(w_idx * b_els, biases.shape(), biases.strides()),
+        M,
+        N,
+        K,
+        mode,
+        group_size,
+        transposed_w);
+  }
+}
+
+void kq_bs_qmm_dispatch(
+    array& out,
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    QuantizationMode mode,
+    int group_size,
+    bool transposed_w) {
+  switch (x.dtype()) {
+    case float32:
+      kq_bs_qmm_dispatch_typed<float>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          mode,
+          group_size,
+          transposed_w);
+      break;
+    case float16:
+      kq_bs_qmm_dispatch_typed<float16_t>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          mode,
+          group_size,
+          transposed_w);
+      break;
+    case bfloat16:
+      kq_bs_qmm_dispatch_typed<bfloat16_t>(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          mode,
+          group_size,
+          transposed_w);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[gather_qmm] only floating types are supported");
+  }
+}
+
+// Decodes a whole row-contiguous tensor. Every row is a whole number of
+// super-blocks, so one walker can run over the flattened buffer.
+template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+void kq_dequantize(
+    T* out,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    size_t size) {
+  constexpr int bitmask = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor(bits, 8);
+  constexpr int bytes_per_pack = get_bytes_per_pack(bits);
+  constexpr int packs_in_group = group_size / pack_factor;
+
+  const uint8_t* w_local = (const uint8_t*)w;
+  KQScales<super_ratio, has_min> sb(scales, biases);
+
+  for (size_t i = 0; i < size; i += group_size) {
+    float scale;
+    float bias;
+    sb.next(scale, bias);
+    for (int kw = 0; kw < packs_in_group; kw++) {
+      if constexpr (bits == 5 || bits == 6) {
+        float wl[pack_factor];
+        extract_bits<float, bits>(w_local, wl);
+#pragma clang loop unroll(full)
+        for (int p = 0; p < pack_factor; p++) {
+          (*out++) = static_cast<T>(scale * wl[p] + bias);
+        }
+        w_local += bytes_per_pack;
+
+      } else {
+        uint8_t wi = *w_local++;
+#pragma clang loop unroll(full)
+        for (int p = 0; p < pack_factor; p++) {
+          (*out++) =
+              static_cast<T>(scale * static_cast<float>(wi & bitmask) + bias);
+          wi >>= bits;
+        }
+      }
+    }
+  }
+}
+
+template <typename T, int bits, int super_ratio, bool has_min>
+void kq_dequantize_dispatch_group(
+    T* out,
+    const uint32_t* w,
+    const uint8_t* scales,
+    const float16_t* biases,
+    size_t size,
+    int group_size) {
+  switch (group_size) {
+    case 16:
+      kq_dequantize<T, bits, 16, super_ratio, has_min>(
+          out, w, scales, biases, size);
+      break;
+    case 32:
+      kq_dequantize<T, bits, 32, super_ratio, has_min>(
+          out, w, scales, biases, size);
+      break;
+    default:
+      throw std::invalid_argument("K-quant group size must be 16 or 32.");
+  }
+}
+
+template <typename T>
+void kq_dequantize_dispatch_typed(
+    array& out,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    QuantizationMode mode,
+    int group_size) {
+  auto out_ptr = out.data<T>();
+  auto w_ptr = w.data<uint32_t>();
+  auto scales_ptr = scales.data<uint8_t>();
+  auto biases_ptr = biases.data<float16_t>();
+  size_t size = out.size();
+  switch (mode) {
+    case QuantizationMode::Q6K:
+      kq_dequantize_dispatch_group<T, 6, 16, false>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::Q4K:
+      kq_dequantize_dispatch_group<T, 4, 8, true>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::Q5K:
+      kq_dequantize_dispatch_group<T, 5, 8, true>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4: {
+      std::ostringstream msg;
+      msg << "[dequantize] Quantization mode '"
+          << quantization_mode_to_string(mode)
+          << "' does not use the K-quant kernels.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+}
+
+void kq_dequantize_dispatch(
+    array& out,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    QuantizationMode mode,
+    int group_size) {
+  switch (out.dtype()) {
+    case float32:
+      kq_dequantize_dispatch_typed<float>(
+          out, w, scales, biases, mode, group_size);
+      break;
+    case float16:
+      kq_dequantize_dispatch_typed<float16_t>(
+          out, w, scales, biases, mode, group_size);
+      break;
+    case bfloat16:
+      kq_dequantize_dispatch_typed<bfloat16_t>(
+          out, w, scales, biases, mode, group_size);
+      break;
+    default:
+      throw std::invalid_argument(
+          "[dequantize] only floating types are supported");
+  }
+}
+
 } // namespace
 
 void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
@@ -1054,6 +1682,20 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
                       bits_ = bits_,
                       transpose_ = transpose_]() mutable {
       _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+    });
+  } else if (quant_super_ratio(mode_) > 0) {
+    auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
+    encoder.set_input_array(biases);
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      x = array::unsafe_weak_copy(x),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      biases = array::unsafe_weak_copy(biases),
+                      mode_ = mode_,
+                      group_size_ = group_size_,
+                      transpose_ = transpose_]() mutable {
+      kq_qmm_dispatch(
+          out, x, w, scales, biases, mode_, group_size_, transpose_);
     });
   } else {
     encoder.dispatch([out = array::unsafe_weak_copy(out),
@@ -1137,6 +1779,31 @@ void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
           rhs_indices,
           group_size_,
           bits_,
+          transpose_);
+    });
+  } else if (quant_super_ratio(mode_) > 0) {
+    auto biases = ensure_row_contiguous_last_dims(inputs[3]);
+    encoder.set_input_array(biases);
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      x = array::unsafe_weak_copy(x),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      biases = array::unsafe_weak_copy(biases),
+                      lhs_indices = array::unsafe_weak_copy(lhs_indices),
+                      rhs_indices = array::unsafe_weak_copy(rhs_indices),
+                      mode_ = mode_,
+                      group_size_ = group_size_,
+                      transpose_ = transpose_]() mutable {
+      kq_bs_qmm_dispatch(
+          out,
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          mode_,
+          group_size_,
           transpose_);
     });
   } else {
@@ -1347,6 +2014,42 @@ void dispatch_quantize(
 void fast::Quantize::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  // Only a K-quant dequantize builds this primitive for the CPU. The affine
+  // and floating point modes decompose into a graph of ops in ops.cpp and
+  // never reach a backend, and no K-quant can be produced at all.
+  if (dequantize_) {
+    if (quant_super_ratio(mode_) == 0) {
+      std::ostringstream msg;
+      msg << "[dequantize] Quantization mode '"
+          << quantization_mode_to_string(mode_)
+          << "' is not implemented on the CPU backend.";
+      throw std::runtime_error(msg.str());
+    }
+    validate_quant_type("dequantize", outputs[0].dtype());
+    validate_kquant_config("dequantize", mode_, bits_, group_size_);
+
+    auto& encoder = cpu::get_command_encoder(stream());
+    auto w = ensure_row_contiguous(inputs[0], encoder, stream());
+    auto scales = ensure_row_contiguous(inputs[1], encoder, stream());
+    auto biases = ensure_row_contiguous(inputs[2], encoder, stream());
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    encoder.set_input_array(w);
+    encoder.set_input_array(scales);
+    encoder.set_input_array(biases);
+    encoder.set_output_array(out);
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      biases = array::unsafe_weak_copy(biases),
+                      mode_ = mode_,
+                      group_size_ = group_size_]() mutable {
+      kq_dequantize_dispatch(out, w, scales, biases, mode_, group_size_);
+    });
+    return;
+  }
+
   // The kernel below packs a per-group scale and bias, which is the affine
   // layout. Every other mode reaches the CPU through the fallback graph, so a
   // mode that arrives here would be decoded as a format it is not. Checked

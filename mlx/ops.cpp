@@ -5470,6 +5470,39 @@ array fp_dequantize(
   return fallback(inputs)[0];
 }
 
+// A K-quant has no decomposition into a graph of ops: the sub-block scale is
+// an integer that has to be multiplied by a super-block scale sixteen or eight
+// groups wide, and the packed codes are 5 and 6 bits wide. It goes to the
+// backend as a primitive on every device, so the mode is rejected by name
+// where no kernel exists rather than silently decoded as something else.
+array kq_dequantize(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    int group_size,
+    int bits,
+    QuantizationMode mode,
+    Dtype out_type,
+    Stream s) {
+  auto out_shape = w.shape();
+  out_shape.back() = w.shape(-1) * 32 / bits;
+
+  auto fallback = [mode](const std::vector<array>&) -> std::vector<array> {
+    std::ostringstream msg;
+    msg << "[dequantize] Quantization mode '"
+        << quantization_mode_to_string(mode)
+        << "' has no fallback implementation.";
+    throw std::invalid_argument(msg.str());
+  };
+
+  return array(
+      std::move(out_shape),
+      out_type,
+      std::make_shared<fast::Quantize>(
+          s, fallback, group_size, bits, mode, true),
+      {w, scales, biases});
+}
+
 array dequantize(
     const array& w,
     const array& scales,
@@ -5511,10 +5544,8 @@ array dequantize(
   } else if (quant_super_ratio(qmode) > 0) {
     validate_quantized_input(
         "dequantize", w, scales, group_size, bits, qmode, biases);
-    std::ostringstream msg;
-    msg << "[dequantize] Quantization mode '" << mode
-        << "' is not yet implemented.";
-    throw std::invalid_argument(msg.str());
+    return kq_dequantize(
+        w, scales, *biases, group_size, bits, qmode, out_type, to_stream(s));
   } else {
     return fp_dequantize(
         w,

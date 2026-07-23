@@ -226,9 +226,15 @@ __global__ void affine_dequantize(
 
 } // namespace cu
 
+namespace {
+
 // A group size or bit width with no case below would skip the callback, and
 // with it the kernel node, leaving the freshly allocated outputs holding
 // uninitialized memory. Both dispatchers throw instead of falling through.
+//
+// Internal linkage is required, not cosmetic: qmm/qmv.cu defines a different
+// mlx::core::dispatch_groups with this same signature, and two definitions of
+// one template would be an ODR violation the linker resolves arbitrarily.
 template <typename F>
 void dispatch_groups(int group_size, const char* tag, F&& f) {
   switch (group_size) {
@@ -279,6 +285,8 @@ void dispatch_bits(int bits, const char* tag, F&& f) {
               bits));
   }
 }
+
+} // namespace
 
 void affine_quantize(
     const array& w,
