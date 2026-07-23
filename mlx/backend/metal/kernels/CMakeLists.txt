@@ -135,6 +135,7 @@ if(NOT MLX_METAL_JIT)
     reduction/reduce_col.h
     reduction/reduce_row.h)
   build_kernel(quantized quantized.h quantized_utils.h ${STEEL_HEADERS})
+  build_kernel(kquant kquant.h quantized_utils.h ${STEEL_HEADERS})
   build_kernel(fp_quantized fp4.h fp8.h fp_quantized.h quantized_utils.h
                ${STEEL_HEADERS})
   build_kernel(scan scan.h)

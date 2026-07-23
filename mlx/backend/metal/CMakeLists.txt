@@ -77,6 +77,7 @@ if(MLX_METAL_JIT)
 
   make_jit_source(quantized_utils)
   make_jit_source(quantized kernels/quantized_utils.h)
+  make_jit_source(kquant kernels/quantized_utils.h)
   make_jit_source(fp_quantized kernels/quantized_utils.h kernels/fp8.h
                   kernels/fp4.h)
   make_jit_source(gemv)
