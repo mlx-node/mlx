@@ -1091,10 +1091,24 @@ void fp_bs_qmm_dispatch(
 // Both levels are decoded in float32 rather than in T. ggml dequantizes in
 // float32 and every (d, sub-scale) product and every (d, sub-scale, code)
 // product is exactly representable there, so a float32 decode reproduces
-// llama.cpp's numbers exactly. Rounding the sub-scale to bfloat16 first would
-// throw away ten mantissa bits of a value the file stores at full precision.
-// kq_qmm_t accumulates in float for the same reason, which is also what the
-// affine mode ends up doing through _qmm_t_simd.
+// llama.cpp's numbers bitwise for q4k and q5k, and bitwise up to the sign of
+// zero for q6k: ggml subtracts the 32 offset in integer while the contract
+// folds it into bias = -32 * scale, and IEEE-754 makes x + (-x) equal +0.0
+// where ggml writes -0.0. Rounding the sub-scale to bfloat16 first would throw
+// away ten mantissa bits of a value the file stores at full precision.
+//
+// That fold parts from ggml one other way, on a non-finite d: at d = inf it
+// reads inf * code + -inf, so the whole q6k super-block decodes to NaN, where
+// ggml's (d * sub-scale) * (code - 32) keeps signed infinities for every code
+// but 32. That is theoretical: the quantizer derives d from finite weights, so
+// no GGUF holds one. A NaN d gives NaN on both sides, so with the finite sweep
+// that is every d. mlx-node's kquant_ggml_parity gate pins both divergences.
+//
+// kq_qmm accumulates into the T-typed result and kq_qmm_t into a float, which
+// is where the affine kernels land as well: _qmm sums in T, and the transposed
+// path real affine weights take is _qmm_t_simd, accumulating in
+// simd::Simd<float, S>. Only affine's scalar _qmm_t sums in T, and it is
+// reached at the bit widths _qmm_dispatch_transpose rules out of the SIMD path.
 
 // Walks the two scale levels in lock step with the group loop of the kernel
 // body. Every row holds a whole number of super-blocks, so the walk stays
