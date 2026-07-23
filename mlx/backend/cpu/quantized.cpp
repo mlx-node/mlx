@@ -1110,44 +1110,46 @@ void fp_bs_qmm_dispatch(
 // simd::Simd<float, S>. Only affine's scalar _qmm_t sums in T, and it is
 // reached at the bit widths _qmm_dispatch_transpose rules out of the SIMD path.
 
-// Walks the two scale levels in lock step with the group loop of the kernel
-// body. Every row holds a whole number of super-blocks, so the walk stays
-// aligned as it continues across rows, which is how the affine kernels already
-// walk their scales.
+// Decodes the two scale levels for an arbitrary group index. The decode is
+// random access rather than a walk because the Metal kernels reach groups out
+// of order -- qmv_wide strides its group loop by the lane count and qmv_fast
+// starts at an offset that is not super-block aligned -- so the primitive has
+// to be at(g) and the sequential walk is a counter on top of it.
+//
+// Every row holds a whole number of super-blocks, so a flat group index stays
+// aligned as it runs across rows, which is how the affine kernels already walk
+// their scales.
 template <int super_ratio, bool has_min>
 class KQScales {
  public:
+  // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
+  static constexpr int per_group = has_min ? 2 : 1;
+
   KQScales(const uint8_t* scales, const float16_t* biases)
       : scales_(scales), biases_(biases) {}
 
-  void next(float& scale, float& bias) {
-    if (sub_ == 0) {
-      d_ = static_cast<float>(biases_[0]);
-      if constexpr (has_min) {
-        dmin_ = static_cast<float>(biases_[1]);
-        biases_ += 2;
-      } else {
-        biases_ += 1;
-      }
-    }
+  void at(size_t g, float& scale, float& bias) const {
+    const float16_t* d = biases_ + (g / super_ratio) * per_group;
+    const uint8_t* sc = scales_ + g * per_group;
     if constexpr (has_min) {
-      scale = d_ * static_cast<float>(scales_[0]);
-      bias = -(dmin_ * static_cast<float>(scales_[1]));
-      scales_ += 2;
+      scale = static_cast<float>(d[0]) * static_cast<float>(sc[0]);
+      bias = -(static_cast<float>(d[1]) * static_cast<float>(sc[1]));
     } else {
-      scale = d_ * static_cast<float>(static_cast<int8_t>(scales_[0]));
+      scale = static_cast<float>(d[0]) *
+          static_cast<float>(static_cast<int8_t>(sc[0]));
       bias = -32.0f * scale;
-      scales_ += 1;
     }
-    sub_ = (sub_ + 1 == super_ratio) ? 0 : sub_ + 1;
+  }
+
+  // The kernel bodies all start at group 0 and walk forward without skipping.
+  void next(float& scale, float& bias) {
+    at(g_++, scale, bias);
   }
 
  private:
   const uint8_t* scales_;
   const float16_t* biases_;
-  float d_ = 0;
-  float dmin_ = 0;
-  int sub_ = 0;
+  size_t g_ = 0;
 };
 
 template <typename T, int bits, int group_size, int super_ratio, bool has_min>
