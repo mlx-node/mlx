@@ -590,9 +590,12 @@ inline void dequantize_to(
 
 // Decodes one group's (scale, bias) from the two K-quant scale levels.
 //
-//   q6k  scale = d[g / 16] * int8(sc[g])        bias = -32 * scale
-//   q4k  scale = d[2 * (g / 8)] * sc[2 * g]
-//   q5k  bias  = -(d[2 * (g / 8) + 1] * sc[2 * g + 1])
+//   q6k  scale = d[g / 16] * int8(sc[g])
+//        bias  = -32 * scale                          (symmetric, q - 32)
+//   q4k
+//   q5k  as q4k with a fifth bit plane
+//        scale = d[2 * (g / 8)]     * sc[2 * g]
+//        bias  = -(d[2 * (g / 8) + 1] * sc[2 * g + 1])
 //
 // `.biases` carries ggml's super-block scale d (and dmin for q4k and q5k), not
 // a bias; the bias is derived above.

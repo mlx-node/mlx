@@ -153,6 +153,22 @@ void validate_quantized_input(
       throw std::invalid_argument(msg.str());
     }
     check_batch_shape(*biases, "biases");
+    // check_batch_shape stops two axes short of the end, so for a 2-D weight it
+    // compares nothing at all and the row count goes unchecked. The K-quant
+    // kernels index both companions with one flat group counter that runs
+    // across rows, so a companion holding fewer rows than the weight is read
+    // past its end instead of rejected.
+    if (w.ndim() >= 2 &&
+        (scales.shape(-2) != w.shape(-2) ||
+         biases->shape(-2) != w.shape(-2))) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << quantization_mode_to_string(mode)
+          << " quantization needs the weight, scales and biases to hold the "
+          << "same number of rows. w.shape() == " << w.shape()
+          << ", scales.shape() == " << scales.shape()
+          << " and biases.shape() == " << biases->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
     if (el_per_row * per_group != biases->shape(-1) * super_size) {
       std::ostringstream msg;
       msg << "[" << tag << "] The shapes of the weight and biases are "
