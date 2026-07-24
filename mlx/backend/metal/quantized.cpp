@@ -37,7 +37,7 @@ const char* quantized_kernel_family(
   if (mode == "mxfp4" || mode == "mxfp8" || mode == "nvfp4") {
     return "fp_";
   }
-  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+  if (is_kquant_mode(mode)) {
     return "kquant_";
   }
   std::ostringstream msg;
