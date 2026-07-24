@@ -111,6 +111,14 @@ void validate_quantized_input(
     throw std::invalid_argument(msg.str());
   }
 
+  // The rank test is new and it applies to every mode, not only to the
+  // K-quants: a companion with more axes than the weight used to walk off the
+  // end of its own shape, because std::equal reads as many entries from
+  // `a.shape()` as the weight's batch axes without ever being told how long
+  // `a.shape()` is. It also stops a 2-D weight from silently matching a 3-D
+  // companion, which the old unconditional std::equal accepted by comparing an
+  // empty range. Every in-tree caller takes the weight and its companions from
+  // one checkpoint tensor set, so the ranks already agree.
   auto check_batch_shape = [&](const array& a, const char* name) {
     if (a.ndim() != w.ndim() ||
         !std::equal(
@@ -4647,6 +4655,13 @@ std::pair<int, int> quantization_params_from_mode(
   // JIT decode by (group size, bits), CUDA decodes by mode, and the Metal
   // metallib build misses a kernel name. Reject it here so every backend sees
   // the same error.
+  //
+  // This gate is not a K-quant detail. It is a behaviour change for the
+  // floating point modes, which used to reach the backends with any pair at
+  // all: mxfp4 is now pinned to (32, 4), mxfp8 to (32, 8) and nvfp4 to
+  // (16, 4). mxfp8 at group size 128 and nvfp4 at group size 32, for
+  // instance, used to pass through here and then be decoded as whatever each
+  // backend inferred. Affine is exempt by design.
   if (mode != QuantizationMode::Affine &&
       (group_size != default_group_size || bits != default_bits)) {
     std::ostringstream msg;

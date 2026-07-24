@@ -504,6 +504,23 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Output columns one qvm threadgroup owns. The affine and K-quant qvm kernels
+// tile `32 / pack_factor` packs per thread, so a simdgroup always covers 32
+// columns whatever the group size (quantized.h:1093, kquant.h:1126); the fp
+// kernels tile `group_size / pack_factor` and cover `group_size` columns
+// (fp_quantized.h:663). `min(group_size, 32)` describes both only because
+// affine forbids a group under 32 and the fp modes never go over it. Q6_K is
+// the first mode with a group of 16 on the affine tiling, so it needs the
+// fixed 32; asking for min() there launches twice the threadgroups the grid
+// needs and half of them return at the out_col bound doing no work.
+int qvm_columns_per_threadgroup(
+    const std::string& mode,
+    int group_size,
+    int num_simdgroups) {
+  int per_simdgroup = is_kquant_mode(mode) ? 32 : std::min(group_size, 32);
+  return per_simdgroup * num_simdgroups;
+}
+
 void qvm_split_k(
     const array& x,
     const array& w,
@@ -527,7 +544,12 @@ void qvm_split_k(
 
   constexpr int num_simdgroups = 2;
   constexpr int bk = 32;
-  int bn = std::min(group_size, 32) * num_simdgroups;
+  // This grid divides N by bn exactly, so a mode whose columns per
+  // threadgroup does not divide N would drop the tail. A K-quant reaches this
+  // path only untransposed, and ops.cpp:154 already requires the untransposed
+  // row length -- which is N here -- to be a whole number of 256-element
+  // super-blocks, so 64 always divides it.
+  int bn = qvm_columns_per_threadgroup(mode, group_size, num_simdgroups);
   MTL::Size group_dims = MTL::Size(bk, num_simdgroups, 1);
   MTL::Size grid_dims = MTL::Size(M, N / bn, B);
 
@@ -651,7 +673,7 @@ void qvm(
 
   constexpr int num_simdgroups = 2;
   constexpr int bk = 32;
-  int bn = std::min(group_size, 32) * num_simdgroups;
+  int bn = qvm_columns_per_threadgroup(mode, group_size, num_simdgroups);
   MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
@@ -1311,7 +1333,7 @@ void gather_qvm(
 
   constexpr int num_simdgroups = 2;
   constexpr int bk = 32;
-  int bn = std::min(group_size, 32) * num_simdgroups;
+  int bn = qvm_columns_per_threadgroup(mode, group_size, num_simdgroups);
   MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 

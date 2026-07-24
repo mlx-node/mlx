@@ -946,6 +946,12 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
   // The mode decides how many companions come out, not the input count: a
   // second input is the optional nvfp4 global scale, so mxfp4 and mxfp8
   // quantize from one input and still produce only scales.
+  //
+  // Counting inputs instead, as this did before, is wrong for the floating
+  // point modes and not only for the K-quants: mxfp4 and mxfp8 take one input
+  // and produce two arrays, and so does nvfp4 when no global scale is passed,
+  // yet the one-input branch reported three shapes. compile.cpp:1071 reads
+  // these for shapeless compilation, so the extra shape was live there.
   switch (mode_) {
     case QuantizationMode::Affine: {
       auto bshape = sshape;
