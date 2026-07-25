@@ -1189,6 +1189,20 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+// Same split as quantized_source above, over the NAX sources. Reachable modes
+// are already filtered by nax_supports_mode / nax_quantized_kernel_family in
+// mlx/backend/metal/quantized.cpp, so a K-quant only arrives here on the qmm_t
+// path kquant_nax.metal instantiates.
+static const char* quantized_nax_source(const std::string& mode) {
+  if (mode == "affine") {
+    return metal::quantized_nax();
+  }
+  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+    return metal::kquant_nax();
+  }
+  return metal::fp_quantized_nax();
+}
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -1202,7 +1216,7 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
         metal::utils(),
         metal::gemm_nax(),
         metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized_nax() : metal::fp_quantized_nax(),
+        quantized_nax_source(mode),
         template_def);
     return kernel_source;
   });

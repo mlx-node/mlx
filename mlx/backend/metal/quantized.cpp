@@ -46,20 +46,35 @@ const char* quantized_kernel_family(
   throw std::invalid_argument(msg.str());
 }
 
-// The NAX tensor-op kernels are instantiated for the affine and floating point
-// families only. Deciding whether a K-quant is faster there needs a benchmark
-// on real weights, so they stay on the simdgroup kernels for now. Callers must
-// consult this before taking a NAX branch; the family lookup below is the
-// backstop that turns a missed check into a throw instead of a silent
-// dispatch into the fp NAX kernel.
-bool nax_supports_mode(const std::string& mode) {
-  return !is_kquant_mode(mode);
+// NAX kernel coverage is per path, not per mode. affine (quantized_nax.metal)
+// and the floating point family (fp_quantized_nax.metal) instantiate the whole
+// set; the K-quants instantiate only kquant_qmm_t_nax (kquant_nax.metal),
+// because that is the one NAX kernel a prefill takes and the one measured to be
+// worth having. Every other K-quant path stays on the simdgroup kernels.
+enum class NaxPath {
+  // qmm with a transposed weight: {affine,fp,kquant}_qmm_t_nax.
+  QmmT,
+  // qmm with a row-major weight: affine and fp only.
+  QmmN,
+  // gather_qmm / gather_qmm_rhs: affine and fp only.
+  GatherQmm,
+};
+
+// Callers must consult this before taking a NAX branch; the family lookup below
+// is the backstop that turns a missed check into a throw instead of a silent
+// dispatch into another family's NAX kernel.
+bool nax_supports_mode(const std::string& mode, NaxPath path) {
+  if (!is_kquant_mode(mode)) {
+    return true;
+  }
+  return path == NaxPath::QmmT;
 }
 
 const char* nax_quantized_kernel_family(
     std::string_view tag,
-    const std::string& mode) {
-  if (!nax_supports_mode(mode)) {
+    const std::string& mode,
+    NaxPath path) {
+  if (!nax_supports_mode(mode, path)) {
     std::ostringstream msg;
     msg << "[" << tag << "] Quantization mode '" << mode
         << "' has no NAX kernel family.";
@@ -137,6 +152,7 @@ auto get_quantized_kernel_wrapped(
 template <typename... Args>
 auto get_qmm_nax_kernel_wrapped(
     std::string_view tag,
+    NaxPath path,
     metal::Device& d,
     const std::string& name,
     const std::string& func,
@@ -146,7 +162,7 @@ auto get_qmm_nax_kernel_wrapped(
     int bits,
     Args... args) {
   auto template_def = quantized_template_definition(
-      nax_quantized_kernel_family(tag, mode),
+      nax_quantized_kernel_family(tag, mode, path),
       name,
       func,
       mode,
@@ -772,6 +788,7 @@ void qmm_nax(
   if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
         "quantized_matmul",
+        NaxPath::QmmT,
         d,
         kname,
         "qmm_t_nax",
@@ -789,6 +806,7 @@ void qmm_nax(
   } else {
     kernel = get_qmm_nax_kernel_wrapped(
         "quantized_matmul",
+        NaxPath::QmmN,
         d,
         kname,
         "qmm_n_nax",
@@ -878,6 +896,7 @@ void gather_qmm_nax(
   if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
         "gather_qmm",
+        NaxPath::GatherQmm,
         d,
         kname,
         "gather_qmm_t_nax_",
@@ -894,6 +913,7 @@ void gather_qmm_nax(
   } else {
     kernel = get_qmm_nax_kernel_wrapped(
         "gather_qmm",
+        NaxPath::GatherQmm,
         d,
         kname,
         "gather_qmm_n_nax_",
@@ -945,8 +965,9 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
-      (K % 64 == 0) && (env::enable_tf32() || x.dtype() != float32)) {
+  if (metal::is_nax_available() && nax_supports_mode(mode, NaxPath::QmmT) &&
+      transpose && (K % 64 == 0) &&
+      (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
         /* const array& w = */ w,
@@ -1157,7 +1178,8 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
+  if (metal::is_nax_available() &&
+      nax_supports_mode(mode, NaxPath::GatherQmm) && transpose &&
       (K % 64 == 0) && (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
@@ -1429,7 +1451,7 @@ void gather_qmm_rhs_nax(
 
   // Make the kernel name. The source is picked from the mode further down in
   // get_gather_qmm_nax_kernel, so reject a mode with no family up front.
-  nax_quantized_kernel_family("gather_qmm", mode);
+  nax_quantized_kernel_family("gather_qmm", mode, NaxPath::GatherQmm);
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
@@ -1527,7 +1549,8 @@ void gather_qmm_rhs(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  if (metal::is_nax_available() && nax_supports_mode(mode) && transpose &&
+  if (metal::is_nax_available() &&
+      nax_supports_mode(mode, NaxPath::GatherQmm) && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
         /* const array& x_ = */ x_,

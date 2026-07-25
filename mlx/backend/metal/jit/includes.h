@@ -55,6 +55,7 @@ const char* steel_gemm_splitk_nax();
 const char* steel_gemm_segmented_nax();
 
 const char* quantized_nax();
+const char* kquant_nax();
 const char* fp_quantized_nax();
 
 const char* steel_attention_nax();
