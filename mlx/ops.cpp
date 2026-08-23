@@ -4621,6 +4621,19 @@ std::pair<int, int> quantization_params_from_mode(
       default_group_size = 32;
       default_bits = 5;
       break;
+    case QuantizationMode::Q3K:
+      default_group_size = 16;
+      default_bits = 3;
+      break;
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+      default_group_size = 32;
+      default_bits = 4;
+      break;
+    case QuantizationMode::IQ3S:
+      default_group_size = 32;
+      default_bits = 8;
+      break;
   }
   if (default_group_size < 0 || default_bits < 0) {
     std::ostringstream msg;

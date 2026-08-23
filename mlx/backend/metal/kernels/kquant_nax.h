@@ -44,12 +44,24 @@ inline constexpr short get_bytes_per_pack() {
 
 // Decode one quantized block (scale * q + bias) into w_local. W (the output
 // pointer type) serves the threadgroup block loader or a thread-local decode.
-template <typename U, int N, int bits, typename W>
+MLX_MTL_CONST int8_t kIQ4NLValuesNAX[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1,    13,    25,  38,  53,  69,  89,  113};
+
+template <typename U, int N, int bits, bool nonlinear, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
       "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  if constexpr (nonlinear) {
+    for (int i = 0; i < N; i++) {
+      const uint code = (w[i / 2] >> (4 * (i & 1))) & 0x0f;
+      w_local[i] = scale * static_cast<U>(kIQ4NLValuesNAX[code]);
+    }
+    return;
+  }
 
   if (bits == 2) {
     U s[4] = {
@@ -128,14 +140,14 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 // fp16 super-scale and an integer sub-scale, so it is worth more than T's
 // mantissa; decode in float and round once on the store. That also sidesteps
 // bfloat, which has no implicit conversion from float.
-template <typename T, int N, int bits>
+template <typename T, int N, int bits, bool nonlinear>
 inline void dequantize_to(
     const device uint8_t* w,
     float scale,
     float bias,
     threadgroup T* w_local) {
   float w_thread[N];
-  dequantize<float, N, bits>(w, scale, bias, w_thread);
+  dequantize<float, N, bits, nonlinear>(w, scale, bias, w_thread);
   for (int i = 0; i < N; i++) {
     w_local[i] = static_cast<T>(w_thread[i]);
   }
@@ -162,7 +174,7 @@ inline void dequantize_to(
 //
 // Mirrors KQScales in mlx/backend/cpu/quantized.cpp: same operand order and the
 // same float32 conversions, so the two decodes agree bitwise.
-template <typename U, int super_ratio, bool has_min>
+template <typename U, int bits, int super_ratio, bool has_min>
 struct KQScales {
   // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
   MLX_MTL_CONST int per_group = has_min ? 2 : 1;
@@ -188,7 +200,11 @@ struct KQScales {
       // as_type is a bit reinterpretation, so this reads the ggml sub-scale as
       // signed exactly the way the CPU reference's static_cast<int8_t> does.
       scale = static_cast<U>(d[0]) * static_cast<U>(as_type<int8_t>(sc[0]));
-      bias = static_cast<U>(-32.0f) * scale;
+      if constexpr (bits == 4) {
+        bias = static_cast<U>(0.0f);
+      } else {
+        bias = static_cast<U>(-(1 << (bits - 1))) * scale;
+      }
     }
   }
 
@@ -215,8 +231,8 @@ template <
     bool has_min>
 struct QuantizedBlockLoader {
   static_assert(
-      bits == 4 || bits == 5 || bits == 6,
-      "Template undefined for bits not in {4, 5, 6}");
+      bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+      "Template undefined for bits not in {3, 4, 5, 6, 8}");
 
   MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
@@ -246,7 +262,7 @@ struct QuantizedBlockLoader {
       (n_reads_per_scale * pack_factor) <= group_size,
       "A per-group run must not reach past its group.");
 
-  using scales_t = KQScales<float, super_ratio, has_min>;
+  using scales_t = KQScales<float, bits, super_ratio, has_min>;
 
   const int src_ld;
   const int tile_stride;
@@ -294,7 +310,7 @@ struct QuantizedBlockLoader {
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits>(
+        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
             src + k * bytes_per_pack, scale, bias, dst + k * pack_factor);
         k++;
       }
@@ -326,7 +342,7 @@ struct QuantizedBlockLoader {
       float bias;
       scales.at(i, scale, bias);
       for (int j = 0; j < n_reads_per_scale; j++) {
-        dequantize_to<T, pack_factor, bits>(
+        dequantize_to<T, pack_factor, bits, bits == 4 && !has_min>(
             (device uint8_t*)(src + k * bytes_per_pack),
             scale,
             bias,
@@ -368,7 +384,7 @@ template <
     const int WN = 2>
 METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     const device uint32_t* w,
-    KQScales<float, super_ratio, has_min> scales,
+    KQScales<float, bits, super_ratio, has_min> scales,
     const device T* x,
     device T* y,
     threadgroup T* Ws,
@@ -665,7 +681,7 @@ template <
       WM,
       WN>(
       w,
-      KQScales<float, super_ratio, has_min>(scales, biases),
+      KQScales<float, bits, super_ratio, has_min>(scales, biases),
       x,
       y,
       Ws,

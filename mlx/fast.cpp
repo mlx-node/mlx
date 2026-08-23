@@ -964,6 +964,10 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
     case QuantizationMode::Q6K:
     case QuantizationMode::Q4K:
     case QuantizationMode::Q5K:
+    case QuantizationMode::Q3K:
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+    case QuantizationMode::IQ3S:
       break;
   }
   throw std::invalid_argument(

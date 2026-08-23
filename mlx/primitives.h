@@ -158,7 +158,19 @@ class MLX_API UnaryPrimitive : public Primitive {
 // writes to and reads back from exported function files. Append new modes at
 // the end only. Reordering or removing one reinterprets every previously
 // exported graph as a different quantization format.
-enum class QuantizationMode { Affine, Mxfp4, Mxfp8, Nvfp4, Q6K, Q4K, Q5K };
+enum class QuantizationMode {
+  Affine,
+  Mxfp4,
+  Mxfp8,
+  Nvfp4,
+  Q6K,
+  Q4K,
+  Q5K,
+  Q3K,
+  IQ4NL,
+  IQ4XS,
+  IQ3S
+};
 
 // How many companion arrays a mode stores next to the packed weights. The
 // affine and K-quant modes carry both scales and biases, the floating point
@@ -169,6 +181,10 @@ constexpr int quant_weight_arrays(QuantizationMode mode) {
     case QuantizationMode::Q6K:
     case QuantizationMode::Q4K:
     case QuantizationMode::Q5K:
+    case QuantizationMode::Q3K:
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+    case QuantizationMode::IQ3S:
       return 2;
     case QuantizationMode::Mxfp4:
     case QuantizationMode::Mxfp8:
@@ -192,6 +208,10 @@ constexpr bool quant_has_sub_min(QuantizationMode mode) {
     case QuantizationMode::Mxfp8:
     case QuantizationMode::Nvfp4:
     case QuantizationMode::Q6K:
+    case QuantizationMode::Q3K:
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+    case QuantizationMode::IQ3S:
       return false;
   }
   throw std::invalid_argument("[quant_has_sub_min] Unknown quantization mode.");
@@ -203,10 +223,15 @@ constexpr bool quant_has_sub_min(QuantizationMode mode) {
 constexpr int quant_super_ratio(QuantizationMode mode) {
   switch (mode) {
     case QuantizationMode::Q6K:
+    case QuantizationMode::Q3K:
       return 16;
     case QuantizationMode::Q4K:
     case QuantizationMode::Q5K:
+    case QuantizationMode::IQ4XS:
+    case QuantizationMode::IQ3S:
       return 8;
+    case QuantizationMode::IQ4NL:
+      return 1;
     case QuantizationMode::Affine:
     case QuantizationMode::Mxfp4:
     case QuantizationMode::Mxfp8:
@@ -214,6 +239,29 @@ constexpr int quant_super_ratio(QuantizationMode mode) {
       return 0;
   }
   throw std::invalid_argument("[quant_super_ratio] Unknown quantization mode.");
+}
+
+// IQ4_NL and IQ4_XS use ggml's non-linear 16-value codebook instead of the
+// affine `scale * q + bias` grid. They retain the same two-level scale storage
+// contract as the K-quants after lossless source-block repacking.
+constexpr bool quant_uses_iq4nl_grid(QuantizationMode mode) {
+  switch (mode) {
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+      return true;
+    case QuantizationMode::Affine:
+    case QuantizationMode::Mxfp4:
+    case QuantizationMode::Mxfp8:
+    case QuantizationMode::Nvfp4:
+    case QuantizationMode::Q6K:
+    case QuantizationMode::Q4K:
+    case QuantizationMode::Q5K:
+    case QuantizationMode::Q3K:
+    case QuantizationMode::IQ3S:
+      return false;
+  }
+  throw std::invalid_argument(
+      "[quant_uses_iq4nl_grid] Unknown quantization mode.");
 }
 
 std::string quantization_mode_to_string(QuantizationMode mode);

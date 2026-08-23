@@ -156,7 +156,11 @@
 #define instantiate_kquant_types(type) \
   instantiate_kquant_modes(q6k, type, 16, 6, 16, false) \
   instantiate_kquant_modes(q4k, type, 32, 4, 8, true) \
-  instantiate_kquant_modes(q5k, type, 32, 5, 8, true)
+  instantiate_kquant_modes(q5k, type, 32, 5, 8, true) \
+  instantiate_kquant_modes(q3k, type, 16, 3, 16, false) \
+  instantiate_kquant_modes(iq4nl, type, 32, 4, 1, false) \
+  instantiate_kquant_modes(iq4xs, type, 32, 4, 8, false) \
+  instantiate_kquant_modes(iq3s, type, 32, 8, 8, false)
 
 instantiate_kquant_types(float)
 instantiate_kquant_types(float16_t)

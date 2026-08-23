@@ -43,7 +43,11 @@
 #define instantiate_kquant_nax_types(type) \
   instantiate_kquant_nax_all(q6k, type, 16, 6, 16, false) \
   instantiate_kquant_nax_all(q4k, type, 32, 4, 8, true) \
-  instantiate_kquant_nax_all(q5k, type, 32, 5, 8, true)
+  instantiate_kquant_nax_all(q5k, type, 32, 5, 8, true) \
+  instantiate_kquant_nax_all(q3k, type, 16, 3, 16, false) \
+  instantiate_kquant_nax_all(iq4nl, type, 32, 4, 1, false) \
+  instantiate_kquant_nax_all(iq4xs, type, 32, 4, 8, false) \
+  instantiate_kquant_nax_all(iq3s, type, 32, 8, 8, false)
 
 instantiate_kquant_nax_types(float)
 instantiate_kquant_nax_types(float16_t)

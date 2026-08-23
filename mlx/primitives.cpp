@@ -3469,6 +3469,14 @@ std::string quantization_mode_to_string(QuantizationMode mode) {
       return "q4k";
     case QuantizationMode::Q5K:
       return "q5k";
+    case QuantizationMode::Q3K:
+      return "q3k";
+    case QuantizationMode::IQ4NL:
+      return "iq4nl";
+    case QuantizationMode::IQ4XS:
+      return "iq4xs";
+    case QuantizationMode::IQ3S:
+      return "iq3s";
   }
   throw std::invalid_argument(
       "[quantization_mode_to_string] Unknown quantization mode with value " +
@@ -3492,6 +3500,14 @@ QuantizationMode string_to_quantization_mode(
     return QuantizationMode::Q4K;
   } else if (mode == "q5k") {
     return QuantizationMode::Q5K;
+  } else if (mode == "q3k") {
+    return QuantizationMode::Q3K;
+  } else if (mode == "iq4nl") {
+    return QuantizationMode::IQ4NL;
+  } else if (mode == "iq4xs") {
+    return QuantizationMode::IQ4XS;
+  } else if (mode == "iq3s") {
+    return QuantizationMode::IQ3S;
   }
   std::string msg;
   if (!tag.empty()) {

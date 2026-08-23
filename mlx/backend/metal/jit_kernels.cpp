@@ -963,7 +963,9 @@ static const char* quantized_source(const std::string& mode) {
   if (mode == "affine") {
     return metal::quantized();
   }
-  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+  if (
+      mode == "q6k" || mode == "q4k" || mode == "q5k" || mode == "q3k" ||
+      mode == "iq4nl" || mode == "iq4xs" || mode == "iq3s") {
     return metal::kquant();
   }
   return metal::fp_quantized();
@@ -1197,7 +1199,9 @@ static const char* quantized_nax_source(const std::string& mode) {
   if (mode == "affine") {
     return metal::quantized_nax();
   }
-  if (mode == "q6k" || mode == "q4k" || mode == "q5k") {
+  if (
+      mode == "q6k" || mode == "q4k" || mode == "q5k" || mode == "q3k" ||
+      mode == "iq4nl" || mode == "iq4xs" || mode == "iq3s") {
     return metal::kquant_nax();
   }
   return metal::fp_quantized_nax();

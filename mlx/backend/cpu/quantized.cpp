@@ -720,6 +720,19 @@ void validate_kquant_config(
       expected_bits = 5;
       expected_group_size = 32;
       break;
+    case QuantizationMode::Q3K:
+      expected_bits = 3;
+      expected_group_size = 16;
+      break;
+    case QuantizationMode::IQ4NL:
+    case QuantizationMode::IQ4XS:
+      expected_bits = 4;
+      expected_group_size = 32;
+      break;
+    case QuantizationMode::IQ3S:
+      expected_bits = 8;
+      expected_group_size = 32;
+      break;
     case QuantizationMode::Affine:
     case QuantizationMode::Mxfp4:
     case QuantizationMode::Mxfp8:
@@ -1119,7 +1132,7 @@ void fp_bs_qmm_dispatch(
 // Every row holds a whole number of super-blocks, so a flat group index stays
 // aligned as it runs across rows, which is how the affine kernels already walk
 // their scales.
-template <int super_ratio, bool has_min>
+template <int bits, int super_ratio, bool has_min, bool nonlinear>
 class KQScales {
  public:
   // Sub-scale entries per group: (sc, m) for q4k and q5k, sc alone for q6k.
@@ -1137,7 +1150,11 @@ class KQScales {
     } else {
       scale = static_cast<float>(d[0]) *
           static_cast<float>(static_cast<int8_t>(sc[0]));
-      bias = -32.0f * scale;
+      if constexpr (nonlinear) {
+        bias = 0.0f;
+      } else {
+        bias = -static_cast<float>(1 << (bits - 1)) * scale;
+      }
     }
   }
 
@@ -1152,7 +1169,26 @@ class KQScales {
   size_t g_ = 0;
 };
 
-template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+constexpr int8_t kIQ4NLValues[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1,    13,    25,  38,  53,  69,  89,  113};
+
+template <bool nonlinear>
+inline float kq_value(float code, float scale, float bias) {
+  if constexpr (nonlinear) {
+    return scale * static_cast<float>(kIQ4NLValues[static_cast<int>(code)]);
+  } else {
+    return scale * code + bias;
+  }
+}
+
+template <
+    typename T,
+    int bits,
+    int group_size,
+    int super_ratio,
+    bool has_min,
+    bool nonlinear>
 void kq_qmm(
     T* result,
     const T* x,
@@ -1169,7 +1205,7 @@ void kq_qmm(
 
   for (int m = 0; m < M; m++) {
     const uint8_t* w_local = (const uint8_t*)w;
-    KQScales<super_ratio, has_min> sb(scales, biases);
+    KQScales<bits, super_ratio, has_min, nonlinear> sb(scales, biases);
 
     std::fill(result, result + N, 0);
 
@@ -1182,12 +1218,13 @@ void kq_qmm(
         float bias;
         sb.next(scale, bias);
         for (int ng = 0; ng < packs_in_group; ng++) {
-          if constexpr (bits == 5 || bits == 6) {
+          if constexpr (bits == 3 || bits == 5 || bits == 6) {
             float wl[pack_factor];
             extract_bits<float, bits>(w_local, wl);
 #pragma clang loop unroll(full)
             for (int p = 0; p < pack_factor; p++) {
-              (*result_local++) += static_cast<T>(xi * (scale * wl[p] + bias));
+              (*result_local++) +=
+                  static_cast<T>(xi * kq_value<nonlinear>(wl[p], scale, bias));
             }
             w_local += bytes_per_pack;
 
@@ -1196,7 +1233,8 @@ void kq_qmm(
 #pragma clang loop unroll(full)
             for (int p = 0; p < pack_factor; p++) {
               (*result_local++) += static_cast<T>(
-                  xi * (scale * static_cast<float>(wi & bitmask) + bias));
+                  xi * kq_value<nonlinear>(
+                           static_cast<float>(wi & bitmask), scale, bias));
               wi >>= bits;
             }
           }
@@ -1208,7 +1246,13 @@ void kq_qmm(
   }
 }
 
-template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+template <
+    typename T,
+    int bits,
+    int group_size,
+    int super_ratio,
+    bool has_min,
+    bool nonlinear>
 void kq_qmm_t(
     T* result,
     const T* x,
@@ -1225,7 +1269,7 @@ void kq_qmm_t(
 
   for (int m = 0; m < M; m++) {
     const uint8_t* w_local = (const uint8_t*)w;
-    KQScales<super_ratio, has_min> sb(scales, biases);
+    KQScales<bits, super_ratio, has_min, nonlinear> sb(scales, biases);
 
     for (int n = 0; n < N; n++) {
       const T* x_local = x;
@@ -1236,12 +1280,13 @@ void kq_qmm_t(
         sb.next(scale, bias);
 
         for (int kw = 0; kw < packs_in_group; kw++) {
-          if constexpr (bits == 5 || bits == 6) {
+          if constexpr (bits == 3 || bits == 5 || bits == 6) {
             float wl[pack_factor];
             extract_bits<float, bits>(w_local, wl);
 #pragma clang loop unroll(full)
             for (int p = 0; p < pack_factor; p++) {
-              sum += static_cast<float>(x_local[p]) * (scale * wl[p] + bias);
+              sum += static_cast<float>(x_local[p]) *
+                  kq_value<nonlinear>(wl[p], scale, bias);
             }
             w_local += bytes_per_pack;
             x_local += pack_factor;
@@ -1251,7 +1296,8 @@ void kq_qmm_t(
 #pragma clang loop unroll(full)
             for (int p = 0; p < pack_factor; p++) {
               sum += static_cast<float>(*x_local++) *
-                  (scale * static_cast<float>(wi & bitmask) + bias);
+                  kq_value<nonlinear>(
+                      static_cast<float>(wi & bitmask), scale, bias);
               wi >>= bits;
             }
           }
@@ -1270,7 +1316,13 @@ void kq_qmm_t(
 // bits. Q6_K's 6-bit stream has no lane-aligned extraction and its group of 16
 // is shorter than one SIMD register, so all three K-quants take the scalar
 // path here. The Metal kernels are where the throughput comes from.
-template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+template <
+    typename T,
+    int bits,
+    int group_size,
+    int super_ratio,
+    bool has_min,
+    bool nonlinear>
 void kq_qmm_dispatch_transpose(
     T* result,
     const T* x,
@@ -1282,17 +1334,17 @@ void kq_qmm_dispatch_transpose(
     int K,
     bool transposed_w) {
   if (transposed_w) {
-    kq_qmm_t<T, bits, group_size, super_ratio, has_min>(
+    kq_qmm_t<T, bits, group_size, super_ratio, has_min, nonlinear>(
         result, x, w, scales, biases, M, N, K);
   } else {
-    kq_qmm<T, bits, group_size, super_ratio, has_min>(
+    kq_qmm<T, bits, group_size, super_ratio, has_min, nonlinear>(
         result, x, w, scales, biases, M, N, K);
   }
 }
 
 // Q6_K's sub-block is 16 values, which the affine chain never sees because
 // validate_affine_quant_config only admits 32, 64 and 128.
-template <typename T, int bits, int super_ratio, bool has_min>
+template <typename T, int bits, int super_ratio, bool has_min, bool nonlinear>
 void kq_qmm_dispatch_group(
     T* result,
     const T* x,
@@ -1306,11 +1358,11 @@ void kq_qmm_dispatch_group(
     bool transposed_w) {
   switch (group_size) {
     case 16:
-      kq_qmm_dispatch_transpose<T, bits, 16, super_ratio, has_min>(
+      kq_qmm_dispatch_transpose<T, bits, 16, super_ratio, has_min, nonlinear>(
           result, x, w, scales, biases, M, N, K, transposed_w);
       break;
     case 32:
-      kq_qmm_dispatch_transpose<T, bits, 32, super_ratio, has_min>(
+      kq_qmm_dispatch_transpose<T, bits, 32, super_ratio, has_min, nonlinear>(
           result, x, w, scales, biases, M, N, K, transposed_w);
       break;
     default:
@@ -1333,15 +1385,31 @@ void kq_qmm_dispatch_typed(
     bool transposed_w) {
   switch (mode) {
     case QuantizationMode::Q6K:
-      kq_qmm_dispatch_group<T, 6, 16, false>(
+      kq_qmm_dispatch_group<T, 6, 16, false, false>(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
       break;
     case QuantizationMode::Q4K:
-      kq_qmm_dispatch_group<T, 4, 8, true>(
+      kq_qmm_dispatch_group<T, 4, 8, true, false>(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
       break;
     case QuantizationMode::Q5K:
-      kq_qmm_dispatch_group<T, 5, 8, true>(
+      kq_qmm_dispatch_group<T, 5, 8, true, false>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::Q3K:
+      kq_qmm_dispatch_group<T, 3, 16, false, false>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::IQ4NL:
+      kq_qmm_dispatch_group<T, 4, 1, false, true>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::IQ4XS:
+      kq_qmm_dispatch_group<T, 4, 8, false, true>(
+          result, x, w, scales, biases, M, N, K, group_size, transposed_w);
+      break;
+    case QuantizationMode::IQ3S:
+      kq_qmm_dispatch_group<T, 8, 8, false, false>(
           result, x, w, scales, biases, M, N, K, group_size, transposed_w);
       break;
     case QuantizationMode::Affine:
@@ -1536,7 +1604,13 @@ void kq_bs_qmm_dispatch(
 
 // Decodes a whole row-contiguous tensor. Every row is a whole number of
 // super-blocks, so one walker can run over the flattened buffer.
-template <typename T, int bits, int group_size, int super_ratio, bool has_min>
+template <
+    typename T,
+    int bits,
+    int group_size,
+    int super_ratio,
+    bool has_min,
+    bool nonlinear>
 void kq_dequantize(
     T* out,
     const uint32_t* w,
@@ -1549,19 +1623,19 @@ void kq_dequantize(
   constexpr int packs_in_group = group_size / pack_factor;
 
   const uint8_t* w_local = (const uint8_t*)w;
-  KQScales<super_ratio, has_min> sb(scales, biases);
+  KQScales<bits, super_ratio, has_min, nonlinear> sb(scales, biases);
 
   for (size_t i = 0; i < size; i += group_size) {
     float scale;
     float bias;
     sb.next(scale, bias);
     for (int kw = 0; kw < packs_in_group; kw++) {
-      if constexpr (bits == 5 || bits == 6) {
+      if constexpr (bits == 3 || bits == 5 || bits == 6) {
         float wl[pack_factor];
         extract_bits<float, bits>(w_local, wl);
 #pragma clang loop unroll(full)
         for (int p = 0; p < pack_factor; p++) {
-          (*out++) = static_cast<T>(scale * wl[p] + bias);
+          (*out++) = static_cast<T>(kq_value<nonlinear>(wl[p], scale, bias));
         }
         w_local += bytes_per_pack;
 
@@ -1570,7 +1644,8 @@ void kq_dequantize(
 #pragma clang loop unroll(full)
         for (int p = 0; p < pack_factor; p++) {
           (*out++) =
-              static_cast<T>(scale * static_cast<float>(wi & bitmask) + bias);
+              static_cast<T>(kq_value<nonlinear>(
+                  static_cast<float>(wi & bitmask), scale, bias));
           wi >>= bits;
         }
       }
@@ -1578,7 +1653,7 @@ void kq_dequantize(
   }
 }
 
-template <typename T, int bits, int super_ratio, bool has_min>
+template <typename T, int bits, int super_ratio, bool has_min, bool nonlinear>
 void kq_dequantize_dispatch_group(
     T* out,
     const uint32_t* w,
@@ -1588,11 +1663,11 @@ void kq_dequantize_dispatch_group(
     int group_size) {
   switch (group_size) {
     case 16:
-      kq_dequantize<T, bits, 16, super_ratio, has_min>(
+      kq_dequantize<T, bits, 16, super_ratio, has_min, nonlinear>(
           out, w, scales, biases, size);
       break;
     case 32:
-      kq_dequantize<T, bits, 32, super_ratio, has_min>(
+      kq_dequantize<T, bits, 32, super_ratio, has_min, nonlinear>(
           out, w, scales, biases, size);
       break;
     default:
@@ -1615,15 +1690,31 @@ void kq_dequantize_dispatch_typed(
   size_t size = out.size();
   switch (mode) {
     case QuantizationMode::Q6K:
-      kq_dequantize_dispatch_group<T, 6, 16, false>(
+      kq_dequantize_dispatch_group<T, 6, 16, false, false>(
           out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
       break;
     case QuantizationMode::Q4K:
-      kq_dequantize_dispatch_group<T, 4, 8, true>(
+      kq_dequantize_dispatch_group<T, 4, 8, true, false>(
           out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
       break;
     case QuantizationMode::Q5K:
-      kq_dequantize_dispatch_group<T, 5, 8, true>(
+      kq_dequantize_dispatch_group<T, 5, 8, true, false>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::Q3K:
+      kq_dequantize_dispatch_group<T, 3, 16, false, false>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::IQ4NL:
+      kq_dequantize_dispatch_group<T, 4, 1, false, true>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::IQ4XS:
+      kq_dequantize_dispatch_group<T, 4, 8, false, true>(
+          out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
+      break;
+    case QuantizationMode::IQ3S:
+      kq_dequantize_dispatch_group<T, 8, 8, false, false>(
           out_ptr, w_ptr, scales_ptr, biases_ptr, size, group_size);
       break;
     case QuantizationMode::Affine:
