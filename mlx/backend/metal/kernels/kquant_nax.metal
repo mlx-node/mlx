@@ -8,11 +8,7 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/kquant_nax.h"
 
-// Only qmm_t. `qmm` is the one dispatcher that reaches NAX with a plain
-// (x, w, scales, biases) triple and a transposed weight, which is the prefill
-// shape K-quants are slow on; the gather paths keep the simdgroup kernels, and
-// nax_supports_mode in mlx/backend/metal/quantized.cpp admits K-quants for this
-// path only.
+// Transposed matrix and gathered-expert NAX kernels.
 //
 // super_ratio is 256 / group_size, the number of sub-blocks a super-block's
 // (d, dmin) covers; has_min says whether the sub-scales interleave a minimum.
@@ -34,7 +30,21 @@
       wm, \
       wn)
 
+
+#define instantiate_kquant_gather(mode, type, group_size, bits, super_ratio, has_min, aligned) \
+  instantiate_kernel( \
+      #mode "_gather_qmm_t_nax_" #type "_gs_" #group_size "_b_" #bits "_bm64_bn64_bk64_wm2_wn2_alN_" #aligned, \
+      kquant_gather_qmm_t_nax, type, group_size, bits, super_ratio, has_min, aligned, 64, 64, 64, 2, 2)
+
+#define instantiate_kquant_gather_rhs(mode, type, group_size, bits, super_ratio, has_min) \
+  instantiate_kernel( \
+      #mode "_gather_qmm_rhs_nax_nt_" #type "_gs_" #group_size "_b_" #bits "_bm_64_bn_64_bk_64_wm_2_wn_2", \
+      kquant_gather_qmm_rhs_nax, type, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2, true)
+
 #define instantiate_kquant_nax_all(mode, type, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_gather(mode, type, group_size, bits, super_ratio, has_min, true) \
+  instantiate_kquant_gather(mode, type, group_size, bits, super_ratio, has_min, false) \
+  instantiate_kquant_gather_rhs(mode, type, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 1, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, true, 0, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \
   instantiate_kquant_aligned_batched(mode, qmm_t_nax, type, false, 1, group_size, bits, super_ratio, has_min, 64, 64, 64, 2, 2) \

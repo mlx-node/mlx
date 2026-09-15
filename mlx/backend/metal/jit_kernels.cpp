@@ -1193,8 +1193,7 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
 
 // Same split as quantized_source above, over the NAX sources. Reachable modes
 // are already filtered by nax_supports_mode / nax_quantized_kernel_family in
-// mlx/backend/metal/quantized.cpp, so a K-quant only arrives here on the qmm_t
-// path kquant_nax.metal instantiates.
+// mlx/backend/metal/quantized.cpp, including transposed K-quant gathers.
 static const char* quantized_nax_source(const std::string& mode) {
   if (mode == "affine") {
     return metal::quantized_nax();
@@ -1251,6 +1250,16 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
         metal::gemm_nax(),
         metal::quantized_utils());
     bool is_affine = mode == "affine";
+    auto qmode = string_to_quantization_mode(mode);
+    if (quant_super_ratio(qmode) > 0) {
+      concatenate(
+          kernel_source, metal::kquant_nax(),
+          get_template_definition(
+              lib_name, "kquant_gather_qmm_rhs_nax", get_type_string(x.dtype()),
+              group_size, bits, quant_super_ratio(qmode), quant_has_sub_min(qmode),
+              bm, bn, bk, wm, wn, transpose));
+      return kernel_source;
+    }
     concatenate(
         kernel_source,
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),

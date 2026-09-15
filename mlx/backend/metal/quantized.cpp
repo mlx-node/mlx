@@ -46,17 +46,14 @@ const char* quantized_kernel_family(
   throw std::invalid_argument(msg.str());
 }
 
-// NAX kernel coverage is per path, not per mode. affine (quantized_nax.metal)
-// and the floating point family (fp_quantized_nax.metal) instantiate the whole
-// set; the K-quants instantiate only kquant_qmm_t_nax (kquant_nax.metal),
-// because that is the one NAX kernel a prefill takes and the one measured to be
-// worth having. Every other K-quant path stays on the simdgroup kernels.
+// NAX covers transposed K-quant matrices and gathered expert matrices.
+// Row-major K-quant matrices retain the SIMD-group fallback.
 enum class NaxPath {
   // qmm with a transposed weight: {affine,fp,kquant}_qmm_t_nax.
   QmmT,
   // qmm with a row-major weight: affine and fp only.
   QmmN,
-  // gather_qmm / gather_qmm_rhs: affine and fp only.
+  // Transposed gather_qmm / gather_qmm_rhs: all families.
   GatherQmm,
 };
 
@@ -67,7 +64,7 @@ bool nax_supports_mode(const std::string& mode, NaxPath path) {
   if (!is_kquant_mode(mode)) {
     return true;
   }
-  return path == NaxPath::QmmT;
+  return path != NaxPath::QmmN;
 }
 
 const char* nax_quantized_kernel_family(
@@ -1551,6 +1548,7 @@ void gather_qmm_rhs(
     const std::string mode) {
   if (metal::is_nax_available() &&
       nax_supports_mode(mode, NaxPath::GatherQmm) && transpose &&
+      (!is_kquant_mode(mode) || K % 64 == 0) &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
         /* const array& x_ = */ x_,
