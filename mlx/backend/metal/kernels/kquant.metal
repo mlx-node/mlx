@@ -126,7 +126,7 @@
   instantiate_kquant_aligned_batched(mode, qmm_t, type, false, 1, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_aligned_batched(mode, qmm_t, type, false, 0, group_size, bits, super_ratio, has_min)
 
-// vecs_per_tg (input-vector tile) 2..5, k_lanes 8 as the affine family uses.
+// vecs_per_tg (input-vector tile) 2..8, k_lanes 8 as the affine family uses.
 #define instantiate_kquant_wide_wrap(mode, type, vecs_per_tg, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_wide(mode, qmv_wide, type, vecs_per_tg, 8, 0, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_wide(mode, qmv_wide, type, vecs_per_tg, 8, 1, group_size, bits, super_ratio, has_min)
@@ -135,7 +135,10 @@
   instantiate_kquant_wide_wrap(mode, type, 2, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_wide_wrap(mode, type, 3, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_wide_wrap(mode, type, 4, group_size, bits, super_ratio, has_min) \
-  instantiate_kquant_wide_wrap(mode, type, 5, group_size, bits, super_ratio, has_min)
+  instantiate_kquant_wide_wrap(mode, type, 5, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_wrap(mode, type, 6, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_wrap(mode, type, 7, group_size, bits, super_ratio, has_min) \
+  instantiate_kquant_wide_wrap(mode, type, 8, group_size, bits, super_ratio, has_min)
 
 #define instantiate_kquant_all_splitk(mode, type, group_size, bits, super_ratio, has_min) \
   instantiate_kquant_split_k(mode, qvm_split_k, type, 8, group_size, bits, super_ratio, has_min) \

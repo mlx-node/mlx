@@ -450,8 +450,14 @@ void qmv_wide(
     std::string_view tag) {
   // vecs_per_tg is the per-threadgroup input-vector tile. Each tile re-reads
   // the weights, so use the fewest tiles, then the smallest tile that fills
-  // them.
-  int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
+  // them. The kernel itself is templated on vecs_per_tg; capping at 5 makes
+  // M=6..8 verify blocks (DFlash2 depth 5-7) double-stream every weight, so
+  // allow single tiles up to 8 — but only for large-N projections, where
+  // threadgroup parallelism is already saturated by the row dimension. On
+  // narrow outputs the weight re-read is cheap and extra threadgroups buy
+  // occupancy, so keep the old cap there.
+  const int tile_cap = N >= 2048 ? 8 : 5;
+  int n_tiles = (M + tile_cap - 1) / tile_cap; // ceil(M / tile_cap)
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
@@ -1741,6 +1747,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+  if (const char* e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
+    int v = std::atoi(e);
+    if (v > 0) {
+      vector_limit = v;
+    }
+  }
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {

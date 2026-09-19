@@ -125,7 +125,10 @@
   instantiate_quantized_wide_wrap(mode, qmv_wide, type, 2, 16, group_size, bits) \
   instantiate_quantized_wide_wrap(mode, qmv_wide, type, 3, 16, group_size, bits) \
   instantiate_quantized_wide_wrap(mode, qmv_wide, type, 4, 16, group_size, bits) \
-  instantiate_quantized_wide_wrap(mode, qmv_wide, type, 5, 16, group_size, bits)
+  instantiate_quantized_wide_wrap(mode, qmv_wide, type, 5, 16, group_size, bits) \
+  instantiate_quantized_wide_wrap(mode, qmv_wide, type, 6, 16, group_size, bits) \
+  instantiate_quantized_wide_wrap(mode, qmv_wide, type, 7, 16, group_size, bits) \
+  instantiate_quantized_wide_wrap(mode, qmv_wide, type, 8, 16, group_size, bits)
 
 #define instantiate_quantized_all_splitk(type, mode, group_size, bits) \
   instantiate_quantized_split_k(mode, qvm_split_k, type, 8, group_size, bits) \
