@@ -377,7 +377,8 @@ class CustomKernel : public Primitive {
       std::vector<ScalarArg> scalar_arguments,
       bool is_precompiled,
       int shared_memory,
-      CompileOptions::Data compile_options = {})
+      CompileOptions::Data compile_options = {},
+      std::vector<Shape> declared_output_shapes = {})
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
@@ -389,6 +390,7 @@ class CustomKernel : public Primitive {
         scalar_arguments_(std::move(scalar_arguments)),
         is_precompiled_(is_precompiled),
         shared_memory_(shared_memory),
+        declared_output_shapes_(std::move(declared_output_shapes)),
         compile_options_(compile_options) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
@@ -400,6 +402,14 @@ class CustomKernel : public Primitive {
       override;
 
   DEFINE_NAME(CustomKernel);
+  // The output shapes declared at kernel construction. Under shapeless
+  // compile replay these are only valid when the kernel's outputs do not
+  // depend on a shape-varying input dim — the same condition that makes the
+  // baked launch grid valid — so callers tracing shape-polymorphic custom
+  // kernels must keep both invariants.
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return declared_output_shapes_;
+  }
   auto state() const {
     return std::make_tuple(
         name_,
@@ -426,6 +436,7 @@ class CustomKernel : public Primitive {
   std::vector<ScalarArg> scalar_arguments_;
   bool is_precompiled_;
   int shared_memory_;
+  std::vector<Shape> declared_output_shapes_;
   CompileOptions::Data compile_options_;
 };
 

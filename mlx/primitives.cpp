@@ -3367,6 +3367,14 @@ bool Pad::is_equivalent(const Primitive& other) const {
       p_other.high_pad_size_ == high_pad_size_);
 }
 
+std::vector<Shape> Pad::output_shapes(const std::vector<array>& inputs) {
+  Shape out = inputs[0].shape();
+  for (size_t i = 0; i < axes_.size(); ++i) {
+    out[axes_[i]] += low_pad_size_[i] + high_pad_size_[i];
+  }
+  return {out};
+}
+
 std::vector<array> Partition::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -5003,6 +5011,32 @@ bool Slice::is_equivalent(const Primitive& other) const {
       end_indices_ == s_other.end_indices_ && strides_ == s_other.strides_);
 }
 
+std::vector<Shape> Slice::output_shapes(const std::vector<array>& inputs) {
+  // `start_indices_` were normalized against the trace-time shape at
+  // construction; `end_indices_` keep the caller's raw bounds (negative =
+  // from the end, > n clamps to n). Re-normalizing `end` against the real
+  // input shape keeps "slice to end" correct when an input dim varies under
+  // shapeless compile replay; fixed absolute bounds clamp defensively.
+  const Shape& in = inputs[0].shape();
+  Shape out(in.size());
+  for (size_t i = 0; i < out.size(); ++i) {
+    auto n = in[i];
+    auto s = std::min(std::max(start_indices_[i], ShapeElem(0)), n);
+    auto e = end_indices_[i];
+    e = e < 0 ? e + n : e;
+    e = std::min(std::max(e, ShapeElem(0)), n);
+    if (strides_[i] < 0) {
+      e = e > s ? s : e;
+      auto str = -strides_[i];
+      out[i] = (s - e + str - 1) / str;
+    } else {
+      e = e < s ? s : e;
+      out[i] = (e - s + strides_[i] - 1) / strides_[i];
+    }
+  }
+  return {out};
+}
+
 std::pair<std::vector<array>, std::vector<int>> SliceUpdate::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
@@ -5475,6 +5509,21 @@ std::vector<array> Split::jvp(
 bool Split::is_equivalent(const Primitive& other) const {
   const Split& s_other = static_cast<const Split&>(other);
   return axis_ == s_other.axis_ && indices_ == s_other.indices_;
+}
+
+std::vector<Shape> Split::output_shapes(const std::vector<array>& inputs) {
+  // Mirrors `split()`'s fast-path sizing, but derives the tail segment from
+  // the real input length so shapeless replay stays correct when the split
+  // axis varies.
+  const Shape& in = inputs[0].shape();
+  std::vector<Shape> out(indices_.size() + 1, in);
+  ShapeElem prev = 0;
+  for (size_t i = 0; i < indices_.size(); ++i) {
+    out[i][axis_] = indices_[i] - prev;
+    prev = indices_[i];
+  }
+  out.back()[axis_] = in[axis_] - prev;
+  return out;
 }
 
 std::vector<array> Square::vjp(
