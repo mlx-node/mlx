@@ -381,6 +381,22 @@ void CommandEncoder::add_temporary(array arr) {
   temporaries_.push_back(std::move(arr));
 }
 
+void CommandEncoder::retain_inputs(const array& arr) {
+  const void* out_data = arr.data_shared_ptr().get();
+  for (const auto& in : arr.inputs()) {
+    const auto& p = in.data_shared_ptr();
+    if (p.get() != out_data) {
+      pending_retained_.insert(p);
+    }
+  }
+  for (const auto& s : arr.siblings()) {
+    const auto& p = s.data_shared_ptr();
+    if (p.get() != out_data) {
+      pending_retained_.insert(p);
+    }
+  }
+}
+
 void CommandEncoder::add_temporaries(std::vector<array> arrays) {
   temporaries_.insert(
       temporaries_.end(),
@@ -516,6 +532,13 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit(std::function<void()> completion) {
+  // Flush accumulated buffer retention in one completed-handler instead of
+  // the per-eval handlers gpu::eval used to attach.
+  if (!pending_retained_.empty()) {
+    buffer_->addCompletedHandler(
+        [retained = std::move(pending_retained_)](MTL::CommandBuffer*) {});
+    pending_retained_.clear();
+  }
   buffer_->addCompletedHandler(
       [&error_ = error_,
        wait_events = std::move(wait_events_),

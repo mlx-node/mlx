@@ -54,6 +54,13 @@ class MLX_API CommandEncoder {
   void add_temporary(array arr);
   void add_temporaries(std::vector<array> arrays);
 
+  // Retain `arr`'s input/sibling storage until the current command buffer
+  // completes (skipping storage donated to `arr` itself). Accumulates across
+  // evals so a single completed-handler per commit covers every retained
+  // buffer (previously each eval built a set and attached its own ObjC
+  // block — one allocation per primitive dispatch).
+  void retain_inputs(const array& arr);
+
   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
@@ -136,6 +143,10 @@ class MLX_API CommandEncoder {
   std::unordered_set<MTL::Resource*> concurrent_outputs_;
   std::unordered_set<const void*> all_inputs_;
   std::unordered_set<const void*> all_outputs_;
+
+  // Array storage retained until the next commit() — moved into a single
+  // completed-handler at commit time (see retain()).
+  std::unordered_set<std::shared_ptr<array::Data>> pending_retained_;
 
   // A map of prior command encoder outputs to their corresponding fence.
   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
