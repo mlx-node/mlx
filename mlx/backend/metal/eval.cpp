@@ -1,4 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -26,11 +29,48 @@ void new_thread_unsafe_stream(Stream s) {
   encoders.try_emplace(s.index, d, s.index, d.residency_set());
 }
 
+namespace {
+// MLX_METAL_OP_TRACE=1: report per-commit primitive dispatch counts to stderr.
+// MLX_METAL_OP_TRACE=2: also emit each primitive's name (aggregated offline).
+// Diagnostic only — counts ops encoded between command-buffer commits.
+int op_trace_level() {
+  static const int level = [] {
+    const char* v = std::getenv("MLX_METAL_OP_TRACE");
+    return v ? std::atoi(v) : 0;
+  }();
+  return level;
+}
+std::atomic<uint64_t>& op_count() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+} // namespace
+
 void eval(array& arr) {
   auto pool = metal::new_scoped_memory_pool();
   auto s = arr.primitive().stream();
   auto& encoder = metal::get_command_encoder(s);
   auto* command_buffer = encoder.get_command_buffer();
+  if (op_trace_level() >= 1) {
+    op_count().fetch_add(1, std::memory_order_relaxed);
+    if (op_trace_level() >= 2) {
+      if (op_trace_level() >= 3) {
+        std::ostringstream os;
+        os << "n" << arr.inputs().size() << ":";
+        for (auto& in : arr.inputs()) {
+          os << in.dtype() << ",";
+        }
+        os << ">" << arr.dtype();
+        fprintf(
+            stderr,
+            "[metal-op] %s %s\n",
+            arr.primitive().name(),
+            os.str().c_str());
+      } else {
+        fprintf(stderr, "[metal-op] %s\n", arr.primitive().name());
+      }
+    }
+  }
 
   auto outputs = arr.outputs();
   {
@@ -62,6 +102,12 @@ void eval(array& arr) {
     encoder.commit([s, buffers = std::move(buffers)]() {
       scheduler::notify_task_completion(s);
     });
+    if (op_trace_level() >= 1) {
+      fprintf(
+          stderr,
+          "[metal-eval] commit: %llu ops\n",
+          op_count().exchange(0, std::memory_order_relaxed));
+    }
   } else {
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
@@ -74,10 +120,22 @@ void finalize(Stream s) {
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
   encoder.commit();
+  if (op_trace_level() >= 1) {
+    fprintf(
+        stderr,
+        "[metal-eval] finalize: %llu ops\n",
+        op_count().exchange(0, std::memory_order_relaxed));
+  }
 }
 
 void synchronize(Stream s) {
   metal::get_command_encoder(s).synchronize();
+  if (op_trace_level() >= 1) {
+    fprintf(
+        stderr,
+        "[metal-eval] sync: %llu ops\n",
+        op_count().exchange(0, std::memory_order_relaxed));
+  }
 }
 
 void clear_streams() {
