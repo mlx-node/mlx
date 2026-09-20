@@ -433,6 +433,9 @@ class AsStrided : public UnaryPrimitive {
 
   DEFINE_GRADS()
   DEFINE_NAME(AsStrided)
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {shape_};
+  }
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
     return std::make_tuple(shape_, strides_, offset_);
@@ -900,6 +903,8 @@ class Depends : public Primitive {
       const std::vector<array>& outputs) override;
 
   DEFINE_NAME(Depends);
+  // Depends passes inputs[0] through; the rest are ordering-only edges.
+  DEFINE_INPUT_OUTPUT_SHAPE()
 
  private:
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
@@ -1588,6 +1593,8 @@ class Pad : public UnaryPrimitive {
   DEFINE_VMAP()
   DEFINE_GRADS()
   DEFINE_NAME(Pad)
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override;
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
     return std::make_tuple(axes_, low_pad_size_, high_pad_size_);
@@ -2104,6 +2111,8 @@ class Slice : public UnaryPrimitive {
   DEFINE_VMAP()
   DEFINE_GRADS()
   DEFINE_NAME(Slice)
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override;
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
     return std::make_tuple(start_indices_, end_indices_, strides_);
@@ -2289,6 +2298,8 @@ class Split : public Primitive {
   DEFINE_VMAP()
   DEFINE_GRADS()
   DEFINE_NAME(Split)
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override;
   bool is_equivalent(const Primitive& other) const override;
   std::pair<Shape, int> state() const {
     return {indices_, axis_};
