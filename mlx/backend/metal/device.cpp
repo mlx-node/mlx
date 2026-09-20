@@ -531,6 +531,22 @@ bool CommandEncoder::needs_commit() const {
   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 
+namespace {
+// Mirror of eval.cpp's tracer gate — read the env once.
+int commit_trace_level() {
+  static const int level = [] {
+    const char* v = std::getenv("MLX_METAL_OP_TRACE");
+    return v ? std::atoi(v) : 0;
+  }();
+  return level;
+}
+} // namespace
+
+std::atomic<double>& gpu_busy_seconds() {
+  static std::atomic<double> s{0.0};
+  return s;
+}
+
 void CommandEncoder::commit(std::function<void()> completion) {
   // Flush accumulated buffer retention in one completed-handler instead of
   // the per-eval handlers gpu::eval used to attach.
@@ -543,7 +559,13 @@ void CommandEncoder::commit(std::function<void()> completion) {
       [&error_ = error_,
        wait_events = std::move(wait_events_),
        signal_events = std::move(signal_events_),
+       trace = commit_trace_level(),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
+        if (trace >= 1 && cbuf->status() == MTL::CommandBufferStatusCompleted) {
+          gpu_busy_seconds().fetch_add(
+              cbuf->GPUEndTime() - cbuf->GPUStartTime(),
+              std::memory_order_relaxed);
+        }
         if (completion) {
           completion();
         }

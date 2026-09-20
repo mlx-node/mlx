@@ -96,8 +96,9 @@ void eval(array& arr) {
     if (op_trace_level() >= 1) {
       fprintf(
           stderr,
-          "[metal-eval] commit: %llu ops\n",
-          op_count().exchange(0, std::memory_order_relaxed));
+          "[metal-eval] commit: %llu ops gpu_total=%.2fms\n",
+          op_count().exchange(0, std::memory_order_relaxed),
+          metal::gpu_busy_seconds().load(std::memory_order_relaxed) * 1e3);
     }
   }
 }
@@ -111,8 +112,9 @@ void finalize(Stream s) {
   if (op_trace_level() >= 1) {
     fprintf(
         stderr,
-        "[metal-eval] finalize: %llu ops\n",
-        op_count().exchange(0, std::memory_order_relaxed));
+        "[metal-eval] finalize: %llu ops gpu_total=%.2fms\n",
+        op_count().exchange(0, std::memory_order_relaxed),
+        metal::gpu_busy_seconds().load(std::memory_order_relaxed) * 1e3);
   }
 }
 
@@ -121,8 +123,9 @@ void synchronize(Stream s) {
   if (op_trace_level() >= 1) {
     fprintf(
         stderr,
-        "[metal-eval] sync: %llu ops\n",
-        op_count().exchange(0, std::memory_order_relaxed));
+        "[metal-eval] sync: %llu ops gpu_total=%.2fms\n",
+        op_count().exchange(0, std::memory_order_relaxed),
+        metal::gpu_busy_seconds().load(std::memory_order_relaxed) * 1e3);
   }
 }
 

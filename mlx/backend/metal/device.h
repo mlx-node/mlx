@@ -3,6 +3,7 @@
 #pragma once
 
 #include <Metal/Metal.hpp>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
@@ -263,6 +264,10 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
+
+// Cumulative GPU execution seconds across committed command buffers
+// (MLX_METAL_OP_TRACE>=1 diagnostic).
+std::atomic<double>& gpu_busy_seconds();
 
 bool is_nax_available();
 
