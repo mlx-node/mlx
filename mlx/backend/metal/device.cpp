@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
@@ -33,6 +35,65 @@ namespace mlx::core::metal {
 namespace {
 
 constexpr const char* default_mtllib_path = METAL_PATH;
+
+double command_trace_seconds() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool command_trace_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MLX_METAL_COMMAND_TRACE");
+    return value && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
+struct CommandTraceRecord {
+  uint64_t id;
+  int stream;
+  int dispatches;
+  size_t resources;
+  size_t resource_bytes;
+  size_t size_units;
+  size_t barriers;
+  size_t encoders;
+  size_t waits;
+  size_t signals;
+  double encode_start;
+  double submit;
+  const char* reason;
+};
+
+void write_command_trace(const CommandTraceRecord& record, MTL::CommandBuffer* cb) {
+  // CPU and GPU timestamps are separate domains. The analyzer compares
+  // GPU intervals with one another, never subtracts a CPU timestamp.
+  fprintf(
+      stderr,
+      "[metal-command] {\"id\":%llu,\"stream\":%d,\"reason\":\"%s\","
+      "\"dispatches\":%d,\"resources\":%zu,\"resourceBytes\":%zu,"
+      "\"sizeUnits\":%zu,\"barriers\":%zu,\"encoders\":%zu,"
+      "\"waits\":%zu,\"signals\":%zu,\"encodeStartCpu\":%.9f,"
+      "\"submitCpu\":%.9f,\"gpuStart\":%.9f,\"gpuEnd\":%.9f,"
+      "\"status\":%lu}\n",
+      static_cast<unsigned long long>(record.id),
+      record.stream,
+      record.reason,
+      record.dispatches,
+      record.resources,
+      record.resource_bytes,
+      record.size_units,
+      record.barriers,
+      record.encoders,
+      record.waits,
+      record.signals,
+      record.encode_start,
+      record.submit,
+      cb->GPUStartTime(),
+      cb->GPUEndTime(),
+      static_cast<unsigned long>(cb->status()));
+}
 
 void set_compile_options(
     MTL::CompileOptions* mtl_options,
@@ -308,6 +369,8 @@ CommandEncoder::CommandEncoder(
     int index,
     ResidencySet& residency_set)
     : device_(d) {
+  trace_commands_ = command_trace_enabled();
+  trace_stream_index_ = index;
   auto pool = new_scoped_memory_pool();
   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
   if (!queue_) {
@@ -333,6 +396,9 @@ void CommandEncoder::set_buffer(
     const MTL::Buffer* buf,
     int idx,
     int64_t offset /* = 0 */) {
+  if (trace_commands_) {
+    trace_resource(buf);
+  }
   // Record as both input and output to ensure synchronization between command
   // buffers
   all_inputs_.insert((void*)buf);
@@ -344,6 +410,9 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  if (trace_commands_) {
+    trace_resource(static_cast<const MTL::Buffer*>(a.buffer().ptr()));
+  }
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
@@ -406,6 +475,9 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
 
 void CommandEncoder::maybeInsertBarrier() {
   if (needs_barrier_) {
+    if (trace_commands_) {
+      ++trace_barriers_;
+    }
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
     // Preserve the hash tables' buckets for reuse across barrier epochs.
@@ -436,7 +508,16 @@ void CommandEncoder::dispatch_threads(
 }
 
 void CommandEncoder::barrier() {
+  if (trace_commands_) {
+    ++trace_barriers_;
+  }
   get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
+void CommandEncoder::trace_resource(const MTL::Buffer* buffer) {
+  if (buffer && trace_resources_.insert(buffer).second) {
+    trace_resource_bytes_ += buffer->length();
+  }
 }
 
 void CommandEncoder::end_encoding() {
@@ -531,6 +612,13 @@ bool CommandEncoder::needs_commit() const {
   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 
+const char* CommandEncoder::commit_reason() const {
+  auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
+  const bool ops = buffer_ops_ > max_ops;
+  const bool size = (buffer_sizes_ >> 20) > max_mb;
+  return ops ? (size ? "ops+size" : "ops") : (size ? "size" : "none");
+}
+
 namespace {
 // Mirror of eval.cpp's tracer gate — read the env once.
 int commit_trace_level() {
@@ -547,7 +635,33 @@ std::atomic<double>& gpu_busy_seconds() {
   return s;
 }
 
-void CommandEncoder::commit(std::function<void()> completion) {
+void CommandEncoder::commit(
+    std::function<void()> completion,
+    const char* reason) {
+  std::shared_ptr<CommandTraceRecord> command_trace;
+  if (trace_commands_) {
+    static std::atomic<uint64_t> sequence{0};
+    const CommandTraceRecord record{
+        sequence.fetch_add(1, std::memory_order_relaxed),
+        trace_stream_index_,
+        buffer_ops_,
+        trace_resources_.size(),
+        trace_resource_bytes_,
+        buffer_sizes_,
+        trace_barriers_,
+        trace_encoders_,
+        wait_events_.size(),
+        signal_events_.size(),
+        trace_encode_start_,
+        command_trace_seconds(),
+        reason};
+    command_trace = std::make_shared<CommandTraceRecord>(record);
+    trace_resources_.clear();
+    trace_resource_bytes_ = 0;
+    trace_barriers_ = 0;
+    trace_encoders_ = 0;
+    trace_encode_start_ = 0;
+  }
   // Flush accumulated buffer retention in one completed-handler instead of
   // the per-eval handlers gpu::eval used to attach.
   if (!pending_retained_.empty()) {
@@ -560,6 +674,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
        wait_events = std::move(wait_events_),
        signal_events = std::move(signal_events_),
        trace = commit_trace_level(),
+       command_trace = std::move(command_trace),
        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
         if (trace >= 1 && cbuf->status() == MTL::CommandBufferStatusCompleted) {
           gpu_busy_seconds().fetch_add(
@@ -596,6 +711,11 @@ void CommandEncoder::commit(std::function<void()> completion) {
             event->signal(value);
           }
         }
+        // Notify the scheduler and propagate errors before diagnostic I/O.
+        // Logging still perturbs a traced run; throughput uses tracing off.
+        if (command_trace) {
+          write_command_trace(*command_trace, cbuf);
+        }
       });
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
@@ -607,7 +727,7 @@ void CommandEncoder::synchronize() {
   auto pool = new_scoped_memory_pool();
   auto cbuf = buffer_; // retained
   end_encoding();
-  commit();
+  commit(nullptr, "synchronize");
   cbuf->waitUntilCompleted();
 
   if (error_ && !exiting_) {
@@ -618,6 +738,12 @@ void CommandEncoder::synchronize() {
 
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
   if (!encoder_) {
+    if (trace_commands_) {
+      if (!trace_encode_start_) {
+        trace_encode_start_ = command_trace_seconds();
+      }
+      ++trace_encoders_;
+    }
     encoder_ = NS::RetainPtr(
         buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());

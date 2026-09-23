@@ -836,6 +836,9 @@ METAL_FUNC void tile_matmad_nax(
   constexpr short TNb = transpose_b ? BTile::kTileRows : BTile::kTileCols;
   constexpr short TN = CTile::kTileCols;
   static_assert(TNb == TN, "MXU tile matmul: N dimensions do not match");
+  static_assert(
+      (TN % 2 == 0) || (TN == 1 && TM % 2 == 0),
+      "MXU tile matmul requires paired output fragments along M or N");
 
   constexpr short TKa = transpose_a ? ATile::kTileRows : ATile::kTileCols;
   constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;

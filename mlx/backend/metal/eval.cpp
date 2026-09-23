@@ -92,7 +92,9 @@ void eval(array& arr) {
   if (encoder.needs_commit()) {
     encoder.end_encoding();
     scheduler::notify_new_task(s);
-    encoder.commit([s]() { scheduler::notify_task_completion(s); });
+    encoder.commit(
+        [s]() { scheduler::notify_task_completion(s); },
+        encoder.commit_reason());
     if (op_trace_level() >= 1) {
       fprintf(
           stderr,
@@ -106,9 +108,8 @@ void eval(array& arr) {
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& encoder = metal::get_command_encoder(s);
-  auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  encoder.commit();
+  encoder.commit(nullptr, "finalize");
   if (op_trace_level() >= 1) {
     fprintf(
         stderr,

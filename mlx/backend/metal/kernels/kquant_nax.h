@@ -397,6 +397,12 @@ METAL_FUNC void kquant_qmm_t_nax_tgp_impl(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  static_assert(BM % WM == 0, "BM should be divisible by WM");
+  static_assert(BN % WN == 0, "BN should be divisible by WN");
+  static_assert(
+      (BM / WM) % 16 == 0, "Each SIMDgroup M tile must be divisible by 16");
+  static_assert(
+      (BN / WN) % 16 == 0, "Each SIMDgroup N tile must be divisible by 16");
 
   (void)lid;
 

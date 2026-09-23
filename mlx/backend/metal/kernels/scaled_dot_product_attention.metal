@@ -3,6 +3,7 @@
 // clang-format off
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
+#include "mlx/backend/metal/kernels/sdpa_segmented.h"
 
 using namespace metal;
 
@@ -42,4 +43,18 @@ using namespace metal;
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+instantiate_kernel(
+    "sdpa_vector_segmented_bfloat16_t_256_256",
+    sdpa_vector_segmented,
+    bfloat16_t,
+    256,
+    256)
+instantiate_kernel(
+    "sdpa_vector_segmented_2pass_1_bfloat16_t_256_256",
+    sdpa_vector_segmented_2pass_1,
+    bfloat16_t,
+    256,
+    256)
+
     // clang-format on

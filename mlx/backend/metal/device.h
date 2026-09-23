@@ -103,7 +103,10 @@ class MLX_API CommandEncoder {
   void wait_event(std::shared_ptr<EventImpl> event, uint64_t value);
   void signal_event(std::shared_ptr<EventImpl> event, uint64_t value);
   bool needs_commit() const;
-  void commit(std::function<void()> completion = nullptr);
+  const char* commit_reason() const;
+  void commit(
+      std::function<void()> completion = nullptr,
+      const char* reason = "unspecified");
   void synchronize();
 
   MTL::CommandBuffer* get_command_buffer() const {
@@ -121,6 +124,17 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+
+  // Opt-in diagnostics. These counters do not change command boundaries or
+  // request unsupported per-dispatch GPU timestamp sampling.
+  bool trace_commands_{false};
+  int trace_stream_index_{0};
+  double trace_encode_start_{0};
+  size_t trace_resource_bytes_{0};
+  size_t trace_barriers_{0};
+  size_t trace_encoders_{0};
+  std::unordered_set<const void*> trace_resources_;
+  void trace_resource(const MTL::Buffer* buffer);
 
   // The events hooked to current command buffer.
   std::vector<std::shared_ptr<EventImpl>> wait_events_;

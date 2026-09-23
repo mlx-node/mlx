@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
+#include "mlx/backend/metal/sdpa_vector_plan.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/utils.h"
@@ -14,14 +15,6 @@
 namespace mlx::core::fast {
 
 namespace {
-
-bool d256_full_sdpa_enabled() {
-  // Keep the new, still-experimental D=256 path independently reversible.
-  // The value is intentionally process-cached like MLX_ENABLE_TF32, so A/B
-  // runs must use separate processes.
-  static bool enabled = env::get_var("MLX_ENABLE_D256_FULL_SDPA", 1);
-  return enabled;
-}
 
 void sdpa_full_self_attention_nax(
     const Stream& s,
@@ -519,45 +512,8 @@ void sdpa_vector_2pass(
   int gqa_factor = q.shape(1) / k.shape(1);
   int n_simds = gqa_factor * q.shape(2);
 
-  char devc = d.get_architecture().back();
   int N = k.shape(2);
-  int blocks;
-  if (devc == 's') {
-    blocks = 64;
-    if (N > 1024 && n_simds > 4) {
-      if (N <= 8192) {
-        blocks = 128;
-      } else if (N <= 32768) {
-        blocks = 256;
-      } else if (N <= 65536) {
-        blocks = 512;
-      } else {
-        blocks = 1024;
-      }
-    }
-  } else if (devc == 'd') {
-    blocks = 128;
-    if (n_simds <= 2 && N > 8192) {
-      blocks = 256;
-    } else if (n_simds >= 6) {
-      if (N >= 16384 && N < 65536) {
-        blocks = 512;
-      } else if (N >= 65536) {
-        blocks = 1024;
-      }
-    }
-  } else {
-    if (n_simds >= 4) {
-      blocks = 64;
-    } else {
-      blocks = 32;
-    }
-  }
-  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
-    // The 2-pass reduction consumes the partials in simd-width (32) chunks
-    // and silently drops the tail otherwise, so round up to a multiple of 32.
-    blocks = ((blocks_env + 31) / 32) * 32;
-  }
+  int blocks = sdpa_vector_partition_count(d, N, n_simds);
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
   size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
@@ -670,12 +626,12 @@ void sdpa_vector_2pass(
 } // namespace
 
 bool d256_full_sdpa_available(bool effective_dtype_is_float32) {
-  // All three inputs are process-stable/cached: the rollback flag above,
-  // `is_nax_available()` in the Metal device layer, and `enable_tf32()` in
-  // MLX's environment helpers. Keep this single capability predicate shared
+  // Both inputs are process-stable/cached: `is_nax_available()` in the
+  // Metal device layer and `enable_tf32()` in MLX's environment helpers.
+  // Keep this single capability predicate shared
   // by dispatch and the mlx-sys probe so the Rust planner cannot advertise a
   // fused allocation when C++ will materialize the fallback score tensor.
-  return d256_full_sdpa_enabled() && metal::is_nax_available() &&
+  return metal::is_nax_available() &&
       (env::enable_tf32() || !effective_dtype_is_float32);
 }
 
@@ -865,9 +821,8 @@ void ScaledDotProductAttention::eval_gpu(
     // - The device is large and the sequence length long
     // - The sequence length is even longer and we have gqa
     bool do_causal = do_causal_ && q.shape(2) > 1;
-    char devc = d.get_architecture().back();
-    if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
-        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
+    if (sdpa_vector_uses_two_pass(
+            d, k.shape(2), q.shape(1), k.shape(1))) {
       sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
     } else {
       sdpa_vector(s, d, q, k, v, o, scale_, do_causal, mask, sinks);

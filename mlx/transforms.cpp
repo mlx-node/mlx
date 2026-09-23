@@ -1,5 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -78,6 +81,17 @@ int& detail::InExportTracing::counter() {
 thread_local int detail::RetainGraph::tracing_counter{0};
 
 array eval_impl(std::vector<array> outputs, bool async) {
+  static const bool trace = [] {
+    const char* v = std::getenv("MLX_METAL_COMMAND_TRACE");
+    return v && std::string(v) == "1";
+  }();
+  const auto trace_start = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+  const size_t trace_outputs = outputs.size();
+  size_t trace_primitives = 0;
+  size_t trace_task_waits = 0;
+  size_t trace_memory_waits = 0;
+  double trace_wait_ms = 0;
   std::deque<array> tape;
 
   // Make an effort to choose a good output stream
@@ -228,6 +242,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
   while (!tape.empty()) {
     auto arr = std::move(tape.back());
     tape.pop_back();
+    if (trace) {
+      ++trace_primitives;
+    }
 
     auto stream = arr.primitive().stream();
     open_streams.insert(stream);
@@ -270,6 +287,12 @@ array eval_impl(std::vector<array> outputs, bool async) {
     if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
         (get_active_memory() > get_memory_limit() &&
          scheduler::n_active_tasks() > 0)) {
+      const auto wait_start = trace ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+      if (trace) {
+        trace_task_waits += scheduler::n_active_tasks() > MAX_ACTIVE_TASKS;
+        trace_memory_waits += get_active_memory() > get_memory_limit();
+      }
       // Commit any open streams
       for (auto& s : open_streams) {
         if (s.device == Device::gpu) {
@@ -280,6 +303,11 @@ array eval_impl(std::vector<array> outputs, bool async) {
       while (get_active_memory() > get_memory_limit() &&
              scheduler::n_active_tasks() > 0) {
         scheduler::wait_for_one();
+      }
+      if (trace) {
+        trace_wait_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - wait_start)
+                             .count();
       }
     }
 
@@ -316,6 +344,25 @@ array eval_impl(std::vector<array> outputs, bool async) {
     }
   }
 
+  if (trace) {
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - trace_start)
+            .count();
+    fprintf(
+        stderr,
+        "[mlx-evaluation] {\"stream\":%d,\"async\":%s,\"outputs\":%zu,"
+        "\"primitives\":%zu,\"hostSpanMs\":%.6f,\"backpressureSpanMs\":%.6f,"
+        "\"taskWaitSections\":%zu,\"memoryWaitSections\":%zu}\n",
+        stream.index,
+        async ? "true" : "false",
+        trace_outputs,
+        trace_primitives,
+        elapsed_ms,
+        trace_wait_ms,
+        trace_task_waits,
+        trace_memory_waits);
+  }
   return synchronizer;
 }
 
