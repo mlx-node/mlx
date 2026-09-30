@@ -133,6 +133,17 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 7, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 8, 8)
 
+#define instantiate_quantized_wide_mixed(type, scale_type, group_size, bits, vecs_per_tg)                   \
+  instantiate_kernel(                                                                                     \
+      "affine_qmv_wide_mixed_" #type "_" #scale_type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_8", \
+      affine_qmv_wide_mixed,                                        \
+      type,                                                         \
+      scale_type,                                                   \
+      group_size,                                                   \
+      bits,                                                         \
+      vecs_per_tg,                                                  \
+      8)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)  \
@@ -182,4 +193,13 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+
+// BF16 activations with F32 affine sidecars (GGUF Q8_0 promoted at load).
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 2)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 3)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 4)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 5)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 6)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 7)
+instantiate_quantized_wide_mixed(bfloat16_t, float, 32, 8, 8) // clang-format on

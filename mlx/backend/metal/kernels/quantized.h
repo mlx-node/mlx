@@ -978,11 +978,17 @@ METAL_FUNC void qmv_impl(
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
-template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs_per_tg,
+    int k_lanes,
+    typename S = T>
 METAL_FUNC void qmv_wide_impl(
     const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
+    const device S* scales,
+    const device S* biases,
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
@@ -1009,8 +1015,8 @@ METAL_FUNC void qmv_wide_impl(
   const int in_vec_size_w = in_vec_size * bits / 8; // bytes per weight row
   const int in_vec_size_g = in_vec_size / group_size;
   const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
-  const device T* srow = scales + row * in_vec_size_g;
-  const device T* brow = biases + row * in_vec_size_g;
+  const device S* srow = scales + row * in_vec_size_g;
+  const device S* brow = biases + row * in_vec_size_g;
 
   const device T* xv[vecs_per_tg];
   for (int v = 0; v < vecs_per_tg; v++) {
@@ -1741,6 +1747,41 @@ template <
         tid);
   }
   qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      M,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+// Non-batched qmv_wide with S (float) scales/biases and T activations/output:
+// the same float math as promoting x to S, one rounding to T at the store.
+template <
+    typename T,
+    typename S,
+    int group_size,
+    int bits,
+    int vecs_per_tg,
+    int k_lanes>
+[[kernel]] void affine_qmv_wide_mixed(
+    const device uint32_t* w,
+    const device S* scales,
+    const device S* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes, S>(
       w,
       scales,
       biases,

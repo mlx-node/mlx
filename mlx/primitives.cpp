@@ -3543,16 +3543,20 @@ std::vector<array> QuantizedMatmul::vjp(
   for (auto arg : argnums) {
     // gradient wrt to x
     if (arg == 0) {
-      vjps.push_back(quantized_matmul(
-          cotangents[0],
-          primals[1],
-          primals[2],
-          quant_weight_arrays(mode_) == 2 ? std::optional<array>(primals[3])
-                                          : std::nullopt,
-          !transpose_,
-          group_size_,
-          bits_,
-          quantization_mode_to_string(mode_),
+      // A mixed affine primal (BF16 x, F32 sidecars) keeps x's dtype.
+      vjps.push_back(astype(
+          quantized_matmul(
+              cotangents[0],
+              primals[1],
+              primals[2],
+              quant_weight_arrays(mode_) == 2 ? std::optional<array>(primals[3])
+                                              : std::nullopt,
+              !transpose_,
+              group_size_,
+              bits_,
+              quantization_mode_to_string(mode_),
+              stream()),
+          primals[0].dtype(),
           stream()));
     }
 

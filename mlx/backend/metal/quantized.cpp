@@ -1724,11 +1724,29 @@ void dispatch_qmv(
   qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode, tag);
 }
 
-void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto& s = stream();
-  auto& d = metal::device(s.device);
+namespace {
 
-  out.set_data(allocator::malloc(out.nbytes()));
+int qmv_vector_limit(int K, int N, bool transpose, metal::Device& d) {
+  int vector_limit = transpose ? get_qmv_batch_limit(K, N, d) : 4;
+  if (const char* e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
+    int v = std::atoi(e);
+    if (v > 0) {
+      vector_limit = v;
+    }
+  }
+  return vector_limit;
+}
+
+// `out` must already hold its buffer. x, scales and biases share one dtype.
+void quantized_matmul_same_dtype(
+    const std::vector<array>& inputs,
+    array& out,
+    int group_size_,
+    int bits_,
+    QuantizationMode mode_,
+    bool transpose_,
+    const Stream& s) {
+  auto& d = metal::device(s.device);
 
   // Make sure the last two dims of x and w, s, b are contiguous. This should
   // be relaxed for x.
@@ -1746,13 +1764,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
-  int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
-  if (const char* e = std::getenv("MLX_QMM_SPLITK_MIN_M")) {
-    int v = std::atoi(e);
-    if (v > 0) {
-      vector_limit = v;
-    }
-  }
+  int vector_limit = qmv_vector_limit(K, N, transpose_, d);
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {
@@ -1810,6 +1822,114 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   qvm_split_k(
       x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
   return;
+}
+
+// BF16 x with F32 affine scales/biases (never built by quantized_matmul, which
+// promotes x). Where the promoted graph would run F32 qmv_wide, one kernel
+// computes the same float math and rounds to BF16 once. Every other shape runs
+// the promoted graph itself: cast x, the F32 kernels, cast the result.
+void quantized_matmul_affine_mixed(
+    const std::vector<array>& inputs,
+    array& out,
+    int group_size,
+    int bits,
+    bool transpose,
+    const Stream& s) {
+  auto& d = metal::device(s.device);
+  const array& x = inputs[0];
+  const array& w = inputs[1];
+  const array& scales = inputs[2];
+  const array& biases = inputs[3];
+  const Dtype sidecar = scales.dtype();
+  int K = x.shape(-1);
+  int N = out.shape(-1);
+  int M = x.size() / K;
+  bool wide = x.dtype() == bfloat16 && out.dtype() == bfloat16 &&
+      sidecar == float32 && biases.dtype() == float32 && group_size == 32 &&
+      bits == 8 && transpose && w.ndim() == 2 && x.flags().row_contiguous &&
+      scales.flags().row_contiguous && biases.flags().row_contiguous &&
+      w.flags().row_contiguous && M >= 2 &&
+      M < qmv_vector_limit(K, N, transpose, d) && K != 64 && K != 128 &&
+      use_qmv_wide("affine", d);
+  if (wide) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    // Same tile choice as qmv_wide() for an affine N x K projection.
+    const int tile_cap = N >= 2048 ? 8 : 5;
+    int n_tiles = (M + tile_cap - 1) / tile_cap;
+    int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+    constexpr int k_lanes = 8;
+    constexpr int num_simdgroups = 2;
+    int rows_per_tg = (32 / k_lanes) * num_simdgroups;
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_qmv_wide_mixed_bfloat16_t_float_gs_32_b_8_nv_",
+        vecs_per_tg,
+        "_kl_8");
+    auto template_def = get_template_definition(
+        kname,
+        "affine_qmv_wide_mixed",
+        "bfloat16_t",
+        "float",
+        32,
+        8,
+        vecs_per_tg,
+        k_lanes);
+    auto kernel = get_quantized_kernel(d, kname, template_def, "affine");
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_input_array(biases, 2);
+    compute_encoder.set_input_array(x, 3);
+    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_bytes(K, 5);
+    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(M, 7);
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size(
+            (M + vecs_per_tg - 1) / vecs_per_tg,
+            (N + rows_per_tg - 1) / rows_per_tg,
+            1),
+        MTL::Size(32, num_simdgroups, 1));
+    return;
+  }
+
+  array x_promoted(x.shape(), sidecar, nullptr, {});
+  copy_gpu(
+      x,
+      x_promoted,
+      x.flags().contiguous ? CopyType::Vector : CopyType::General,
+      s);
+  array out_promoted(out.shape(), sidecar, nullptr, {});
+  out_promoted.set_data(allocator::malloc(out_promoted.nbytes()));
+  quantized_matmul_same_dtype(
+      {x_promoted, w, scales, biases},
+      out_promoted,
+      group_size,
+      bits,
+      QuantizationMode::Affine,
+      transpose,
+      s);
+  copy_gpu(out_promoted, out, CopyType::Vector, s);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(x_promoted);
+  compute_encoder.add_temporary(out_promoted);
+}
+
+} // namespace
+
+void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto& s = stream();
+  if (mode_ == QuantizationMode::Affine &&
+      inputs[2].dtype() != inputs[0].dtype()) {
+    quantized_matmul_affine_mixed(
+        inputs, out, group_size_, bits_, transpose_, s);
+    return;
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  quantized_matmul_same_dtype(
+      inputs, out, group_size_, bits_, mode_, transpose_, s);
 }
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
