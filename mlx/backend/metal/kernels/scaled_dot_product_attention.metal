@@ -56,5 +56,11 @@ instantiate_kernel(
     bfloat16_t,
     256,
     256)
+instantiate_kernel(
+    "sdpa_vector_segmented_verify_2pass_1_bfloat16_t_256_256",
+    sdpa_vector_segmented_verify_2pass_1,
+    bfloat16_t,
+    256,
+    256)
 
     // clang-format on

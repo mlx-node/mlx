@@ -76,14 +76,17 @@ template <typename T, int D, int V = D>
   // Every prefix row precedes every query. Traverse that segment without
   // a per-row segment selection or causal branch, then continue the same
   // strided score sequence through the visible new rows.
-  const device T* pk = prefix_keys + batch_idx * pk_batch_stride +
-      kv_head_idx * pk_head_stride + simd_lid * qk_per_thread;
-  const device T* pv = prefix_values + batch_idx * pv_batch_stride +
-      kv_head_idx * pv_head_stride + simd_lid * v_per_thread;
   int i = simd_gid;
+  const device T* key = prefix_keys + batch_idx * pk_batch_stride +
+      kv_head_idx * pk_head_stride + i * pk_seq_stride +
+      simd_lid * qk_per_thread;
+  const device T* value = prefix_values + batch_idx * pv_batch_stride +
+      kv_head_idx * pv_head_stride + i * pv_seq_stride +
+      simd_lid * v_per_thread;
+  // The host guarantees the row steps fit in 32 bits (faster than 64-bit).
+  const int key_step = BN * int(pk_seq_stride);
+  const int value_step = BN * int(pv_seq_stride);
   for (; i < prefix_n; i += BN) {
-    const device T* key = pk + i * pk_seq_stride;
-    const device T* value = pv + i * pv_seq_stride;
     for (int j = 0; j < qk_per_thread; ++j) {
       k[j] = key[j];
     }
@@ -100,6 +103,8 @@ template <typename T, int D, int V = D>
     for (int j = 0; j < v_per_thread; ++j) {
       o[j] = o[j] * factor + exp_score * value[j];
     }
+    key += key_step;
+    value += value_step;
   }
   const device T* nk = new_keys + batch_idx * nk_batch_stride +
       kv_head_idx * nk_head_stride + simd_lid * qk_per_thread;
@@ -199,14 +204,14 @@ template <typename T, int D, int V = D>
   }
   U max_score = Limits<U>::finite_min;
   U sum_exp_score = 0;
-  const device T* pk = prefix_keys + batch_idx * strides[3] +
-      kv_head_idx * strides[4] + simd_lid * qk_per_thread;
-  const device T* pv = prefix_values + batch_idx * strides[6] +
-      kv_head_idx * strides[7] + simd_lid * v_per_thread;
   int i = block_idx;
+  const device T* key = prefix_keys + batch_idx * strides[3] +
+      kv_head_idx * strides[4] + i * strides[5] + simd_lid * qk_per_thread;
+  const device T* value = prefix_values + batch_idx * strides[6] +
+      kv_head_idx * strides[7] + i * strides[8] + simd_lid * v_per_thread;
+  const int key_step = blocks * int(strides[5]);
+  const int value_step = blocks * int(strides[8]);
   for (; i < prefix_n; i += blocks) {
-    const device T* key = pk + i * strides[5];
-    const device T* value = pv + i * strides[8];
     U score = 0;
     for (int j = 0; j < qk_per_thread; ++j) {
       score += q[j] * key[j];
@@ -220,6 +225,8 @@ template <typename T, int D, int V = D>
     for (int j = 0; j < v_per_thread; ++j) {
       o[j] = o[j] * factor + exp_score * value[j];
     }
+    key += key_step;
+    value += value_step;
   }
   const device T* nk = new_keys + batch_idx * strides[9] +
       kv_head_idx * strides[10] + simd_lid * qk_per_thread;
@@ -250,5 +257,154 @@ template <typename T, int D, int V = D>
   }
   for (int j = 0; j < v_per_thread; ++j) {
     out[j] = static_cast<T>(o[j]);
+  }
+}
+
+constant int verify_gqa [[function_constant(27)]];
+constant int verify_rows [[function_constant(28)]];
+
+template <typename U, typename T, int QK, int VP>
+METAL_FUNC void sdpa_segmented_verify_update(
+    thread const U* q,
+    thread U* o,
+    thread U& max_score,
+    thread U& sum_exp_score,
+    thread const T* key,
+    thread const T* value) {
+  U score = 0;
+  for (int j = 0; j < QK; ++j) {
+    score += q[j] * key[j];
+  }
+  score = simd_sum(score);
+  U new_max = max(max_score, score);
+  U factor = fast::exp(max_score - new_max);
+  U exp_score = fast::exp(score - new_max);
+  max_score = new_max;
+  sum_exp_score = sum_exp_score * factor + exp_score;
+  for (int j = 0; j < VP; ++j) {
+    o[j] = o[j] * factor + exp_score * value[j];
+  }
+}
+
+// Causal first pass for a whole verify block: one threadgroup serves every
+// (query head, row) pair of one KV head, and each simdgroup applies each K/V
+// row it loads to two pairs. Per pair the key order, statements and causal
+// limit equal sdpa_vector_segmented_2pass_1 with q_seq_len = verify_rows, so
+// the partials are bit-identical to that kernel at the same `blocks`.
+template <typename T, int D, int V = D>
+[[kernel]] void sdpa_vector_segmented_verify_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* prefix_keys [[buffer(1)]],
+    const device T* prefix_values [[buffer(2)]],
+    const device T* new_keys [[buffer(3)]],
+    const device T* new_values [[buffer(4)]],
+    device T* out [[buffer(5)]],
+    device float* sums [[buffer(6)]],
+    device float* maxs [[buffer(7)]],
+    const constant int& prefix_n [[buffer(8)]],
+    const constant int& new_n [[buffer(9)]],
+    const constant long* strides [[buffer(10)]],
+    const constant float& scale [[buffer(11)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Four pairs per simdgroup spill registers.
+  constexpr int PAIRS = 2;
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  typedef float U;
+
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int block_idx = tid.z;
+  const int num_q_heads = tpg.x * verify_gqa;
+  const int simdgroups = verify_gqa * verify_rows / PAIRS;
+  const int n = prefix_n + new_n;
+
+  thread U q[PAIRS][qk_per_thread];
+  thread U o[PAIRS][v_per_thread];
+  thread U max_score[PAIRS];
+  thread U sum_exp_score[PAIRS];
+  thread int visible_n[PAIRS];
+  thread int o_offset[PAIRS];
+  for (int k = 0; k < PAIRS; ++k) {
+    const int pair = int(simd_gid) + k * simdgroups;
+    const int q_seq_idx = pair / verify_gqa;
+    const int q_head_idx =
+        verify_gqa * kv_head_idx + (pair - q_seq_idx * verify_gqa);
+    o_offset[k] =
+        (batch_idx * num_q_heads + q_head_idx) * verify_rows + q_seq_idx;
+    const device T* query = queries + batch_idx * strides[0] +
+        q_head_idx * strides[1] + q_seq_idx * strides[2] +
+        simd_lid * qk_per_thread;
+    for (int j = 0; j < qk_per_thread; ++j) {
+      q[k][j] = static_cast<U>(scale) * query[j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      o[k][j] = 0;
+    }
+    max_score[k] = Limits<U>::finite_min;
+    sum_exp_score[k] = 0;
+    visible_n[k] = n - verify_rows + q_seq_idx + 1;
+  }
+
+  int i = block_idx;
+  const device T* key = prefix_keys + batch_idx * strides[3] +
+      kv_head_idx * strides[4] + i * strides[5] + simd_lid * qk_per_thread;
+  const device T* value = prefix_values + batch_idx * strides[6] +
+      kv_head_idx * strides[7] + i * strides[8] + simd_lid * v_per_thread;
+  const int key_step = blocks * int(strides[5]);
+  const int value_step = blocks * int(strides[8]);
+  for (; i < prefix_n; i += blocks) {
+    thread T k_row[qk_per_thread];
+    thread T v_row[v_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) {
+      k_row[j] = key[j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      v_row[j] = value[j];
+    }
+    for (int k = 0; k < PAIRS; ++k) {
+      sdpa_segmented_verify_update<U, T, qk_per_thread, v_per_thread>(
+          q[k], o[k], max_score[k], sum_exp_score[k], k_row, v_row);
+    }
+    key += key_step;
+    value += value_step;
+  }
+  const device T* nk = new_keys + batch_idx * strides[9] +
+      kv_head_idx * strides[10] + simd_lid * qk_per_thread;
+  const device T* nv = new_values + batch_idx * strides[12] +
+      kv_head_idx * strides[13] + simd_lid * v_per_thread;
+  for (; i < n; i += blocks) {
+    const device T* new_key = nk + (i - prefix_n) * strides[11];
+    const device T* new_value = nv + (i - prefix_n) * strides[14];
+    thread T k_row[qk_per_thread];
+    thread T v_row[v_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) {
+      k_row[j] = new_key[j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      v_row[j] = new_value[j];
+    }
+    for (int k = 0; k < PAIRS; ++k) {
+      if (i < visible_n[k]) {
+        sdpa_segmented_verify_update<U, T, qk_per_thread, v_per_thread>(
+            q[k], o[k], max_score[k], sum_exp_score[k], k_row, v_row);
+      }
+    }
+  }
+
+  for (int k = 0; k < PAIRS; ++k) {
+    device T* partial = out + o_offset[k] * blocks * V + block_idx * V +
+        simd_lid * v_per_thread;
+    if (simd_lid == 0) {
+      sums[o_offset[k] * blocks + block_idx] = sum_exp_score[k];
+      maxs[o_offset[k] * blocks + block_idx] = max_score[k];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      partial[j] = static_cast<T>(o[k][j]);
+    }
   }
 }
