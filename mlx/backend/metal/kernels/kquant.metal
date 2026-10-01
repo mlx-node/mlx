@@ -168,4 +168,13 @@
 instantiate_kquant_types(float)
 instantiate_kquant_types(float16_t)
 instantiate_kquant_types(bfloat16_t)
+
+// M = 8 simdgroup-matrix qmv: bfloat16 only, and only the modes kq_sg8::format
+// decodes (q3k, iq4nl and iq3s stay on qmv_wide).
+instantiate_kquant(q6k, qmv_sg8, bfloat16_t, 16, 6, 16, false)
+instantiate_kquant(q4k, qmv_sg8, bfloat16_t, 32, 4, 8, true)
+instantiate_kquant(q5k, qmv_sg8, bfloat16_t, 32, 5, 8, true)
+instantiate_kquant(iq4xs, qmv_sg8, bfloat16_t, 32, 4, 8, false)
+instantiate_kernel("kquant_qmv_sg8_prep_bfloat16_t_gs_16", kquant_qmv_sg8_prep, bfloat16_t, 16)
+instantiate_kernel("kquant_qmv_sg8_prep_bfloat16_t_gs_32", kquant_qmv_sg8_prep, bfloat16_t, 32)
     // clang-format on

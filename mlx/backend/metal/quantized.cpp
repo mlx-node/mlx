@@ -526,6 +526,90 @@ void qmv_wide(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Every 8-row bfloat16 matvec of the modes kquant_qmv_sg8 decodes, on gen-17+
+// (measured faster than qmv_wide there; older GPUs keep qmv_wide). The kernel
+// has no batch strides, no column tail and only aligned vector loads (x:
+// uint2, scales: uint4, biases: half2), so any other case stays on qmv_wide.
+bool use_qmv_sg8(
+    const array& x,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& out,
+    int M,
+    int N,
+    const std::string& mode,
+    metal::Device& d) {
+  if (M != 8 || d.get_architecture_gen() < 17) {
+    return false;
+  }
+  if (mode != "q4k" && mode != "q5k" && mode != "q6k" && mode != "iq4xs") {
+    return false;
+  }
+  return x.dtype() == bfloat16 && biases.has_value() &&
+      out.size() == size_t(8) * N && N % 32 == 0 && x.offset() % 8 == 0 &&
+      scales.offset() % 16 == 0 && biases->offset() % 4 == 0;
+}
+
+// Two dispatches: kquant_qmv_sg8_prep packs x into MMA operand order (bt) with
+// fp32 per-group row sums, then kquant_qmv_sg8 runs over N / 32 threadgroups.
+void qmv_sg8(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode,
+    std::string_view tag) {
+  array bt({K * 4}, uint32, nullptr, {});
+  array sums({(K / group_size) * 8}, float32, nullptr, {});
+  bt.set_data(allocator::malloc(bt.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(bt);
+  compute_encoder.add_temporary(sums);
+
+  std::string type_string = get_type_string(x.dtype());
+  std::string prep_name;
+  concatenate(
+      prep_name, "kquant_qmv_sg8_prep_", type_string, "_gs_", group_size);
+  auto prep = get_quantized_kernel(
+      d,
+      prep_name,
+      get_template_definition(
+          prep_name, "kquant_qmv_sg8_prep", type_string, group_size),
+      mode);
+  compute_encoder.set_compute_pipeline_state(prep);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_output_array(bt, 1);
+  compute_encoder.set_output_array(sums, 2);
+  compute_encoder.set_bytes(K, 3);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size((K / 32 + 3) / 4, 1, 1), MTL::Size(128, 1, 1));
+
+  std::string kname;
+  concatenate(
+      kname, mode, "_qmv_sg8_", type_string, "_gs_", group_size, "_b_", bits);
+  auto kernel = get_quantized_kernel_wrapped(
+      tag, d, kname, "qmv_sg8", mode, type_string, group_size, bits);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(w, 0);
+  compute_encoder.set_input_array(scales, 1);
+  compute_encoder.set_input_array(biases, 2);
+  compute_encoder.set_input_array(bt, 3);
+  compute_encoder.set_input_array(sums, 4);
+  compute_encoder.set_output_array(out, 5);
+  compute_encoder.set_bytes(K, 6);
+  compute_encoder.set_bytes(N, 7);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / 32, 1, 1), MTL::Size(128, 1, 1));
+}
+
 // Output columns one qvm threadgroup owns. The affine and K-quant qvm kernels
 // tile `32 / pack_factor` packs per thread, so a simdgroup always covers 32
 // columns whatever the group size (quantized.h:1093, kquant.h:1126); the fp
@@ -1711,6 +1795,12 @@ void dispatch_qmv(
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
     qmv_quad(
         x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode, tag);
+    return;
+  }
+
+  if (use_qmv_sg8(x, scales, biases, out, M, N, mode, d)) {
+    qmv_sg8(
+        x, w, scales, *biases, out, group_size, bits, N, K, d, s, mode, tag);
     return;
   }
 
