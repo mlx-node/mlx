@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdio>
 #include <memory>
+#include <sstream>
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
@@ -31,6 +33,26 @@ void eval(array& arr) {
   auto s = arr.primitive().stream();
   auto& encoder = metal::get_command_encoder(s);
   auto* command_buffer = encoder.get_command_buffer();
+  if (const int trace = encoder.trace_level()) {
+    encoder.trace_primitive();
+    if (trace >= 2) {
+      if (trace >= 3) {
+        std::ostringstream os;
+        os << "n" << arr.inputs().size() << ":";
+        for (auto& in : arr.inputs()) {
+          os << in.dtype() << ",";
+        }
+        os << ">" << arr.dtype();
+        fprintf(
+            stderr,
+            "[metal-op] %s %s\n",
+            arr.primitive().name(),
+            os.str().c_str());
+      } else {
+        fprintf(stderr, "[metal-op] %s\n", arr.primitive().name());
+      }
+    }
+  }
 
   auto outputs = arr.outputs();
   {
@@ -52,16 +74,17 @@ void eval(array& arr) {
   if (encoder.needs_commit()) {
     encoder.end_encoding();
     scheduler::notify_new_task(s);
-    encoder.commit([s]() { scheduler::notify_task_completion(s); });
+    encoder.commit(
+        [s]() { scheduler::notify_task_completion(s); },
+        encoder.commit_reason());
   }
 }
 
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& encoder = metal::get_command_encoder(s);
-  auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  encoder.commit();
+  encoder.commit(nullptr, "finalize");
 }
 
 void synchronize(Stream s) {
