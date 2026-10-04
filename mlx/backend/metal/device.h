@@ -105,8 +105,19 @@ class MLX_API CommandEncoder {
   void wait_event(Event event, uint64_t value);
   void signal_event(Event event, uint64_t value);
   bool needs_commit() const;
-  void commit(std::function<void()> completion = nullptr);
+  const char* commit_reason() const;
+  void commit(
+      std::function<void()> completion = nullptr,
+      const char* reason = "unspecified");
   void synchronize();
+
+  // MLX_METAL_COMMAND_TRACE level (0 = off); see device.cpp.
+  int trace_level() const {
+    return trace_level_;
+  }
+  void trace_primitive() {
+    ++trace_primitives_;
+  }
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
@@ -127,6 +138,17 @@ class MLX_API CommandEncoder {
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
   uint64_t sets_attached_{0};
+  // Opt-in diagnostics. These counters do not change command boundaries or
+  // request unsupported per-dispatch GPU timestamp sampling.
+  int trace_level_{0};
+  int trace_stream_index_{0};
+  size_t trace_primitives_{0};
+  double trace_encode_start_{0};
+  size_t trace_resource_bytes_{0};
+  size_t trace_barriers_{0};
+  size_t trace_encoders_{0};
+  std::unordered_set<const void*> trace_resources_;
+  void trace_resource(const MTL::Buffer* buffer);
 
   // The events hooked to current command buffer.
   std::vector<Event> wait_events_;
