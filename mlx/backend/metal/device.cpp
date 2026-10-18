@@ -388,6 +388,24 @@ MTL::Library* load_library(
   throw std::runtime_error(msg.str());
 }
 
+bool in_epoch(
+    const std::unordered_map<MTL::Resource*, uint64_t>& stamped,
+    MTL::Resource* resource,
+    uint64_t epoch) {
+  auto it = stamped.find(resource);
+  return it != stamped.end() && it->second == epoch;
+}
+
+// Stamps are never erased on the dispatch path. Once per command buffer an
+// outgrown map is dropped so an encoder does not keep every buffer it saw.
+constexpr size_t max_stamped_resources = 8192;
+
+void forget_stale(std::unordered_map<MTL::Resource*, uint64_t>& stamped) {
+  if (stamped.size() > max_stamped_resources) {
+    stamped = {};
+  }
+}
+
 } // namespace
 
 CommandEncoder::CommandEncoder(
@@ -442,9 +460,9 @@ void CommandEncoder::set_input_array(
     buffer_sizes_ += a.data_size();
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
-  next_inputs_.insert(r_buf);
+  next_inputs_.push_back(r_buf);
   needs_barrier_ =
-      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
+      needs_barrier_ | in_epoch(prev_outputs_, r_buf, barrier_epoch_);
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -465,9 +483,9 @@ void CommandEncoder::register_output_array(const array& a) {
   if (concurrent_) {
     concurrent_outputs_.insert(buf);
   } else {
-    next_outputs_.insert(buf);
+    next_outputs_.push_back(buf);
     needs_barrier_ =
-        needs_barrier_ | (prev_inputs_.find(buf) != prev_inputs_.end());
+        needs_barrier_ | in_epoch(prev_inputs_, buf, barrier_epoch_);
   }
 }
 
@@ -505,12 +523,13 @@ void CommandEncoder::maybeInsertBarrier() {
     }
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
-    // Preserve the hash tables' buckets for reuse across barrier epochs.
-    prev_inputs_.swap(next_inputs_);
-    prev_outputs_.swap(next_outputs_);
-  } else {
-    prev_inputs_.insert(next_inputs_.begin(), next_inputs_.end());
-    prev_outputs_.insert(next_outputs_.begin(), next_outputs_.end());
+    ++barrier_epoch_;
+  }
+  for (auto r : next_inputs_) {
+    prev_inputs_[r] = barrier_epoch_;
+  }
+  for (auto r : next_outputs_) {
+    prev_outputs_[r] = barrier_epoch_;
   }
   next_inputs_.clear();
   next_outputs_.clear();
@@ -608,9 +627,10 @@ void CommandEncoder::end_encoding() {
   encoder_.reset();
   needs_barrier_ = false;
   concurrent_ = false;
-  prev_inputs_.clear();
+  ++barrier_epoch_;
+  forget_stale(prev_inputs_);
+  forget_stale(prev_outputs_);
   next_inputs_.clear();
-  prev_outputs_.clear();
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();

@@ -35,8 +35,9 @@ class MLX_API CommandEncoder {
     }
     ~ConcurrentContext() {
       enc.concurrent_ = false;
-      enc.prev_outputs_.insert(
-          enc.concurrent_outputs_.begin(), enc.concurrent_outputs_.end());
+      for (auto r : enc.concurrent_outputs_) {
+        enc.prev_outputs_[r] = enc.barrier_epoch_;
+      }
       enc.concurrent_outputs_.clear();
     }
 
@@ -165,10 +166,16 @@ class MLX_API CommandEncoder {
   bool needs_barrier_{false};
   bool concurrent_{false};
   std::vector<array> temporaries_;
-  std::unordered_set<MTL::Resource*> prev_inputs_;
-  std::unordered_set<MTL::Resource*> prev_outputs_;
-  std::unordered_set<MTL::Resource*> next_inputs_;
-  std::unordered_set<MTL::Resource*> next_outputs_;
+  // Resources read/written since the last barrier, stamped with the epoch
+  // that recorded them: a resource counts iff its stamp equals
+  // barrier_epoch_. A barrier only bumps the epoch; clearing a set per
+  // dispatch zeroed its bucket array every time (7% of a MoE decode thread).
+  std::unordered_map<MTL::Resource*, uint64_t> prev_inputs_;
+  std::unordered_map<MTL::Resource*, uint64_t> prev_outputs_;
+  uint64_t barrier_epoch_{1};
+  // Resources of the kernel being encoded; maybeInsertBarrier() stamps them.
+  std::vector<MTL::Resource*> next_inputs_;
+  std::vector<MTL::Resource*> next_outputs_;
   std::unordered_set<MTL::Resource*> concurrent_outputs_;
   std::unordered_set<const void*> all_inputs_;
   std::unordered_set<const void*> all_outputs_;
