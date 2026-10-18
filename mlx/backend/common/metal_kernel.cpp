@@ -3,6 +3,8 @@
 #include <iostream>
 #include <sstream>
 
+#include <fmt/format.h>
+
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
@@ -51,8 +53,6 @@ Stream resolve_metal_kernel_stream(StreamOrDevice s) {
 
 std::string write_signature(
     std::string func_name,
-    const std::string& header,
-    const std::string& source,
     const std::vector<std::string>& input_names,
     const std::vector<array>& inputs,
     const std::vector<std::string>& output_names,
@@ -62,8 +62,7 @@ std::string write_signature(
     const std::vector<std::tuple<bool, bool, bool>>& shape_infos,
     bool atomic_outputs) {
   std::string kernel_source;
-  kernel_source.reserve(header.size() + source.size() + 16384);
-  kernel_source += header;
+  kernel_source.reserve(16384);
   // Auto-generate a function signature based on `template_args`
   // and the dtype/shape of the arrays passed as `inputs`.
   if (!template_args.empty()) {
@@ -171,8 +170,6 @@ std::string write_signature(
     }
     index++;
   }
-  kernel_source += source;
-  kernel_source += "\n}\n";
   return kernel_source;
 }
 
@@ -218,6 +215,19 @@ std::string make_template_hash(const std::string& template_def) {
 }
 
 } // namespace
+
+const std::string& CustomKernel::library_name() {
+  std::call_once(lib_name_once_, [this] {
+    if (lib_name_.empty()) {
+      lib_name_ = fmt::format(
+          "{}_{:x}_{}",
+          name_,
+          std::hash<std::string>{}(source_),
+          compile_options_);
+    }
+  });
+  return lib_name_;
+}
 
 CustomKernelFunction metal_kernel(
     const std::string& name,
@@ -269,6 +279,11 @@ CustomKernelFunction metal_kernel(
       attributes.push_back("  " + dtype + " " + attr + " [[" + attr + "]]");
     }
   }
+
+  // Hashed once per kernel function; the per-call library key below only
+  // hashes the generated signature.
+  auto header_hash = std::hash<std::string>{}(header);
+  auto source_hash = std::hash<std::string>{}(source);
 
   return [=,
           shape_infos = std::move(shape_infos),
@@ -324,10 +339,8 @@ CustomKernelFunction metal_kernel(
       kernel_name += get_type_string(dtype);
     }
 
-    std::string kernel_source = write_signature(
+    std::string signature = write_signature(
         kernel_name,
-        header,
-        source,
         input_names,
         inputs,
         output_names,
@@ -337,16 +350,36 @@ CustomKernelFunction metal_kernel(
         shape_infos,
         atomic_outputs);
 
+    std::string instantiation;
     if (!template_args.empty()) {
       template_def = kernel_name + template_def;
-      kernel_source += "\ntemplate [[host_name(\"";
-      kernel_source += kernel_name;
-      kernel_source += "\")]] [[kernel]] decltype(";
-      kernel_source += template_def;
-      kernel_source += ") ";
-      kernel_source += template_def;
-      kernel_source += ";\n";
+      instantiation += "\ntemplate [[host_name(\"";
+      instantiation += kernel_name;
+      instantiation += "\")]] [[kernel]] decltype(";
+      instantiation += template_def;
+      instantiation += ") ";
+      instantiation += template_def;
+      instantiation += ";\n";
     }
+
+    std::string lib_name = fmt::format(
+        "{}_{:x}_{:x}_{:x}_{:x}_{}",
+        kernel_name,
+        header_hash,
+        std::hash<std::string>{}(signature),
+        source_hash,
+        std::hash<std::string>{}(instantiation),
+        compile_options.serialize());
+
+    std::string kernel_source;
+    kernel_source.reserve(
+        header.size() + signature.size() + source.size() +
+        instantiation.size() + 4);
+    kernel_source += header;
+    kernel_source += signature;
+    kernel_source += source;
+    kernel_source += "\n}\n";
+    kernel_source += instantiation;
 
     if (verbose) {
       std::cout << "Generated source code for `" << name << "`:" << std::endl
@@ -374,7 +407,8 @@ CustomKernelFunction metal_kernel(
             false,
             0,
             compile_options.serialize(),
-            std::move(declared_output_shapes)),
+            std::move(declared_output_shapes),
+            std::move(lib_name)),
         std::move(inputs));
   };
 }

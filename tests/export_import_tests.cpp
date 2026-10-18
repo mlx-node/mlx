@@ -1,12 +1,15 @@
 // Copyright © 2024 Apple Inc.
 
+#include <atomic>
 #include <filesystem>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "doctest/doctest.h"
 
 #include "mlx/export.h"
+#include "mlx/fast_primitives.h"
 #include "mlx/mlx.h"
 
 using namespace mlx::core;
@@ -188,4 +191,79 @@ TEST_CASE("test export import with metadata") {
     fn_exporter({array({0, 1, 2})});
   }
   CHECK(import_function(file_path).metadata() == metadata);
+}
+
+TEST_CASE("test export import custom kernel shared across threads") {
+  if (!metal::is_available()) {
+    return;
+  }
+  std::string file_path = get_temp_file("custom_kernel.mlxfn");
+
+  // The padding keeps every thread inside the key computation at once;
+  // without it the concurrent first calls below rarely overlap.
+  std::string source =
+      "uint elem = thread_position_in_grid.x;\n"
+      "out[elem] = a[elem] + 1;\n"
+      "// " +
+      std::string(1 << 18, 'x') + "\n";
+  auto kernel = fast::metal_kernel("shared_import", {"a"}, {"out"}, source);
+  auto fun = [&kernel](const std::vector<array>& args) -> std::vector<array> {
+    auto& a = args[0];
+    int n = static_cast<int>(a.size());
+    return kernel(
+        {a},
+        {a.shape()},
+        {a.dtype()},
+        {n, 1, 1},
+        {n, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        Device::gpu);
+  };
+  auto a = arange(8);
+  export_function(file_path, fun, {a});
+
+  // One deserialized primitive serves every call of the imported function
+  auto imported = import_function(file_path);
+  auto out = imported({a});
+  auto* custom = dynamic_cast<fast::CustomKernel*>(&out[0].primitive());
+  REQUIRE(custom != nullptr);
+
+  constexpr int num_threads = 16;
+  constexpr int calls_per_thread = 64;
+  std::atomic<bool> start{false};
+  std::atomic<int> moved{0};
+  std::vector<const char*> first_data(num_threads, nullptr);
+  std::vector<std::string> values(num_threads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t]() {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      const std::string& key = custom->library_name();
+      first_data[t] = key.data();
+      values[t] = key;
+      for (int i = 1; i < calls_per_thread; ++i) {
+        if (custom->library_name().data() != first_data[t]) {
+          moved++;
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  CHECK_EQ(moved.load(), 0);
+  CHECK_FALSE(values[0].empty());
+  for (int t = 1; t < num_threads; ++t) {
+    CHECK_EQ(first_data[t], first_data[0]);
+    CHECK_EQ(values[t], values[0]);
+  }
+  CHECK_EQ(custom->library_name().data(), first_data[0]);
+
+  // The fallback key names a library that runs
+  CHECK(array_equal(out[0], fun({a})[0]).item<bool>());
 }

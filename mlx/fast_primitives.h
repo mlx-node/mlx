@@ -1,5 +1,6 @@
 // Copyright © 2024-2026 Apple Inc.
 
+#include <mutex>
 #include <optional>
 #include <variant>
 
@@ -520,10 +521,12 @@ class CustomKernel : public Primitive {
       bool is_precompiled,
       int shared_memory,
       CompileOptions::Data compile_options = {},
-      std::vector<Shape> declared_output_shapes = {})
+      std::vector<Shape> declared_output_shapes = {},
+      std::string lib_name = {})
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
+        lib_name_(std::move(lib_name)),
         grid_(grid),
         threadgroup_(threadgroup),
         shape_infos_(std::move(shape_infos)),
@@ -542,6 +545,10 @@ class CustomKernel : public Primitive {
 
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
+
+  // Key of the Metal library this kernel evaluates with. Lookups through
+  // `metal::Device::get_library` under any other key compile the source again.
+  const std::string& library_name();
 
   DEFINE_NAME(CustomKernel);
   // The output shapes declared at kernel construction. Under shapeless
@@ -570,6 +577,12 @@ class CustomKernel : public Primitive {
  private:
   std::string name_;
   std::string source_;
+  // Metal library key precomputed by `metal_kernel()`. A deserialized kernel
+  // (`state()` omits it) keys on `source_`: `library_name()` fills that in
+  // under `lib_name_once_`, because one imported primitive is shared by every
+  // call of the imported function, from any thread.
+  std::string lib_name_;
+  std::once_flag lib_name_once_;
   std::tuple<int, int, int> grid_;
   std::tuple<int, int, int> threadgroup_;
   std::vector<std::tuple<bool, bool, bool>> shape_infos_;
