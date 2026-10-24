@@ -77,13 +77,14 @@ void write_command_trace(
   // GPU intervals with one another, never subtracts a CPU timestamp.
   fprintf(
       stderr,
-      "[metal-command] {\"id\":%llu,\"stream\":%d,\"reason\":\"%s\","
+      "[metal-command] {\"id\":%llu,\"commandBuffer\":\"%p\",\"stream\":%d,\"reason\":\"%s\","
       "\"dispatches\":%d,\"primitives\":%zu,\"resources\":%zu,"
       "\"resourceBytes\":%zu,\"sizeUnits\":%zu,\"barriers\":%zu,"
       "\"encoders\":%zu,\"waits\":%zu,\"signals\":%zu,"
       "\"encodeStartCpu\":%.9f,\"submitCpu\":%.9f,\"gpuStart\":%.9f,"
       "\"gpuEnd\":%.9f,\"status\":%lu}\n",
       static_cast<unsigned long long>(record.id),
+      static_cast<void*>(cb),
       record.stream,
       record.reason,
       record.dispatches,
