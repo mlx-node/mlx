@@ -445,9 +445,20 @@ void CommandEncoder::set_buffer(
   }
   // Record as both input and output to ensure synchronization between command
   // buffers
+  restore_input_budget(buf);
   all_inputs_.insert((void*)buf);
   all_outputs_.insert((void*)buf);
   get_command_encoder()->setBuffer(buf, offset, idx);
+}
+
+void CommandEncoder::restore_input_budget(const void* buffer) {
+  if (!input_budget_discounts_.empty()) {
+    auto it = input_budget_discounts_.find(buffer);
+    if (it != input_budget_discounts_.end()) {
+      buffer_sizes_ += it->second;
+      input_budget_discounts_.erase(it);
+    }
+  }
 }
 
 void CommandEncoder::set_input_array(
@@ -457,6 +468,11 @@ void CommandEncoder::set_input_array(
   if (trace_level_) {
     trace_resource(static_cast<const MTL::Buffer*>(a.buffer().ptr()));
   }
+  // A shared allocation may be rebound through another view or operation.
+  // Restore the first binding's complete charge rather than assuming that
+  // both bindings touch the same selected rows. This also covers a later
+  // ordinary input/output binding after a budgeted sparse input.
+  restore_input_budget(a.buffer().ptr());
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
@@ -466,6 +482,23 @@ void CommandEncoder::set_input_array(
       needs_barrier_ | in_epoch(prev_outputs_, r_buf, barrier_epoch_);
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
+}
+
+void CommandEncoder::set_input_array_with_budget(
+    const array& a,
+    int idx,
+    size_t touched_units,
+    int64_t offset) {
+  const bool already_bound =
+      all_inputs_.find(a.buffer().ptr()) != all_inputs_.end() ||
+      all_outputs_.find(a.buffer().ptr()) != all_outputs_.end();
+  // The normal API performs ALL actual binding, tracing and hazard work.
+  set_input_array(a, idx, offset);
+  if (!already_bound && touched_units < a.data_size()) {
+    const size_t discount = a.data_size() - touched_units;
+    input_budget_discounts_.emplace(a.buffer().ptr(), discount);
+    buffer_sizes_ -= discount;
+  }
 }
 
 void CommandEncoder::set_output_array(
@@ -478,6 +511,7 @@ void CommandEncoder::set_output_array(
 }
 
 void CommandEncoder::register_output_array(const array& a) {
+  restore_input_budget(a.buffer().ptr());
   all_outputs_.insert(a.buffer().ptr());
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
@@ -635,6 +669,7 @@ void CommandEncoder::end_encoding() {
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();
+  input_budget_discounts_.clear();
 }
 
 void CommandEncoder::signal_event(Event event, uint64_t value) {

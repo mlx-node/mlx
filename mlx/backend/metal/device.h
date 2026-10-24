@@ -47,6 +47,11 @@ class MLX_API CommandEncoder {
 
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
+  // Scheduling estimate only, in data_size() storage units (not bytes).
+  // Resource binding, hazards, residency and retention remain unchanged.
+  // A repeated binding of this allocation restores its full original charge.
+  void set_input_array_with_budget(
+      const array& a, int idx, size_t touched_units, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
   void register_output_array(const array& a);
 
@@ -135,6 +140,7 @@ class MLX_API CommandEncoder {
 
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
+  void restore_input_budget(const void* buffer);
 
   Device& device_;
   bool exiting_{false};
@@ -144,6 +150,9 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  // Reduced first bindings in the current encoder. Any later binding, even
+  // through an alias or the budget API, conservatively restores the discount.
+  std::unordered_map<const void*, size_t> input_budget_discounts_;
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
