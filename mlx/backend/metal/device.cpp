@@ -11,6 +11,7 @@
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
+#include "mlx/allocator.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/event.h"
@@ -522,6 +523,64 @@ void CommandEncoder::register_output_array(const array& a) {
     needs_barrier_ =
         needs_barrier_ | in_epoch(prev_inputs_, buf, barrier_epoch_);
   }
+}
+
+const std::vector<array>* CommandEncoder::try_workspace(
+    uint64_t identity, const std::vector<WorkspaceSpec>& specs) {
+  constexpr size_t max_bytes = size_t(8) << 20;
+  if (concurrent_ || identity == 0 || specs.empty() || specs.size() > 16 ||
+      (workspace_identity_ && workspace_identity_ != identity)) {
+    return nullptr;
+  }
+  size_t total = 0;
+  for (const auto& spec : specs) {
+    const size_t itemsize = size_of(spec.dtype);
+    if (!itemsize) return nullptr;
+    size_t elements = 1;
+    for (int dim : spec.shape) {
+      if (dim <= 0 || size_t(dim) > (max_bytes / itemsize) / elements)
+        return nullptr;
+      elements *= size_t(dim);
+    }
+    const size_t bytes = elements * itemsize;
+    if (bytes > max_bytes - total) return nullptr;
+    total += bytes;
+  }
+  auto trace_workspace = [&](bool reused) {
+    if (trace_level_) {
+      std::fprintf(stderr,
+          "[metal-workspace] stream=%d identity=0x%016llx selected=1 "
+          "reused=%d slots=%zu bytes=%zu\n",
+          trace_stream_index_, static_cast<unsigned long long>(identity),
+          int(reused), specs.size(), total);
+    }
+  };
+  if (workspace_identity_) {
+    if (workspace_.size() != specs.size()) return nullptr;
+    for (size_t i = 0; i < specs.size(); ++i) {
+      if (workspace_[i].shape() != specs[i].shape ||
+          workspace_[i].dtype() != specs[i].dtype) return nullptr;
+    }
+  } else {
+    // No publication until all allocation and completion-pin operations
+    // succeed; failed new pins are erased before prepared storage is released.
+    std::vector<array> prepared;
+    prepared.reserve(specs.size());
+    for (const auto& spec : specs) {
+      prepared.emplace_back(spec.shape, spec.dtype, nullptr, std::vector<array>{});
+      prepared.back().set_data(allocator::malloc(prepared.back().nbytes()));
+    }
+    publish_workspace(identity, std::move(prepared), [this](const auto& data) {
+      pending_retained_.insert(data);
+    });
+    trace_workspace(false);
+    return &workspace_;
+  }
+  // retain_inputs only owns graph inputs/siblings, not internal scratch.
+  for (const auto& slot : workspace_)
+    pending_retained_.insert(slot.data_shared_ptr());
+  trace_workspace(true);
+  return &workspace_;
 }
 
 void CommandEncoder::add_temporary(array arr) {

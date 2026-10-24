@@ -55,6 +55,20 @@ class MLX_API CommandEncoder {
   void set_output_array(array& a, int idx, int64_t offset = 0);
   void register_output_array(const array& a);
 
+  struct WorkspaceSpec {
+    Shape shape;
+    Dtype dtype;
+  };
+  // One bounded profile per encoder; returns nullptr for an incompatible
+  // request or inside ConcurrentContext. The borrowed vector and its array
+  // descriptors/Data are immutable: only ordinary tracked GPU writes may
+  // change contents. Do not donate/rebind storage or expose it as graph output.
+  // The reference is only for the current eval. Storage survives command
+  // completion/commit and is released after encoder teardown synchronizes.
+  // No add_temporary: normal cross-encoder read/write fences must retain it.
+  const std::vector<array>* try_workspace(
+      uint64_t identity, const std::vector<WorkspaceSpec>& specs);
+
   void add_temporary(array arr);
   void add_temporaries(std::vector<array> arrays);
 
@@ -201,6 +215,29 @@ class MLX_API CommandEncoder {
   // Array storage retained until the next commit() — moved into a single
   // completed-handler at commit time (see retain()).
   std::unordered_set<std::shared_ptr<array::Data>> pending_retained_;
+
+  // Test access injects a deterministic pin failure without a production
+  // runtime switch or public test method. Publication remains all-or-nothing.
+  friend struct PersistentWorkspaceTestAccess;
+  template <typename Pin>
+  void publish_workspace(
+      uint64_t identity, std::vector<array> prepared, Pin&& pin) {
+    try {
+      for (const auto& slot : prepared) pin(slot.data_shared_ptr());
+    } catch (...) {
+      // None of these newly allocated slots has been bound to the GPU. Erase
+      // every possibly inserted pin so repeated caught failures stay bounded.
+      for (const auto& slot : prepared)
+        pending_retained_.erase(slot.data_shared_ptr());
+      throw;
+    }
+    workspace_.swap(prepared);
+    workspace_identity_ = identity;
+  }
+
+  // Never resized or evicted. Completion pins also hold each acquired slot.
+  uint64_t workspace_identity_{0};
+  std::vector<array> workspace_;
 
   // A map of prior command encoder outputs to their corresponding fence.
   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
