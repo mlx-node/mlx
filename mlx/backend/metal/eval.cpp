@@ -45,11 +45,15 @@ void eval(array& arr) {
         os << ">" << arr.dtype();
         fprintf(
             stderr,
-            "[metal-op] %s %s\n",
+            "[metal-op] %s %s commandBuffer=%p stream=%d\n",
             arr.primitive().name(),
-            os.str().c_str());
+            os.str().c_str(),
+            static_cast<void*>(command_buffer),
+            s.index);
       } else {
-        fprintf(stderr, "[metal-op] %s\n", arr.primitive().name());
+        fprintf(stderr, "[metal-op] %s commandBuffer=%p stream=%d\n",
+                arr.primitive().name(), static_cast<void*>(command_buffer),
+                s.index);
       }
     }
   }

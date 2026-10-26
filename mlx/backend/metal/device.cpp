@@ -77,13 +77,14 @@ void write_command_trace(
   // GPU intervals with one another, never subtracts a CPU timestamp.
   fprintf(
       stderr,
-      "[metal-command] {\"id\":%llu,\"stream\":%d,\"reason\":\"%s\","
+      "[metal-command] {\"id\":%llu,\"commandBuffer\":\"%p\",\"stream\":%d,\"reason\":\"%s\","
       "\"dispatches\":%d,\"primitives\":%zu,\"resources\":%zu,"
       "\"resourceBytes\":%zu,\"sizeUnits\":%zu,\"barriers\":%zu,"
       "\"encoders\":%zu,\"waits\":%zu,\"signals\":%zu,"
       "\"encodeStartCpu\":%.9f,\"submitCpu\":%.9f,\"gpuStart\":%.9f,"
       "\"gpuEnd\":%.9f,\"status\":%lu}\n",
       static_cast<unsigned long long>(record.id),
+      static_cast<void*>(cb),
       record.stream,
       record.reason,
       record.dispatches,
@@ -388,6 +389,24 @@ MTL::Library* load_library(
   throw std::runtime_error(msg.str());
 }
 
+bool in_epoch(
+    const std::unordered_map<MTL::Resource*, uint64_t>& stamped,
+    MTL::Resource* resource,
+    uint64_t epoch) {
+  auto it = stamped.find(resource);
+  return it != stamped.end() && it->second == epoch;
+}
+
+// Stamps are never erased on the dispatch path. Once per command buffer an
+// outgrown map is dropped so an encoder does not keep every buffer it saw.
+constexpr size_t max_stamped_resources = 8192;
+
+void forget_stale(std::unordered_map<MTL::Resource*, uint64_t>& stamped) {
+  if (stamped.size() > max_stamped_resources) {
+    stamped = {};
+  }
+}
+
 } // namespace
 
 CommandEncoder::CommandEncoder(
@@ -426,9 +445,20 @@ void CommandEncoder::set_buffer(
   }
   // Record as both input and output to ensure synchronization between command
   // buffers
+  restore_input_budget(buf);
   all_inputs_.insert((void*)buf);
   all_outputs_.insert((void*)buf);
   get_command_encoder()->setBuffer(buf, offset, idx);
+}
+
+void CommandEncoder::restore_input_budget(const void* buffer) {
+  if (!input_budget_discounts_.empty()) {
+    auto it = input_budget_discounts_.find(buffer);
+    if (it != input_budget_discounts_.end()) {
+      buffer_sizes_ += it->second;
+      input_budget_discounts_.erase(it);
+    }
+  }
 }
 
 void CommandEncoder::set_input_array(
@@ -438,15 +468,37 @@ void CommandEncoder::set_input_array(
   if (trace_level_) {
     trace_resource(static_cast<const MTL::Buffer*>(a.buffer().ptr()));
   }
+  // A shared allocation may be rebound through another view or operation.
+  // Restore the first binding's complete charge rather than assuming that
+  // both bindings touch the same selected rows. This also covers a later
+  // ordinary input/output binding after a budgeted sparse input.
+  restore_input_budget(a.buffer().ptr());
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
-  next_inputs_.insert(r_buf);
+  next_inputs_.push_back(r_buf);
   needs_barrier_ =
-      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
+      needs_barrier_ | in_epoch(prev_outputs_, r_buf, barrier_epoch_);
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
+}
+
+void CommandEncoder::set_input_array_with_budget(
+    const array& a,
+    int idx,
+    size_t touched_units,
+    int64_t offset) {
+  const bool already_bound =
+      all_inputs_.find(a.buffer().ptr()) != all_inputs_.end() ||
+      all_outputs_.find(a.buffer().ptr()) != all_outputs_.end();
+  // The normal API performs ALL actual binding, tracing and hazard work.
+  set_input_array(a, idx, offset);
+  if (!already_bound && touched_units < a.data_size()) {
+    const size_t discount = a.data_size() - touched_units;
+    input_budget_discounts_.emplace(a.buffer().ptr(), discount);
+    buffer_sizes_ -= discount;
+  }
 }
 
 void CommandEncoder::set_output_array(
@@ -459,15 +511,16 @@ void CommandEncoder::set_output_array(
 }
 
 void CommandEncoder::register_output_array(const array& a) {
+  restore_input_budget(a.buffer().ptr());
   all_outputs_.insert(a.buffer().ptr());
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   if (concurrent_) {
     concurrent_outputs_.insert(buf);
   } else {
-    next_outputs_.insert(buf);
+    next_outputs_.push_back(buf);
     needs_barrier_ =
-        needs_barrier_ | (prev_inputs_.find(buf) != prev_inputs_.end());
+        needs_barrier_ | in_epoch(prev_inputs_, buf, barrier_epoch_);
   }
 }
 
@@ -505,12 +558,13 @@ void CommandEncoder::maybeInsertBarrier() {
     }
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
-    // Preserve the hash tables' buckets for reuse across barrier epochs.
-    prev_inputs_.swap(next_inputs_);
-    prev_outputs_.swap(next_outputs_);
-  } else {
-    prev_inputs_.insert(next_inputs_.begin(), next_inputs_.end());
-    prev_outputs_.insert(next_outputs_.begin(), next_outputs_.end());
+    ++barrier_epoch_;
+  }
+  for (auto r : next_inputs_) {
+    prev_inputs_[r] = barrier_epoch_;
+  }
+  for (auto r : next_outputs_) {
+    prev_outputs_[r] = barrier_epoch_;
   }
   next_inputs_.clear();
   next_outputs_.clear();
@@ -618,12 +672,14 @@ void CommandEncoder::end_encoding(bool wait_in_flight) {
   encoder_.reset();
   needs_barrier_ = false;
   concurrent_ = false;
-  prev_inputs_.clear();
+  ++barrier_epoch_;
+  forget_stale(prev_inputs_);
+  forget_stale(prev_outputs_);
   next_inputs_.clear();
-  prev_outputs_.clear();
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();
+  input_budget_discounts_.clear();
 }
 
 void CommandEncoder::signal_event(Event event, uint64_t value) {
@@ -760,8 +816,11 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
       }
       ++trace_encoders_;
     }
-    encoder_ = NS::RetainPtr(
-        buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
+    // Serial dispatch is an opt-in comparison with fixed-graph runtimes.
+    // Keep the usual resource bookkeeping and cross-encoder fences.
+    static const bool serial = env::get_var("MLX_METAL_SERIAL_ENCODER", 0) == 1;
+    encoder_ = NS::RetainPtr(buffer_->computeCommandEncoder(
+        serial ? MTL::DispatchTypeSerial : MTL::DispatchTypeConcurrent));
     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
   }
   return encoder_.get();

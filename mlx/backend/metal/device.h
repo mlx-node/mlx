@@ -35,8 +35,9 @@ class MLX_API CommandEncoder {
     }
     ~ConcurrentContext() {
       enc.concurrent_ = false;
-      enc.prev_outputs_.insert(
-          enc.concurrent_outputs_.begin(), enc.concurrent_outputs_.end());
+      for (auto r : enc.concurrent_outputs_) {
+        enc.prev_outputs_[r] = enc.barrier_epoch_;
+      }
       enc.concurrent_outputs_.clear();
     }
 
@@ -46,6 +47,11 @@ class MLX_API CommandEncoder {
 
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
+  // Scheduling estimate only, in data_size() storage units (not bytes).
+  // Resource binding, hazards, residency and retention remain unchanged.
+  // A repeated binding of this allocation restores its full original charge.
+  void set_input_array_with_budget(
+      const array& a, int idx, size_t touched_units, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
   void register_output_array(const array& a);
 
@@ -60,6 +66,15 @@ class MLX_API CommandEncoder {
   void retain_inputs(const array& arr);
 
   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
+  // Register the argument buffer as an input before this dispatch.
+  void dispatch_threadgroups_indirect(
+      const MTL::Buffer* arguments,
+      size_t offset,
+      MTL::Size group_dims) {
+    maybeInsertBarrier();
+    ++buffer_ops_;
+    get_command_encoder()->dispatchThreadgroups(arguments, offset, group_dims);
+  }
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
 
@@ -125,6 +140,7 @@ class MLX_API CommandEncoder {
 
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
+  void restore_input_budget(const void* buffer);
 
   Device& device_;
   bool exiting_{false};
@@ -134,6 +150,9 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  // Reduced first bindings in the current encoder. Any later binding, even
+  // through an alias or the budget API, conservatively restores the discount.
+  std::unordered_map<const void*, size_t> input_budget_discounts_;
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
@@ -165,10 +184,16 @@ class MLX_API CommandEncoder {
   bool needs_barrier_{false};
   bool concurrent_{false};
   std::vector<array> temporaries_;
-  std::unordered_set<MTL::Resource*> prev_inputs_;
-  std::unordered_set<MTL::Resource*> prev_outputs_;
-  std::unordered_set<MTL::Resource*> next_inputs_;
-  std::unordered_set<MTL::Resource*> next_outputs_;
+  // Resources read/written since the last barrier, stamped with the epoch
+  // that recorded them: a resource counts iff its stamp equals
+  // barrier_epoch_. A barrier only bumps the epoch; clearing a set per
+  // dispatch zeroed its bucket array every time (7% of a MoE decode thread).
+  std::unordered_map<MTL::Resource*, uint64_t> prev_inputs_;
+  std::unordered_map<MTL::Resource*, uint64_t> prev_outputs_;
+  uint64_t barrier_epoch_{1};
+  // Resources of the kernel being encoded; maybeInsertBarrier() stamps them.
+  std::vector<MTL::Resource*> next_inputs_;
+  std::vector<MTL::Resource*> next_outputs_;
   std::unordered_set<MTL::Resource*> concurrent_outputs_;
   std::unordered_set<const void*> all_inputs_;
   std::unordered_set<const void*> all_outputs_;

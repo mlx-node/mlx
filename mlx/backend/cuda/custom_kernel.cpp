@@ -236,7 +236,7 @@ CustomKernelFunction cuda_kernel(
             std::vector<ScalarArg>{},
             false,
             shared_memory,
-            {},
+            0,
             std::move(declared_output_shapes)),
         std::move(inputs));
   };
@@ -272,7 +272,7 @@ std::vector<array> precompiled_cuda_kernel(
           scalars,
           true,
           shared_memory,
-          {},
+          0,
           output_shapes),
       inputs);
 }
