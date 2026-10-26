@@ -30,6 +30,9 @@ const char* steel_gemm_splitk_nax() {
 const char* steel_gemm_segmented_nax() {
   return "";
 }
+const char* steel_gemm_thin_nax() {
+  return "";
+}
 const char* quantized_nax() {
   return "";
 }
@@ -1263,6 +1266,25 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+MTL::ComputePipelineState* get_steel_gemm_thin_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const std::string& template_def) {
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source,
+        metal::utils(),
+        metal::gemm_nax(),
+        metal::steel_gemm_thin_nax(),
+        template_def);
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+}
+
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -1411,6 +1433,66 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
             wm,
             wn,
             get_type_string(m.dtype())));
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+}
+
+MTL::ComputePipelineState* get_steel_attention_split_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int bq,
+    int bk,
+    int bd,
+    int wm,
+    int wn) {
+  const auto& lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source,
+        metal::utils(),
+        metal::steel_attention(),
+        get_template_definition(
+            lib_name,
+            "attention_split",
+            get_type_string(q.dtype()),
+            bq,
+            bk,
+            bd,
+            wm,
+            wn));
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+}
+
+MTL::ComputePipelineState* get_steel_attention_split_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& q,
+    int bk,
+    int bd,
+    int wn) {
+  const auto& lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source,
+        metal::utils(),
+        metal::steel_attention_nax(),
+        get_template_definition(
+            lib_name,
+            "attention_split_nax",
+            get_type_string(q.dtype()),
+            bk,
+            bd,
+            wn));
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);

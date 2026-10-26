@@ -31,6 +31,7 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool has_arr_mask,
     bool do_causal,
     bool has_sinks,
+    int window_size,
     bool is_training,
     bool output_logsumexp,
     bool force_fused,
@@ -119,6 +120,7 @@ NO_GPU(Expm1)
 NO_GPU(FFT)
 NO_GPU(Flatten)
 NO_GPU(Floor)
+NO_GPU(FloorDivide)
 NO_GPU(Full)
 NO_GPU(Gather)
 NO_GPU(GatherAxis)

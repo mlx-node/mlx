@@ -23,6 +23,16 @@
       bits,                                                              \
       batched)
 
+#define instantiate_quantized_qmv(name, type, group_size, bits, batched, partial_rows) \
+  instantiate_kernel(                                                    \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_pr_" #partial_rows "_hgs_0_r_4", \
+      name,                                                              \
+      type,                                                              \
+      group_size,                                                        \
+      bits,                                                              \
+      batched,                                                           \
+      partial_rows)
+
 #define instantiate_quantized_aligned(name, type, group_size, bits, aligned)     \
   instantiate_kernel(                                                                     \
       #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned, \
@@ -90,9 +100,14 @@
   instantiate_quantized_batched(name, type, group_size, bits, 1)      \
   instantiate_quantized_batched(name, type, group_size, bits, 0)
 
-#define instantiate_quantized_all_batched(type, group_size, bits) \
-  instantiate_quantized_batched_wrap(affine_qmv_fast, type, group_size, bits)     \
-  instantiate_quantized_batched_wrap(affine_qmv, type, group_size, bits)     \
+#define instantiate_quantized_qmv_wrap(name, type, group_size, bits, partial_rows)  \
+  instantiate_quantized_qmv(name, type, group_size, bits, 1, partial_rows) \
+  instantiate_quantized_qmv(name, type, group_size, bits, 0, partial_rows)
+
+#define instantiate_quantized_all_batched(type, group_size, bits)            \
+  instantiate_quantized_qmv_wrap(affine_qmv_fast, type, group_size, bits, 1) \
+  instantiate_quantized_qmv_wrap(affine_qmv_fast, type, group_size, bits, 0) \
+  instantiate_quantized_qmv_wrap(affine_qmv, type, group_size, bits, 0)      \
   instantiate_quantized_batched_wrap(affine_qvm, type, group_size, bits)     \
   instantiate_quantized_batched_wrap(affine_qmm_n, type, group_size, bits)
 
@@ -119,7 +134,8 @@
   instantiate_quantized_quad(affine_qmv_quad, type, group_size, bits, 128, 0)
 
 // vecs_per_tg (input-vector tile) 2..8; affine uses k_lanes=8 (more rows per
-// simdgroup) where the fp path uses 16.
+// simdgroup) where the fp path uses 16. The affine kernel holds every streamed
+// vector in registers and spills above 8.
 #define instantiate_quantized_wide_wrap(name, type, group_size, bits, vecs_per_tg, k_lanes) \
   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 0)         \
   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 1)
@@ -175,6 +191,7 @@
   instantiate_quantized_types(32, bits)
 
 #define instantiate_quantized_all() \
+  instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
   instantiate_quantized_groups(3) \
   instantiate_quantized_groups(4) \

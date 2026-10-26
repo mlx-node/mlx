@@ -11,7 +11,7 @@ try:
     import torch
 
     has_torch = True
-except ImportError as e:
+except ImportError:
     has_torch = False
 
 
@@ -199,6 +199,47 @@ class TestFFT(mlx_tests.MLXTestCase):
                     self.assertTrue(
                         mx.allclose(output, expected, atol=atol, rtol=1e-4).item()
                     )
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_fft_partial_threadgroup_bounds(self):
+        # When the batch does not fill the last threadgroup, the GPU FFT must
+        # not read or write past the end of its input or output buffers.
+        # Allocating and freeing a buffer of the output size right before the
+        # FFT lets the output reuse it, with `victim` placed right behind it.
+        # Clearing the cache first keeps buffers left by earlier tests from
+        # changing that placement.
+        rng = np.random.default_rng(0)
+        cases = (
+            (mx.fft.fft, (5, 41)),
+            (mx.fft.ifft, (5, 41)),
+        )
+        expected = np.arange(1000, 1441, dtype=np.int32)
+        for transform, shape in cases:
+            with (
+                self.subTest(transform=transform.__name__, shape=shape),
+                mx.stream(mx.gpu),
+            ):
+                x_np = (
+                    rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+                ).astype(np.complex64)
+                x = mx.array(x_np)
+                mx.eval(x)
+                outputs = []
+                for _ in range(10):
+                    mx.clear_cache()
+                    hole = mx.zeros(shape, mx.complex64)
+                    mx.eval(hole)
+                    victim = mx.array(expected)
+                    mx.eval(victim)
+                    del hole
+                    y = transform(x)
+                    mx.eval(y)
+                    outputs.append(y)
+                    np.testing.assert_array_equal(np.array(victim), expected)
+                np_transform = getattr(np.fft, transform.__name__)
+                np.testing.assert_allclose(
+                    np.array(outputs[-1]), np_transform(x_np), atol=1e-3, rtol=1e-4
+                )
 
     @unittest.skip("Too slow for CI but useful for local testing.")
     def test_fft_exhaustive(self):
@@ -473,22 +514,164 @@ class TestFFT(mlx_tests.MLXTestCase):
     def test_fft_vmap(self):
         for fftn, a_np, axes in self.make_ffts():
             a = mx.array(a_np)
-            f = lambda x: fftn(x, axes=axes)
+
+            def f(x):
+                return fftn(x, axes=axes)
+
             expected = mx.stack([f(a[i]) for i in range(a.shape[0])])
             out = mx.vmap(f)(a)
             self.assertEqual(tuple(out.shape), tuple(expected.shape))
             np.testing.assert_allclose(out, expected, atol=1e-5, rtol=1e-5)
+
+    def test_fft_vmap_explicit_size(self):
+        # An inverse real transform to an odd length is not recoverable from
+        # the input shape.
+        shape = (3, 8, 6)
+        a = mx.array(np.random.rand(*shape) + 1j * np.random.rand(*shape))
+        for n in [10, 11, 12, 13]:
+            for fftn, axes in [
+                (mx.fft.irfftn, (-1,)),
+                (mx.fft.irfftn, (-2, -1)),
+                (mx.fft.ifftn, (-1,)),
+            ]:
+                s_arg = [shape[-2], n] if len(axes) == 2 else [n]
+
+                def f(x):
+                    return fftn(x, s=s_arg, axes=axes)
+
+                expected = mx.stack([f(a[i]) for i in range(a.shape[0])])
+                out = mx.vmap(f)(a)
+                self.assertEqual(tuple(out.shape), tuple(expected.shape))
+                np.testing.assert_allclose(out, expected, atol=1e-5, rtol=1e-5)
 
     def test_fft_jvp(self):
         # The fft is linear so the jvp is the fft of the tangent
         for fftn, a_np, axes in self.make_ffts():
             a = mx.array(a_np)
             t = mx.array(np.random.rand(*a_np.shape).astype(a_np.dtype))
-            f = lambda x: fftn(x, axes=axes)
+
+            def f(x):
+                return fftn(x, axes=axes)
+
             expected = f(t)
             out = mx.jvp(f, [a], [t])[1][0]
             self.assertEqual(tuple(out.shape), tuple(expected.shape))
             np.testing.assert_allclose(out, expected, atol=1e-5, rtol=1e-5)
+
+    @unittest.skipIf(not has_torch, "requires PyTorch")
+    def test_stft(self):
+        def check(x_np, win_np, n_fft, hop, win_len, center, pad_mode, norm, one):
+            win_mx = None if win_np is None else mx.array(win_np)
+            win_pt = None if win_np is None else torch.tensor(win_np)
+            z_mx = mx.fft.stft(
+                mx.array(x_np),
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=win_len,
+                window=win_mx,
+                center=center,
+                pad_mode=pad_mode,
+                norm=norm,
+                onesided=one,
+            )
+            z_pt = torch.stft(
+                torch.tensor(x_np),
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=win_len,
+                window=win_pt,
+                center=center,
+                pad_mode="replicate" if pad_mode == "edge" else pad_mode,
+                normalized=(norm == "ortho"),
+                onesided=one,
+                return_complex=True,
+            )
+            np.testing.assert_allclose(
+                np.array(z_mx), z_pt.numpy(), atol=1e-4, rtol=1e-4
+            )
+
+        np.random.seed(0)
+        x = np.random.randn(16000).astype(np.float32)
+        han = np.hanning(400).astype(np.float32)
+        h256 = np.hanning(256).astype(np.float32)
+        check(x, han, 400, 160, 400, True, "reflect", "backward", True)
+        check(x, han, 512, 128, 400, False, "constant", "backward", True)
+        check(x, han, 400, 160, 400, True, "edge", "backward", True)
+        check(x, han, 400, 160, 400, True, "reflect", "ortho", True)
+        check(x, h256, 256, 64, 256, True, "reflect", "backward", False)
+        check(x, None, 256, 64, 256, True, "reflect", "backward", True)
+        xb = np.random.randn(2, 16000).astype(np.float32)
+        check(xb, h256, 256, 64, 256, True, "reflect", "backward", True)
+
+    @unittest.skipIf(not has_torch, "requires PyTorch")
+    def test_istft(self):
+        def check(x_np, win_np, n_fft, hop, center, norm, one, length):
+            win_mx = None if win_np is None else mx.array(win_np)
+            win_pt = None if win_np is None else torch.tensor(win_np)
+            z = mx.fft.stft(
+                mx.array(x_np),
+                n_fft=n_fft,
+                hop_length=hop,
+                window=win_mx,
+                center=center,
+                norm=norm,
+                onesided=one,
+            )
+            y_mx = mx.fft.istft(
+                z,
+                n_fft=n_fft,
+                hop_length=hop,
+                window=win_mx,
+                center=center,
+                norm=norm,
+                onesided=one,
+                length=length,
+            )
+            y_pt = torch.istft(
+                torch.tensor(np.array(z)),
+                n_fft=n_fft,
+                hop_length=hop,
+                window=win_pt,
+                center=center,
+                normalized=(norm == "ortho"),
+                onesided=one,
+                length=length,
+            )
+            np.testing.assert_allclose(
+                np.array(y_mx), y_pt.numpy(), atol=1e-4, rtol=1e-4
+            )
+
+        np.random.seed(0)
+        x = np.random.randn(16000).astype(np.float32)
+        win = np.hanning(512).astype(np.float32)
+        check(x, win, 512, 128, True, "backward", True, 16000)
+        # n_fft not divisible by hop, no explicit length (length must still match)
+        check(x, win, 512, 160, True, "backward", True, None)
+        # center=False needs an edge-nonzero window for torch's NOLA check
+        check(x, None, 512, 160, False, "backward", True, None)
+        check(x, win, 512, 128, True, "ortho", True, 16000)
+        check(x, None, 512, 256, True, "backward", False, 16000)
+        # odd n_fft (passed explicitly, since onesided inference is even)
+        check(
+            x,
+            np.hanning(257).astype(np.float32),
+            257,
+            64,
+            True,
+            "backward",
+            True,
+            16000,
+        )
+        xb = np.random.randn(2, 16000).astype(np.float32)
+        check(xb, win, 512, 128, True, "backward", True, 16000)
+
+        # norm="forward" has no torch.istft flag; check the round-trip directly
+        win_mx = mx.array(win)
+        z = mx.fft.stft(
+            mx.array(x), n_fft=512, hop_length=128, window=win_mx, norm="forward"
+        )
+        y = mx.fft.istft(z, hop_length=128, window=win_mx, norm="forward", length=16000)
+        np.testing.assert_allclose(np.array(y)[1000:-1000], x[1000:-1000], atol=1e-4)
 
 
 if __name__ == "__main__":

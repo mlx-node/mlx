@@ -23,7 +23,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
     def test_quantize_dequantize(self):
         w = mx.random.normal(shape=(128, 512))
         for gs in [32, 64, 128]:
-            for b in [2, 3, 5, 6, 4, 8]:
+            for b in [1, 2, 3, 5, 6, 4, 8]:
+                if b == 1 and mx.cuda.is_available():
+                    continue
                 with self.subTest(gs=gs, b=b):
                     w_q, scales, biases = mx.quantize(w, group_size=gs, bits=b)
                     w_hat = mx.dequantize(w_q, scales, biases, gs, b)
@@ -34,7 +36,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # test quantize/dequantize 0s
         a = mx.zeros((256, 512))
         for gs in [32, 64, 128]:
-            for b in [2, 3, 4, 5, 6, 8]:
+            for b in [1, 2, 3, 4, 5, 6, 8]:
+                if b == 1 and mx.cuda.is_available():
+                    continue
                 w_q, scales, biases = mx.quantize(a, gs, b)
                 a_hat = mx.dequantize(w_q, scales, biases, gs, b)
                 self.assertTrue(mx.all(a_hat == 0))
@@ -224,6 +228,98 @@ class TestQuantized(mlx_tests.MLXTestCase):
         )
         self.assertTrue(mx.allclose(w, w_hat, rtol=1e-5, atol=1e-5))
 
+    @unittest.skipIf(mx.cuda.is_available(), "1-bit quantization NYI on CUDA")
+    def test_1bit_quantize_dequantize(self):
+        """Test 1-bit affine quantization."""
+
+        # Symmetric binary weights {-0.5, +0.5} should round-trip perfectly
+        # (affine formula gives scale=1.0, bias=-0.5)
+        for gs in [32, 64, 128]:
+            with self.subTest(gs=gs, case="pack_symmetric_weights"):
+                signs = (mx.random.uniform(shape=(128, 512)) > 0.5).astype(mx.float32)
+                w = signs * 1.0 - (1 - signs) * 1.0  # {-1.0, +1.0}
+                w = w * 0.5  # {-0.5, +0.5}
+
+                w_q, scales, biases = mx.quantize(w, group_size=gs, bits=1)
+                w_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+
+                self.assertLess((w - w_hat).abs().max().item(), 1e-5)
+
+        # Asymmetric binary weights {0.1, 0.9} should round-trip perfectly
+        # (affine formula gives scale=0.8, bias=0.1)
+        for gs in [32, 64, 128]:
+            with self.subTest(gs=gs, case="pack_asymmetric_weights"):
+                bits = (mx.random.uniform(shape=(128, 512)) > 0.5).astype(mx.float32)
+                w = bits * 0.9 + (1 - bits) * 0.1  # {0.1, 0.9}
+
+                w_q, scales, biases = mx.quantize(w, group_size=gs, bits=1)
+                w_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+
+                self.assertLess((w - w_hat).abs().max().item(), 1e-5)
+
+        # Verify dequantized values are exactly {bias, bias + scale}
+        w = mx.random.normal(shape=(64, 256))
+        for gs in [32, 64, 128]:
+            with self.subTest(gs=gs, case="dequant_values"):
+                w_q, scales, biases = mx.quantize(w, group_size=gs, bits=1)
+                w_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+
+                for i in range(scales.shape[0]):
+                    for j in range(scales.shape[1]):
+                        s = scales[i, j].item()
+                        b = biases[i, j].item()
+                        row_start = j * gs
+                        row_end = row_start + gs
+                        vals = w_hat[i, row_start:row_end]
+                        mx.eval(vals)
+                        for v in vals.tolist():
+                            self.assertTrue(
+                                abs(v - b) < 1e-5 or abs(v - (b + s)) < 1e-5,
+                                f"Value {v} not in {{bias={b}, bias+scale={b + s}}}",
+                            )
+
+        # 1-bit quantize/dequantize zeros — scale floors to eps, bias=0
+        a = mx.zeros((256, 512))
+        for gs in [32, 64, 128]:
+            w_q, scales, biases = mx.quantize(a, gs, 1)
+            a_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+            self.assertLess(a_hat.abs().max().item(), 1e-5)
+
+        # Quantized matmul with symmetric binary weights
+        key = mx.random.key(42)
+        k1, k2 = mx.random.split(key)
+        for gs in [32, 64, 128]:
+            with self.subTest(gs=gs, case="quantized_matmul_symmetric"):
+                x = mx.random.normal(shape=(4, 256), key=k1)
+                signs = (mx.random.uniform(shape=(128, 256), key=k2) > 0.5).astype(
+                    mx.float32
+                )
+                w = signs * 0.3 - (1 - signs) * 0.3  # {-0.3, +0.3}
+
+                w_q, scales, biases = mx.quantize(w, gs, 1)
+                w_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+                y_q = mx.quantized_matmul(x, w_q, scales, biases, True, gs, 1)
+                y_hat = x @ w_hat.T
+                self.assertEqual(y_q.shape, y_hat.shape)
+                self.assertLess((y_q - y_hat).abs().max().item(), 1e-5)
+
+        # Quantized matmul with asymmetric binary weights
+        for gs in [32, 64, 128]:
+            with self.subTest(gs=gs, case="quantized_matmul_asymmetric"):
+                x = mx.random.normal(shape=(4, 256), key=k1)
+                bits = (mx.random.uniform(shape=(128, 256), key=k2) > 0.5).astype(
+                    mx.float32
+                )
+                w = bits * 0.7 + (1 - bits) * 0.1  # {0.1, 0.7}
+
+                w_q, scales, biases = mx.quantize(w, gs, 1)
+                w_hat = mx.dequantize(w_q, scales, biases, gs, 1)
+                y_q = mx.quantized_matmul(x, w_q, scales, biases, True, gs, 1)
+                y_hat = x @ w_hat.T
+                self.assertEqual(y_q.shape, y_hat.shape)
+                tol = 2e-5 if platform.system() == "Windows" else 1e-5
+                self.assertLess((y_q - y_hat).abs().max().item(), tol)
+
     def test_qqmv(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
@@ -373,13 +469,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
         dtype = mx.float16 if (mx.default_device() == mx.gpu) else mx.float32
         tests = product(
             [128, 64, 32],  # group_size
-            [2, 4, 8],  # bits
+            [1, 2, 4, 8],  # bits
             [8, 32, 33, 64],  # M
             [128, 256],  # N
             [128, 256],  # K
             [True, False],  # transposed
         )
         for group_size, bits, M, N, K, transposed in tests:
+            if bits == 1 and mx.cuda.is_available():
+                continue
             with self.subTest(
                 shape=(M, N, K),
                 group_size=group_size,
@@ -559,6 +657,167 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 )
                 self.assertLess((y_ref - y).abs().max(), 1e-3)
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_splitk_precision(self):
+        # Split-K sums the partitions in float32 and rounds the result to the
+        # input type once. Rounding each partition first gives two to three
+        # times the error of a single rounding at these shapes.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        K, N = 2560, 1024
+        # Keep M at or above get_qmv_batch_limit on all devices. Below it the
+        # qmv kernel runs, which dequantizes in float32 and not in the input type.
+        for mode, dtype, M in product(
+            ["affine", "mxfp4"], [mx.bfloat16, mx.float16], [25, 33, 65]
+        ):
+            with self.subTest(mode=mode, dtype=dtype, M=M):
+                k1, k2 = mx.random.split(mx.random.key(0))
+                x = mx.random.normal((M, K), key=k1).astype(dtype)
+                w = (0.02 * mx.random.normal((N, K), key=k2)).astype(dtype)
+                group_size, bits = (64, 4) if mode == "affine" else (None, None)
+                wq = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
+                w_hat = mx.dequantize(*wq, group_size=group_size, bits=bits, mode=mode)
+                y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                y = mx.quantized_matmul(
+                    x, *wq, transpose=True, group_size=group_size, bits=bits, mode=mode
+                )
+                error = (y.astype(mx.float32) - y_ref).abs().mean()
+                rounding = (y_ref.astype(dtype).astype(mx.float32) - y_ref).abs().mean()
+                self.assertLess(error.item(), 1.1 * rounding.item())
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_mid_m(self):
+        # Mid-size M with narrow outputs, where a single batch routes to the
+        # split-K and vector kernels: every split count, both row tilings and
+        # the boundaries between the routes.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        shapes = [
+            (256, 4096),
+            (1024, 6144),
+            (2560, 1024),
+            (4096, 2048),
+        ]
+        for (K, N), M, bits, group_size, dtype in product(
+            shapes,
+            [8, 31, 33, 130],
+            [2, 3, 4, 6, 8],
+            [32, 64, 128],
+            [mx.bfloat16, mx.float16, mx.float32],
+        ):
+            if K % group_size != 0:
+                continue
+            with self.subTest(
+                K=K, N=N, M=M, bits=bits, group_size=group_size, dtype=dtype
+            ):
+                k1, k2 = mx.random.split(mx.random.key(M * K + N))
+                x = mx.random.normal((M, K), key=k1).astype(dtype)
+                w = (0.02 * mx.random.normal((N, K), key=k2)).astype(dtype)
+                wq = mx.quantize(w, group_size=group_size, bits=bits)
+                w_hat = mx.dequantize(*wq, group_size=group_size, bits=bits)
+                y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                y = mx.quantized_matmul(
+                    x, *wq, transpose=True, group_size=group_size, bits=bits
+                )
+                self.assertEqual(y.shape, (M, N))
+                error = (y.astype(mx.float32) - y_ref).abs().mean()
+                if dtype == mx.float32:
+                    rounding = mx.array(1)
+                else:
+                    rounding = (
+                        (y_ref.astype(dtype).astype(mx.float32) - y_ref).abs().mean()
+                    )
+                # The split-K and NAX routes round once. The vector kernels
+                # (below 16384 outputs, or when K does not split in two) reach
+                # ~1.6x the output rounding.
+                splits = K % (2 * max(64, group_size)) == 0
+                tol = 1.1 if M * N >= 16384 and splits else 2.0
+                if error.item() >= tol * rounding.item():
+                    # Vector kernels can dequantize weights in float32.
+                    qw, scales, biases = wq
+                    w_hat = mx.dequantize(
+                        qw,
+                        scales.astype(mx.float32),
+                        biases.astype(mx.float32),
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    y_ref = mx.matmul(x.astype(mx.float32), w_hat.T, stream=mx.cpu)
+                    error = (y.astype(mx.float32) - y_ref).abs().mean()
+                    rounding = (
+                        (y_ref.astype(dtype).astype(mx.float32) - y_ref).abs().mean()
+                    )
+                    tol = 1.1
+                self.assertLess(error.item(), tol * rounding.item())
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_fp4_half_loader(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        mx.random.seed(0)
+
+        def rel_err(got, expected):
+            d = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+            return d.max() / mx.abs(expected.astype(mx.float32)).max()
+
+        tests = [
+            (512, 8192, 1040, ()),  # 64 x 64
+            (552, 8224, 1040, ()),  # 64 x 64, M % 64 == 40, N % 64 == 32
+            (300, 8192, 1040, (2,)),  # 64 x 64, batched w
+            (40, 1040, 1200, ()),  # 32 x 32, N % 32 == 16
+            (40, 512, 1024, ()),  # split K
+            (40, 528, 1024, ()),  # split K, N % 32 == 16
+        ]
+        modes = [("nvfp4", 16), ("mxfp4", 32)]
+        dtypes = [mx.bfloat16, mx.float16]
+        for (M, N, K, batch), (mode, group_size), dtype in product(
+            tests, modes, dtypes
+        ):
+            K -= K % group_size
+            with self.subTest(M=M, N=N, K=K, batch=batch, mode=mode, dtype=dtype):
+                w = mx.random.normal(batch + (N, K)).astype(dtype)
+                w_q, scales = mx.quantize(w, mode=mode)
+                w_hat = mx.dequantize(w_q, scales, mode=mode, dtype=dtype)
+                x = (mx.random.normal(batch + (M, K)) / K**0.5).astype(dtype)
+                out = mx.quantized_matmul(x, w_q, scales, mode=mode)
+                self.assertLess(rel_err(out, x @ w_hat.swapaxes(-1, -2)), 3e-2)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_few_rows(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        mx.random.seed(0)
+        K = 4224
+
+        def rel_err(got, expected):
+            d = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+            return d.max() / mx.abs(expected.astype(mx.float32)).max()
+
+        modes = ["nvfp4", "mxfp4", "mxfp8"]
+        dtypes = [mx.bfloat16, mx.float16, mx.float32]
+        for N, mode, dtype in product([4128, 4112], modes, dtypes):
+            tol = 1e-5 if dtype == mx.float32 else 3e-2
+            w = mx.random.normal((N, K)).astype(dtype)
+            w_q, scales = mx.quantize(w, mode=mode)
+            w_hat = mx.dequantize(w_q, scales, mode=mode, dtype=dtype)
+            for M in [5, 6, 8, 13, 16, 17]:
+                with self.subTest(N=N, mode=mode, dtype=dtype, M=M):
+                    x = (mx.random.normal((M, K)) / K**0.5).astype(dtype)
+                    out = mx.quantized_matmul(x, w_q, scales, mode=mode)
+                    self.assertLess(rel_err(out, x @ w_hat.T), tol)
+
+            # Views at odd offsets must not reach the Metal vector loads
+            x = (mx.random.normal((16 * K + 1,)) / K**0.5).astype(dtype)
+            s = mx.concatenate([mx.zeros((1,), mx.uint8), scales.reshape(-1)])
+            views = {
+                "x": (x[1:].reshape(16, K), scales),
+                "scales": (x[:-1].reshape(16, K), s[1:].reshape(scales.shape)),
+            }
+            for name, (xv, sv) in views.items():
+                with self.subTest(N=N, mode=mode, dtype=dtype, offset=name):
+                    out = mx.quantized_matmul(xv, w_q, sv, mode=mode)
+                    self.assertLess(rel_err(out, xv @ w_hat.T), tol)
+
     def test_qmm_vjp(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
@@ -671,6 +930,152 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 y_hat = x @ mx.swapaxes(w_hat, -1, -2)
                 self.assertEqual(y_q.shape, y_hat.shape)
                 self.assertLess((y_q - y_hat).abs().max(), 1e-3)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmv_affine_bias_sum_precision(self):
+        # The bias contributes bias * sum(x), and a sum accumulated in the input
+        # type loses the small values: the sum of [1, 1 / denom, -1, 0] cancels
+        # to zero.
+        for n, k, gs, dtype, sign, bits in product(
+            [1, 4, 8, 12],
+            [64, 96, 512],
+            [32, 64],
+            [mx.bfloat16, mx.float16],
+            [-1, 1],
+            [2, 3, 4, 5, 6, 8],
+        ):
+            if k % gs:
+                continue
+            with self.subTest(n=n, k=k, gs=gs, dtype=dtype, sign=sign, bits=bits):
+                # 1 / denom is exactly half an ulp at 1.0, so 1 + 1 / denom
+                # rounds back to 1 (ties-to-even) in the input type.
+                denom = 2048 if dtype == mx.float16 else 256
+                x = mx.tile(mx.array([1, 1 / denom, -1, 0], dtype), k // 4)
+                x = (sign * x).reshape(1, k)
+                # Zero scales and unit biases dequantize to all ones, so the
+                # product is exactly sum(x) = sign * k / (4 * denom).
+                q = mx.zeros((n, k * bits // 32), mx.uint32)
+                scales = mx.zeros((n, k // gs), dtype)
+                biases = mx.ones((n, k // gs), dtype)
+                y = mx.quantized_matmul(x, q, scales, biases, group_size=gs, bits=bits)
+                expected = mx.full((1, n), sign * k / (4 * denom), dtype)
+                self.assertTrue(mx.array_equal(y, expected).item())
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmv_fast_unaligned_n(self):
+        # Output sizes that are not a multiple of 8 with an aligned input size.
+        # "vector" is one input row, "batched" two weight batches, and "rows"
+        # is M = 3, which reaches this kernel only on GPUs before gen 15, since
+        # later ones route M >= 2 to qmv_wide.
+        for n, k, bits, gs, dtype, layout in product(
+            [1, 3, 5, 12, 17],
+            [512, 1024],
+            [2, 3, 4, 5, 6, 8],
+            [64],
+            [mx.float32, mx.bfloat16],
+            ["vector", "batched", "rows"],
+        ):
+            with self.subTest(n=n, k=k, bits=bits, gs=gs, dtype=dtype, layout=layout):
+                key = mx.random.key(n * 7 + k + bits)
+                if layout == "batched":
+                    w_shape, x_shape = (2, n, k), (2, 1, k)
+                elif layout == "rows":
+                    w_shape, x_shape = (n, k), (3, k)
+                else:
+                    w_shape, x_shape = (n, k), (1, k)
+                w = mx.random.normal(w_shape, key=key) / k**0.5
+                x = mx.random.normal(x_shape, key=mx.random.split(key)[0])
+                x = (x / k**0.5).astype(dtype)
+                q, s, b = mx.quantize(w.astype(dtype), group_size=gs, bits=bits)
+                w_hat = mx.dequantize(q, s, b, group_size=gs, bits=bits)
+                y_hat = x.astype(mx.float32) @ mx.swapaxes(
+                    w_hat.astype(mx.float32), -1, -2
+                )
+                y = mx.quantized_matmul(x, q, s, b, group_size=gs, bits=bits)
+                tol = 1e-3 if dtype == mx.float32 else 1.5e-3
+                self.assertEqual(y.shape, y_hat.shape)
+                self.assertLess((y - y_hat).abs().max().item(), tol)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_fp_qmv_fast_unaligned_n(self):
+        for n, k, mode, dtype, batched in product(
+            [1, 3, 5, 7, 8, 9, 12, 17],
+            [256, 512, 544, 1024],
+            ["mxfp4", "mxfp8", "nvfp4"],
+            [mx.float32, mx.float16, mx.bfloat16],
+            [False, True],
+        ):
+            with self.subTest(n=n, k=k, mode=mode, dtype=dtype, batched=batched):
+                key = mx.random.key(n * 7 + k)
+                w_shape = (2, n, k) if batched else (n, k)
+                x_shape = (2, 1, k) if batched else (1, k)
+                w = mx.random.normal(w_shape, key=key) / k**0.5
+                x = mx.random.normal(x_shape, key=mx.random.split(key)[0])
+                x = (x / k**0.5).astype(dtype)
+                q, s = mx.quantize(w, mode=mode)
+                w_hat = mx.dequantize(q, s, mode=mode, dtype=mx.float32)
+                expected = x.astype(mx.float32) @ mx.swapaxes(w_hat, -1, -2)
+                actual = mx.quantized_matmul(x, q, s, mode=mode)
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertLess((actual - expected).abs().max().item(), 1e-3)
+
+                # Compare aligned inputs with the existing full-tile kernel.
+                alignment = 256 if mode == "mxfp8" else 512
+                if k % alignment == 0:
+                    padding = [(0, 0)] * q.ndim
+                    padding[-2] = (0, (-n) % 8)
+                    padded = mx.quantized_matmul(
+                        x, mx.pad(q, padding), mx.pad(s, padding), mode=mode
+                    )
+                    self.assertTrue(mx.array_equal(actual, padded[..., :n]).item())
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_fp_qmv_fast_unaligned_n_global_scale(self):
+        for n, k, m, dtype in product(
+            [1, 3, 5, 7, 8, 9, 12, 17],
+            [512, 544, 1024],
+            [1, 3],
+            [mx.float32, mx.float16, mx.bfloat16],
+        ):
+            with self.subTest(n=n, k=k, m=m, dtype=dtype):
+                key = mx.random.key(n * 7 + k)
+                w = mx.random.normal((n, k), key=key) / k**0.5
+                x = mx.random.normal((m, k), key=mx.random.split(key)[0])
+                x = (x / k**0.5).astype(dtype)
+                global_scale_x = mx.max(mx.abs(x)).astype(mx.float32)
+                global_scale_w = mx.max(mx.abs(w)).astype(mx.float32)
+                q, s = mx.quantize(w, mode="nvfp4", global_scale=global_scale_w)
+                w_hat = mx.dequantize(
+                    q, s, mode="nvfp4", global_scale=global_scale_w, dtype=mx.float32
+                )
+                x_hat = mx.dequantize(
+                    *mx.quantize(x, mode="nvfp4", global_scale=global_scale_x),
+                    mode="nvfp4",
+                    global_scale=global_scale_x,
+                    dtype=dtype,
+                )
+                expected = x_hat.astype(mx.float32) @ w_hat.T
+                actual = mx.qqmm(
+                    x,
+                    q,
+                    s,
+                    mode="nvfp4",
+                    global_scale_x=global_scale_x,
+                    global_scale_w=global_scale_w,
+                )
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertLess((actual - expected).abs().max().item(), 1e-3)
+
+                if k % 512 == 0:
+                    padded = mx.qqmm(
+                        x,
+                        mx.pad(q, [(0, (-n) % 8), (0, 0)]),
+                        mx.pad(s, [(0, (-n) % 8), (0, 0)]),
+                        mode="nvfp4",
+                        global_scale_x=global_scale_x,
+                        global_scale_w=global_scale_w,
+                    )
+                    self.assertTrue(mx.array_equal(actual, padded[..., :n]).item())
 
     def test_fp_qmv(self):
         key = mx.random.key(0)
@@ -1573,6 +1978,19 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 mode=mode,
                 **bf16,
             )
+        for mode in ("nvfp4", "mxfp4", "mxfp8"):
+            for K, tol in ((448, 1e-1), (512, 1e-2), (704, 1e-2)):
+                test_shape(
+                    1,
+                    33,
+                    K,
+                    batch_A=(1,),
+                    batch_B=(3,),
+                    lhs_indices=(0,),
+                    rhs_indices=(2, 1, 0, 2, 1, 0, 2, 1, 0),
+                    mode=mode,
+                    **{**bf16, "rtol": tol, "atol": tol},
+                )
 
     def test_gather_qqmm(self):
         if mx.default_device() == mx.cpu:
@@ -1876,8 +2294,10 @@ class TestQuantized(mlx_tests.MLXTestCase):
         k1, k2, k3 = mx.random.split(key, 3)
         dtype = mx.float16 if (mx.default_device() == mx.gpu) else mx.float32
 
-        for L, K, D, E, I, transpose, mode in parameters:
-            with self.subTest(L=L, K=K, D=D, E=E, I=I, transpose=transpose, mode=mode):
+        for L, K, D, E, num_indices, transpose, mode in parameters:
+            with self.subTest(
+                L=L, K=K, D=D, E=E, I=num_indices, transpose=transpose, mode=mode
+            ):
                 if mode != "affine":
                     group_size = None
                     dtype = (
@@ -1890,7 +2310,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     )
 
                 K, D = (K, D) if transpose else (D, K)
-                ishape = (L, I)
+                ishape = (L, num_indices)
                 xshape = (L, 1, 1, K)
                 wshape = (E, D, K) if transpose else (E, K, D)
 
@@ -2207,7 +2627,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
             # Should raise
             with self.assertRaises(ValueError):
-                ds = mx.grad(mm)(s, x, wq)
+                mx.grad(mm)(s, x, wq)
 
             rhs_indices = mx.array(0)
             with self.assertRaises(ValueError):
@@ -2221,7 +2641,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         mode=mode,
                     ).sum()
 
-                ds = mx.grad(gmm)(s, x, wq)
+                _ds = mx.grad(gmm)(s, x, wq)
 
     @unittest.skipIf(
         not mx.is_available(mx.gpu), "Global scale is only supported on the GPU"
@@ -2333,6 +2753,28 @@ class TestQuantized(mlx_tests.MLXTestCase):
         w_hat = mx.dequantize(w_q, scales, mode=mode)
         expected = mx.dequantize(w_q, mx.contiguous(scales), mode=mode)
         self.assertTrue(mx.allclose(w_hat, expected))
+
+    def test_quantized_matmul_batched_split_k(self):
+        tol = 3e-2 if mx.cuda.is_available() else 1e-3
+        K, N = 2048, 512
+        w = mx.random.normal(shape=(K, N))
+        w_q, scales, biases = mx.quantize(w, group_size=64, bits=4)
+        w_hat = mx.dequantize(w_q, scales, biases, group_size=64, bits=4)
+
+        shapes = [
+            (2, K),
+            (2, 1, K),
+            (3, 1, K),
+            (2, 1, 1, K),
+        ]
+        for shape in shapes:
+            x = mx.random.normal(shape=shape)
+            y_q = mx.quantized_matmul(
+                x, w_q, scales, biases, transpose=False, group_size=64, bits=4
+            )
+            y_hat = x @ w_hat
+            self.assertEqual(y_q.shape, y_hat.shape)
+            self.assertLess((y_q - y_hat).abs().max(), tol)
 
 
 if __name__ == "__main__":
