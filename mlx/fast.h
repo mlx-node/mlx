@@ -3,6 +3,9 @@
 #pragma once
 
 #include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 
 #include "mlx/api.h"
@@ -60,6 +63,34 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     bool force_fused = false,
     StreamOrDevice s = {});
+
+// Pre-window API compatibility. The constrained fifth argument leaves
+// integral and braced window calls on the overload above.
+template <
+    typename MaskMode,
+    std::enable_if_t<std::is_convertible_v<MaskMode, std::string>, int> = 0>
+inline array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    MaskMode&& mask_mode,
+    std::optional<array> mask_arr = {},
+    const std::optional<array>& sinks = {},
+    bool force_fused = false,
+    StreamOrDevice s = {}) {
+  return scaled_dot_product_attention(
+      queries,
+      keys,
+      values,
+      scale,
+      -1,
+      std::string(std::forward<MaskMode>(mask_mode)),
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      std::move(s));
+}
 
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,

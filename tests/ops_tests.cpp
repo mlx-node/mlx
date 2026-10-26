@@ -5034,3 +5034,84 @@ TEST_CASE("test ops and their gradients keep the caller's stream") {
     check_stream(outs[1], s);
   }
 }
+
+TEST_CASE("test fast sdpa legacy string mask API") {
+  auto check_same = [](array legacy, array current) {
+    REQUIRE_EQ(legacy.shape(), current.shape());
+    CHECK(
+        legacy.primitive().output_shapes(legacy.inputs()) ==
+        current.primitive().output_shapes(current.inputs()));
+    eval(legacy, current);
+    CHECK(array_equal(legacy, current, Device::cpu).item<bool>());
+  };
+
+  const std::vector<float> values{1.0f, 0.0f, 2.0f, 0.0f, 4.0f, 0.0f};
+  for (auto device : {Device::cpu, Device::gpu}) {
+    if (device == Device::gpu && !is_available(device)) {
+      continue;
+    }
+    auto s = default_stream(device);
+    auto q = ones({1, 1, 3, 2}, float32, s);
+    auto k = zeros({1, 1, 3, 2}, float32, s);
+    auto v = array(values.data(), {1, 1, 3, 2});
+
+    auto causal = fast::scaled_dot_product_attention(
+        q, k, v, 1.0f, "causal", std::nullopt, std::nullopt, {});
+    auto current_causal = fast::scaled_dot_product_attention(
+        q, k, v, 1.0f, -1, "causal", std::nullopt, std::nullopt, {});
+    check_same(causal, current_causal);
+
+    auto unmasked = fast::scaled_dot_product_attention(
+        q, k, v, 1.0f, -1, "", std::nullopt, std::nullopt, false, s);
+    eval(unmasked);
+    CHECK(!array_equal(causal, unmasked, Device::cpu).item<bool>());
+
+    std::string mask_mode;
+    check_same(
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, mask_mode, {}, std::nullopt, {}),
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, -1, mask_mode, {}, std::nullopt, {}));
+
+    mask_mode = "causal";
+    check_same(
+        fast::scaled_dot_product_attention(q, k, v, 1.0f, mask_mode),
+        fast::scaled_dot_product_attention(q, k, v, 1.0f, -1, mask_mode));
+
+    auto sinks = array({0.5f});
+    const char* dynamic_mode = mask_mode.empty() ? "" : "causal";
+    auto streamed = fast::scaled_dot_product_attention(
+        q, k, v, 1.0f, dynamic_mode, std::nullopt, sinks, false, s);
+    CHECK_EQ(streamed.primitive().stream(), s);
+    check_same(
+        streamed,
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, -1, dynamic_mode, std::nullopt, sinks, false, s));
+
+    auto mask = array(
+        {true, false, true, true, true, false, false, true, true},
+        {1, 1, 3, 3});
+    check_same(
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, "", mask, std::nullopt, false, s),
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, -1, "", mask, std::nullopt, false, s));
+
+    mask_mode = "array";
+    check_same(
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, mask_mode, mask, std::nullopt),
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, -1, mask_mode, mask, std::nullopt));
+
+    check_same(
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, true, "", std::nullopt, std::nullopt, false, s),
+        fast::scaled_dot_product_attention(
+            q, k, v, 1.0f, 1, "", std::nullopt, std::nullopt, false, s));
+
+    CHECK_THROWS_AS(
+        fast::scaled_dot_product_attention(q, k, v, 1.0f, {}),
+        std::invalid_argument);
+  }
+}
