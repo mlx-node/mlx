@@ -222,10 +222,12 @@ inline bool metal_fast_synch() {
   return metal_fast_synch;
 }
 
-inline bool enable_tf32() {
-  static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
-  return enable_tf32_;
-}
+// MLX_ENABLE_TF32, unless the calling thread set its own value. The GEMM,
+// quantized and SDPA dispatch reads this on the thread that encodes the op.
+MLX_API bool enable_tf32();
+
+// -1: follow MLX_ENABLE_TF32; 0: true f32 on this thread; 1: TF32 allowed.
+MLX_API void set_thread_tf32(int mode);
 
 inline int nccl_timeout(int default_value) {
   static int nccl_timeout = get_var("MLX_NCCL_TIMEOUT", default_value);

@@ -307,6 +307,19 @@ std::string get_var(const char* name, const char* default_value) {
   }
 }
 
+namespace {
+thread_local int thread_tf32 = -1;
+} // namespace
+
+bool enable_tf32() {
+  static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
+  return thread_tf32 < 0 ? enable_tf32_ : thread_tf32 != 0;
+}
+
+void set_thread_tf32(int mode) {
+  thread_tf32 = mode < 0 ? -1 : (mode != 0 ? 1 : 0);
+}
+
 } // namespace env
 
 template <typename T>
