@@ -52,8 +52,7 @@ auto& cudnn_handles_cache() {
   struct CudnnHandle {
     ~CudnnHandle() {
       if (handle) {
-        // Not checked: runs at thread exit where a throw would terminate.
-        cudnnDestroy(handle);
+        CHECK_CUDNN_ERROR(cudnnDestroy(handle));
       }
     }
     cudnnHandle_t handle{nullptr};

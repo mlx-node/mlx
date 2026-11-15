@@ -91,11 +91,7 @@ void synchronize(Stream s) {
 void clear_streams() {
   auto sync = [](auto& encoders) {
     for (auto& item : encoders) {
-      try {
-        item.second.synchronize();
-      } catch (...) {
-        // The encoder destructor also tolerates runtime shutdown.
-      }
+      item.second.synchronize();
     }
   };
   sync(cu::get_command_encoders());
