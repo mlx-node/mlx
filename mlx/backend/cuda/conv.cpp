@@ -256,6 +256,10 @@ void init_cudnn_conv_cache() {
   conv_cache();
 }
 
+void clear_cudnn_conv_cache() {
+  conv_cache().clear();
+}
+
 void Convolution::eval_gpu(const std::vector<array>& inputs, array& out_) {
   nvtx3::scoped_range r("Convolution::eval_gpu");
   if (out_.size() == 0) {
