@@ -1116,7 +1116,8 @@ ArrayFnWithExtra compile(
     ArrayFnWithExtra fun,
     std::uintptr_t fun_id,
     bool shapeless /* = false */,
-    std::vector<uint64_t> constants /* = {} */) {
+    std::vector<uint64_t> constants /* = {} */,
+    std::optional<CompileMode> mode /* = std::nullopt */) {
   if (skip_compile()) {
     return fun;
   }
@@ -1124,11 +1125,15 @@ ArrayFnWithExtra compile(
     throw std::invalid_argument(
         "[compile] Cannot compile a function without a target.");
   }
+  if (mode) {
+    fun_id ^= (static_cast<uint64_t>(mode.value()) + 1) << 61;
+  }
 
   return [fun = std::move(fun),
           fun_id,
           shapeless,
-          constants = std::move(constants)](const std::vector<array>& inputs) {
+          constants = std::move(constants),
+          mode](const std::vector<array>& inputs) {
     // If the inputs are tracers, trace the original graph
     if (std::any_of(inputs.begin(), inputs.end(), [](auto& in) {
           return in.is_tracer();
@@ -1157,15 +1162,15 @@ ArrayFnWithExtra compile(
           compile_dfs(entry.inputs, entry.outputs, inputs);
 
       // Simplify the tape
-      auto mode = compile_mode().load();
-      if (mode != CompileMode::no_simplify) {
+      auto selected_mode = mode.value_or(compile_mode().load());
+      if (selected_mode != CompileMode::no_simplify) {
         compile_simplify(
             entry.tape, parents_map, entry.outputs, /* passes */ 3);
       }
 
       // Kernel fusion to generate Compiled primitives. The tape and
       // new outputs must be updated accordingly
-      if (mode != CompileMode::no_fuse) {
+      if (selected_mode != CompileMode::no_fuse) {
         compile_fuse(entry.tape, parents_map, entry.inputs, entry.outputs);
       }
 
@@ -1188,7 +1193,8 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
     std::function<std::vector<array>(const std::vector<array>&)> fun,
     std::uintptr_t fun_id,
     bool shapeless /* = false */,
-    std::vector<uint64_t> constants /* = {} */) {
+    std::vector<uint64_t> constants /* = {} */,
+    std::optional<CompileMode> mode /* = std::nullopt */) {
   if (skip_compile()) {
     return fun;
   }
@@ -1203,7 +1209,7 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
       };
 
   auto compiled_fun = compile(
-      std::move(fun_with_extra), fun_id, shapeless, std::move(constants));
+      std::move(fun_with_extra), fun_id, shapeless, std::move(constants), mode);
 
   return [compiled_fun =
               std::move(compiled_fun)](const std::vector<array>& inputs) {
@@ -1256,6 +1262,37 @@ std::function<std::vector<array>(const std::vector<array>&)> compile(
         fun_id,
         shapeless);
   }
+}
+
+std::function<std::vector<array>(const std::vector<array>&)> compile_with_mode(
+    std::function<std::vector<array>(const std::vector<array>&)> fun,
+    bool shapeless,
+    CompileMode mode) {
+  if (detail::skip_compile()) {
+    return fun;
+  }
+  auto fun_id = detail::get_function_address(fun);
+  if (fun_id) {
+    return detail::compile(std::move(fun), fun_id, shapeless, {}, mode);
+  }
+  auto pfun = std::shared_ptr<
+      std::function<std::vector<array>(const std::vector<array>&)>>(
+      new std::function<std::vector<array>(const std::vector<array>&)>{fun},
+      [cache = detail::compile_cache(), mode](auto* p) {
+        auto erase_id = reinterpret_cast<std::uintptr_t>(p) ^
+            ((static_cast<uint64_t>(mode) + 1) << 61);
+        detail::compile_erase(cache, erase_id);
+        delete p;
+      });
+  fun_id = reinterpret_cast<std::uintptr_t>(pfun.get());
+  return detail::compile(
+      [pfun = std::move(pfun)](const auto& inputs) {
+        return (*pfun)(inputs);
+      },
+      fun_id,
+      shapeless,
+      {},
+      mode);
 }
 
 std::function<std::vector<array>(const std::vector<array>&)> compile(

@@ -2,10 +2,12 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 
 #include "mlx/api.h"
 #include "mlx/array.h"
+#include "mlx/compile.h"
 
 namespace mlx::core::detail {
 
@@ -19,13 +21,15 @@ MLX_API std::function<std::vector<array>(const std::vector<array>&)> compile(
     std::function<std::vector<array>(const std::vector<array>&)> fun,
     std::uintptr_t fun_id,
     bool shapeless = false,
-    std::vector<uint64_t> constants = {});
+    std::vector<uint64_t> constants = {},
+    std::optional<CompileMode> mode = std::nullopt);
 
 MLX_API ArrayFnWithExtra compile(
     ArrayFnWithExtra fun,
     std::uintptr_t fun_id,
     bool shapeless,
-    std::vector<uint64_t> constants);
+    std::vector<uint64_t> constants,
+    std::optional<CompileMode> mode = std::nullopt);
 
 // Get the compiler cache of current thread.
 class CompileCache;

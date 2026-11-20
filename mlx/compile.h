@@ -18,6 +18,12 @@ MLX_API std::function<std::vector<array>(const std::vector<array>&)> compile(
     std::vector<array> (*fun)(const std::vector<array>&),
     bool shapeless = false);
 
+/** Compile with a per-function mode override, leaving the global mode alone. */
+MLX_API std::function<std::vector<array>(const std::vector<array>&)> compile_with_mode(
+    std::function<std::vector<array>(const std::vector<array>&)> fun,
+    bool shapeless,
+    CompileMode mode);
+
 // Convert capture-less lambdas to function pointers.
 template <
     typename F,
