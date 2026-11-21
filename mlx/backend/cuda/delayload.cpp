@@ -19,9 +19,14 @@ inline fs::path relative_to_current_binary(const char* relative) {
   return fs::absolute(current_binary_dir() / relative);
 }
 
+inline fs::path resolve_bin_dir(const char* dir) {
+  fs::path p(dir);
+  return p.is_absolute() ? p : fs::absolute(current_binary_dir() / p);
+}
+
 inline fs::path cublas_dir() {
   if (const char* dir = cuda_bin_dir()) {
-    return fs::path(dir);
+    return resolve_bin_dir(dir);
   }
   return relative_to_current_binary("../nvidia/cublas/bin");
 }
@@ -29,29 +34,44 @@ inline fs::path cublas_dir() {
 fs::path load_nvrtc() {
   fs::path nvrtc_dir;
   if (const char* dir = cuda_bin_dir()) {
-    nvrtc_dir = fs::path(dir);
+    nvrtc_dir = resolve_bin_dir(dir);
   } else {
     nvrtc_dir = relative_to_current_binary("../nvidia/cuda_nvrtc/bin");
   }
-  // Internally nvrtc loads some libs dynamically, add to search dirs.
+  // Internally nvrtc calls LoadLibrary("nvrtc-builtins*.dll"). Preload it from
+  // nvrtc_dir (which may be next to the addon, not on PATH) and register the
+  // absolute directory so NVRTC always locates its builtins library.
   ::AddDllDirectory(nvrtc_dir.c_str());
+  std::error_code ec;
+  if (fs::exists(nvrtc_dir, ec)) {
+    for (const auto& dll : fs::directory_iterator(nvrtc_dir, ec)) {
+      auto name = dll.path().filename().string();
+      if (name.starts_with("nvrtc-builtins") &&
+          dll.path().extension() == ".dll") {
+        ::LoadLibraryW(dll.path().c_str());
+      }
+    }
+  }
   return nvrtc_dir;
 }
 
 fs::path load_cudnn() {
   fs::path cudnn_dir;
   if (const char* dir = cudnn_bin_dir()) {
-    cudnn_dir = fs::path(dir);
+    cudnn_dir = resolve_bin_dir(dir);
   } else {
     cudnn_dir = relative_to_current_binary("../nvidia/cudnn/bin");
   }
   // Must load cudnn_graph64_9.dll before locating symbols, otherwise We would
   // get errors like "Invalid handle. Cannot load symbol cudnnCreate".
-  for (const auto& dll : fs::directory_iterator(cudnn_dir)) {
-    if (dll.path().filename().string().starts_with("cudnn_graph") &&
-        dll.path().extension() == ".dll") {
-      ::LoadLibraryW(dll.path().c_str());
-      break;
+  std::error_code ec;
+  if (fs::exists(cudnn_dir, ec)) {
+    for (const auto& dll : fs::directory_iterator(cudnn_dir, ec)) {
+      if (dll.path().filename().string().starts_with("cudnn_graph") &&
+          dll.path().extension() == ".dll") {
+        ::LoadLibraryW(dll.path().c_str());
+        break;
+      }
     }
   }
   // Internally cuDNN loads some libs dynamically, add to search dirs.
@@ -64,7 +84,7 @@ fs::path load_cudnn() {
 fs::path load_cusolver() {
   fs::path cusolver_dir;
   if (const char* dir = cuda_bin_dir()) {
-    cusolver_dir = dir;
+    cusolver_dir = resolve_bin_dir(dir);
   } else {
     cusolver_dir = relative_to_current_binary("../nvidia/cusolver/bin");
     ::AddDllDirectory(cublas_dir().c_str());
@@ -94,7 +114,7 @@ FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
       static auto nvrtc_dir = load_nvrtc();
       mod = ::LoadLibraryW((nvrtc_dir / dll).c_str());
     } else if (const char* dir = cuda_bin_dir()) {
-      mod = ::LoadLibraryW((fs::path(dir) / dll).c_str());
+      mod = ::LoadLibraryW((resolve_bin_dir(dir) / dll).c_str());
     }
   }
   return reinterpret_cast<FARPROC>(mod);

@@ -79,11 +79,15 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 
 CommandEncoder::CaptureContext::~CaptureContext() {
   if (!use_cuda_graphs()) {
-    enc.node_count_++;
+    if (!discard) {
+      enc.node_count_++;
+    }
     return;
   }
 
-  graph.end_capture(enc.stream());
+  if (static_cast<cudaGraph_t>(graph) == nullptr) {
+    graph.end_capture(enc.stream());
+  }
   if (discard) {
     return;
   }
@@ -195,7 +199,7 @@ std::pair<int, int> get_graph_limits(Device& d) {
       mb = 1000;
       break;
     case 1210: // DGX Spark
-      ops = 20;
+      ops = 100;
       mb = 25;
       break;
   }
@@ -229,7 +233,6 @@ void CommandEncoder::set_input_array(const array& arr) {
   if (!use_cuda_graphs()) {
     return;
   }
-  bytes_in_graph_ += arr.data_size();
   auto id = reinterpret_cast<std::uintptr_t>(arr.buffer().ptr());
   active_deps_.push_back(id);
 }
@@ -459,6 +462,23 @@ void CommandEncoder::add_graph_node(
   insert_graph_dependencies(GraphNode{node, subgraph_key});
 }
 
+void CommandEncoder::add_captured_graph_cached(
+    CudaGraph& graph,
+    std::string& cached_key,
+    bool& cached_updatable,
+    bool& has_cached_key) {
+  if (!use_cuda_graphs()) {
+    node_count_++;
+    return;
+  }
+  graph.end_capture(stream_);
+  if (!has_cached_key) {
+    std::tie(cached_key, cached_updatable) = subgraph_to_key(graph);
+    has_cached_key = true;
+  }
+  add_graph_node(graph, cached_key, cached_updatable);
+}
+
 bool CommandEncoder::needs_commit() {
   return (node_count_ > max_ops_per_graph_) ||
       ((bytes_in_graph_ >> 20) > max_mb_per_graph_);
@@ -512,7 +532,7 @@ void CommandEncoder::commit_impl() {
           graph_,
           from_nodes_.data(),
           to_nodes_.data(),
-          nullptr, // edgeData
+          nullptr,
           from_nodes_.size()));
 #else
       CHECK_CUDA_ERROR(cudaGraphAddDependencies(

@@ -36,9 +36,12 @@ const std::filesystem::path& default_cuda_toolkit_path() {
   static auto cached_path = []() -> std::filesystem::path {
     std::filesystem::path root(
         LR"(C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA)");
-    for (auto& file : std::filesystem::directory_iterator(root)) {
-      if (std::filesystem::exists(file.path() / "include" / "cuda.h")) {
-        return file.path();
+    std::error_code ec;
+    if (std::filesystem::exists(root, ec)) {
+      for (auto& file : std::filesystem::directory_iterator(root, ec)) {
+        if (std::filesystem::exists(file.path() / "include" / "cuda.h", ec)) {
+          return file.path();
+        }
       }
     }
     return {};
@@ -144,18 +147,41 @@ const std::filesystem::path& ptx_cache_dir() {
 std::filesystem::path get_ptx_path(
     const std::filesystem::path& cache_dir,
     const std::string& module_name) {
+#if defined(_WIN32)
+  std::string safe_name = module_name;
+  for (char& c : safe_name) {
+    switch (c) {
+      case '<':
+      case '>':
+      case ':':
+      case '"':
+      case '/':
+      case '\\':
+      case '|':
+      case '?':
+      case '*':
+        c = '_';
+        break;
+      default:
+        break;
+    }
+  }
+  const std::string& name = safe_name;
+#else
+  const std::string& name = module_name;
+#endif
   constexpr int max_file_name_length = 245;
-  if (module_name.size() <= max_file_name_length) {
-    return cache_dir / (module_name + ".ptx");
+  if (name.size() <= max_file_name_length) {
+    return cache_dir / (name + ".ptx");
   }
 
   auto ptx_path = cache_dir;
   int offset = 0;
-  while (module_name.size() - offset > max_file_name_length) {
-    ptx_path /= module_name.substr(offset, max_file_name_length);
+  while (name.size() - offset > max_file_name_length) {
+    ptx_path /= name.substr(offset, max_file_name_length);
     offset += max_file_name_length;
   }
-  ptx_path /= module_name.substr(offset) + ".ptx";
+  ptx_path /= name.substr(offset) + ".ptx";
 
   return ptx_path;
 }

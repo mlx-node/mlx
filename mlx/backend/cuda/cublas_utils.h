@@ -48,6 +48,40 @@ void init_cublas_handles_cache();
 
 class CublasMatmulBase {
  public:
+  struct PlanKey {
+    int device{0};
+    uint8_t plan_kind{0};
+    uint8_t a_transposed{0};
+    uint8_t b_transposed{0};
+    uint8_t has_bias{0};
+    uint8_t has_c{0};
+    uint8_t has_out_override{0};
+    uint8_t out_transposed{0};
+    uint8_t align_bits{0};
+    int32_t scale_type{0};
+    int32_t compute_type{0};
+    int32_t data_type{0};
+    int32_t output_type{0};
+    int32_t a_scale_mode{0};
+    int32_t b_scale_mode{0};
+    int32_t batch_count{0};
+    int32_t out_batch_count{0};
+    uint64_t a_rows{0};
+    uint64_t a_cols{0};
+    int64_t lda{0};
+    uint64_t b_rows{0};
+    uint64_t b_cols{0};
+    int64_t ldb{0};
+    int64_t ldc{0};
+    int64_t a_batch_stride{0};
+    int64_t b_batch_stride{0};
+    int64_t c_batch_stride{0};
+    uint64_t out_rows{0};
+    uint64_t out_cols{0};
+    int64_t out_ld{0};
+    int64_t out_batch_stride{0};
+  };
+
   virtual ~CublasMatmulBase();
 
   void set_bias(cu::CommandEncoder& encoder, const array& bias);
@@ -67,6 +101,7 @@ class CublasMatmulBase {
   cublasLtMatrixLayout_t c_desc_{nullptr};
   cublasLtMatrixLayout_t out_desc_{nullptr};
   cublasLtMatmulHeuristicResult_t heuristic_;
+  PlanKey plan_key_{};
 
   void init_base(
       cu::Device& device,

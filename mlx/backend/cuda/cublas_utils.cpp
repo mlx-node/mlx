@@ -2,8 +2,11 @@
 
 #include "mlx/backend/cuda/cublas_utils.h"
 #include "mlx/backend/cuda/cuda.h"
+#include "mlx/backend/cuda/lru_cache.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/utils.h"
+
+#include <cstring>
 
 namespace mlx::core {
 
@@ -78,6 +81,36 @@ auto get_cublas_handles(cu::Device& device) {
   return std::make_tuple(storage.handle, storage.pref);
 }
 
+struct CublasPlanEntry {
+  cublasLtMatmulHeuristicResult_t heuristic{};
+  std::string subgraph_key;
+  bool is_updatable{true};
+  bool has_heuristic{false};
+  bool has_subgraph_key{false};
+};
+
+auto& cublas_plan_cache() {
+  static thread_local LRUBytesKeyCache<
+      CublasMatmulBase::PlanKey,
+      CublasPlanEntry>
+      cache("MLX_CUDA_CUBLAS_CACHE_SIZE", /* default_capacity */ 512);
+  return cache;
+}
+
+inline uint8_t ptr_align_bucket(const void* ptr) {
+  if (!ptr) {
+    return 0;
+  }
+  auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+  if ((addr & 15) == 0) {
+    return 3;
+  }
+  if ((addr & 7) == 0) {
+    return 2;
+  }
+  return 1;
+}
+
 } // namespace
 
 void check_cublas_error(const char* name, cublasStatus_t err) {
@@ -122,6 +155,24 @@ void CublasMatmulBase::init_base(
   scale_type_ = scale_type;
   std::tie(handle_, pref_) = get_cublas_handles(device);
   heuristic_.state = CUBLAS_STATUS_NOT_INITIALIZED;
+
+  std::memset(&plan_key_, 0, sizeof(plan_key_));
+  plan_key_.device = device.cuda_device();
+  plan_key_.a_transposed = a_transposed ? 1 : 0;
+  plan_key_.b_transposed = b_transposed ? 1 : 0;
+  plan_key_.scale_type = static_cast<int32_t>(scale_type);
+  plan_key_.compute_type = static_cast<int32_t>(compute_type);
+  plan_key_.data_type = static_cast<int32_t>(data_type);
+  plan_key_.output_type = static_cast<int32_t>(output_type);
+  plan_key_.batch_count = batch_count;
+  plan_key_.a_rows = a_rows;
+  plan_key_.a_cols = a_cols;
+  plan_key_.lda = lda;
+  plan_key_.b_rows = b_rows;
+  plan_key_.b_cols = b_cols;
+  plan_key_.ldb = ldb;
+  plan_key_.a_batch_stride = a_batch_stride;
+  plan_key_.b_batch_stride = b_batch_stride;
 
   CHECK_CUBLAS_ERROR(
       cublasLtMatmulDescCreate(&matmul_desc_, compute_type, scale_type));
@@ -174,7 +225,23 @@ void CublasMatmulBase::execute_matmul(
     const void* c,
     const void* alpha_ptr,
     const void* beta_ptr) {
-  if (heuristic_.state != CUBLAS_STATUS_SUCCESS) {
+  BytesKey<PlanKey> cache_key;
+  std::memcpy(&cache_key.pod, &plan_key_, sizeof(PlanKey));
+  cache_key.pod.has_c = c ? 1 : 0;
+  cache_key.pod.align_bits = static_cast<uint8_t>(
+      ptr_align_bucket(out) | (ptr_align_bucket(a) << 2) |
+      (ptr_align_bucket(b) << 4) | (ptr_align_bucket(c) << 6));
+
+  auto& cache = cublas_plan_cache();
+  auto it = cache.find(cache_key);
+  if (it == cache.end()) {
+    it = cache.emplace(cache_key, CublasPlanEntry{}).first;
+  }
+  auto& entry = it->second;
+
+  if (entry.has_heuristic) {
+    heuristic_ = entry.heuristic;
+  } else if (heuristic_.state != CUBLAS_STATUS_SUCCESS) {
     int ret = 0;
     CHECK_CUBLAS_ERROR(cublasLtMatmulAlgoGetHeuristic(
         handle_,
@@ -190,35 +257,49 @@ void CublasMatmulBase::execute_matmul(
     if (ret == 0) {
       throw std::runtime_error("Can not find algorithm for matmul.");
     }
+    entry.heuristic = heuristic_;
+    entry.has_heuristic = true;
   }
 
   void* workspace_ptr = allocate_workspace(encoder, heuristic_.workspaceSize);
 
   // Execute matmul
   auto capture = encoder.capture_context();
-  CHECK_CUBLAS_ERROR(cublasLtMatmul(
-      handle_,
-      matmul_desc_,
-      alpha_ptr,
-      b, // a and b are swapped for row-major layout
-      a_desc_,
-      a,
-      b_desc_,
-      beta_ptr,
-      c ? c : out,
-      c ? c_desc_ : out_desc_,
-      out,
-      out_desc_,
-      &heuristic_.algo,
-      workspace_ptr,
-      heuristic_.workspaceSize,
-      encoder.stream()));
+  try {
+    CHECK_CUBLAS_ERROR(cublasLtMatmul(
+        handle_,
+        matmul_desc_,
+        alpha_ptr,
+        b, // a and b are swapped for row-major layout
+        a_desc_,
+        a,
+        b_desc_,
+        beta_ptr,
+        c ? c : out,
+        c ? c_desc_ : out_desc_,
+        out,
+        out_desc_,
+        &heuristic_.algo,
+        workspace_ptr,
+        heuristic_.workspaceSize,
+        encoder.stream()));
+  } catch (...) {
+    capture.discard = true;
+    throw;
+  }
+  capture.discard = true;
+  encoder.add_captured_graph_cached(
+      capture.graph,
+      entry.subgraph_key,
+      entry.is_updatable,
+      entry.has_subgraph_key);
 }
 
 void CublasMatmulBase::set_bias(
     cu::CommandEncoder& encoder,
     const array& bias) {
   encoder.set_input_array(bias);
+  plan_key_.has_bias = 1;
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(
       matmul_desc_,

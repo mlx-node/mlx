@@ -80,6 +80,7 @@ class CudaAllocator : public allocator::Allocator {
   size_t total_memory_;
   size_t max_pool_size_;
   BufferCache<CudaBuffer> buffer_cache_;
+  BufferCache<CudaBuffer> host_buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
   std::vector<CudaStream> free_streams_;

@@ -81,6 +81,9 @@ CublasQQMM::CublasQQMM(
 
   a_scale_mode_ = config.scale_mode;
   b_scale_mode_ = config.scale_mode;
+  plan_key_.plan_kind = 2;
+  plan_key_.a_scale_mode = static_cast<int32_t>(a_scale_mode_);
+  plan_key_.b_scale_mode = static_cast<int32_t>(b_scale_mode_);
 
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(
       matmul_desc_,
@@ -136,6 +139,8 @@ CublasQQMM::CublasQQMM(
       ldc,
       batch_count,
       c_batch_stride);
+  plan_key_.ldc = ldc;
+  plan_key_.c_batch_stride = c_batch_stride;
 }
 
 void CublasQQMM::run(

@@ -148,6 +148,10 @@ CudaAllocator::CudaAllocator()
     : buffer_cache_(
           page_size,
           [](CudaBuffer* buf) { return buf->size; },
+          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }),
+      host_buffer_cache_(
+          page_size,
+          [](CudaBuffer* buf) { return buf->size; },
           [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
   size_t free;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
@@ -185,15 +189,28 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     device = -1;
   }
 
-  // Find available buffer from cache.
+  // Find available buffer from cache. On platforms without concurrent managed
+  // access (e.g. Windows WDDM), keep pinned host buffers (device == -1)
+  // separate from device-pool buffers (device >= 0) so GPU ops never silently
+  // reuse host pinned memory and fresh host allocs never trigger stale D2H.
+  const bool separate_host_cache = !supports_managed_memory();
+  auto& active_cache = (separate_host_cache && device == -1)
+      ? host_buffer_cache_
+      : buffer_cache_;
   std::unique_lock lock(mutex_);
-  CudaBuffer* buf = buffer_cache_.reuse_from_cache(size);
+  CudaBuffer* buf = active_cache.reuse_from_cache(size);
   if (!buf) {
     // If we have a lot of memory pressure try to reclaim memory from the cache.
     int64_t mem_to_free =
         get_active_memory() + get_cache_memory() + size - get_memory_limit();
     if (mem_to_free > 0) {
+      size_t before = buffer_cache_.cache_size();
       buffer_cache_.release_cached_buffers(mem_to_free);
+      size_t freed = before - buffer_cache_.cache_size();
+      if (separate_host_cache && freed < static_cast<size_t>(mem_to_free)) {
+        host_buffer_cache_.release_cached_buffers(
+            static_cast<size_t>(mem_to_free) - freed);
+      }
     }
 
     // Try the scalar pool first
@@ -244,7 +261,13 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
 
   // Maintain the cache below the requested limit.
   if (get_cache_memory() > max_pool_size_) {
-    buffer_cache_.release_cached_buffers(get_cache_memory() - max_pool_size_);
+    size_t excess = get_cache_memory() - max_pool_size_;
+    size_t before = buffer_cache_.cache_size();
+    buffer_cache_.release_cached_buffers(excess);
+    size_t freed = before - buffer_cache_.cache_size();
+    if (separate_host_cache && freed < excess) {
+      host_buffer_cache_.release_cached_buffers(excess - freed);
+    }
   }
   lock.unlock();
   // Copy to unified memory here if the buffer is not on the right device.
@@ -271,7 +294,11 @@ void CudaAllocator::free(Buffer buffer) {
   std::unique_lock lock(mutex_);
   active_memory_ -= buf->size;
   if (get_cache_memory() < max_pool_size_) {
-    buffer_cache_.recycle_to_cache(buf);
+    if (!supports_managed_memory() && buf->device == -1) {
+      host_buffer_cache_.recycle_to_cache(buf);
+    } else {
+      buffer_cache_.recycle_to_cache(buf);
+    }
   } else {
     free_cuda_buffer(buf);
   }
@@ -361,7 +388,7 @@ size_t CudaAllocator::set_memory_limit(size_t limit) {
 }
 
 size_t CudaAllocator::get_cache_memory() const {
-  return buffer_cache_.cache_size();
+  return buffer_cache_.cache_size() + host_buffer_cache_.cache_size();
 }
 
 size_t CudaAllocator::set_cache_limit(size_t limit) {
@@ -374,6 +401,7 @@ void CudaAllocator::clear_cache() {
   {
     std::lock_guard lk(mutex_);
     buffer_cache_.clear();
+    host_buffer_cache_.clear();
   }
   for (size_t i = 0; i < mem_pools_.size(); ++i) {
     if (mem_pools_[i]) {
@@ -397,6 +425,7 @@ CudaAllocator& allocator() {
 }
 
 allocator::Data malloc_async(size_t size, CommandEncoder& encoder) {
+  encoder.add_graph_bytes(size);
   return allocator::Data(
       allocator().malloc_async(
           size, encoder.device().cuda_device(), encoder.stream()));

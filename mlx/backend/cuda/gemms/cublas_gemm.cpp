@@ -72,6 +72,7 @@ CublasGemm::CublasGemm(
       b_batch_stride);
 
   // alpha and beta are both host pointers
+  plan_key_.plan_kind = 1;
   cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(
       matmul_desc_,
@@ -113,6 +114,8 @@ CublasGemm::CublasGemm(
   auto type = cublas_utils::dtype_to_cublas_type(dtype, "CublasGemm");
   c_desc_ = cublas_utils::create_matrix_layout(
       type, b_cols, a_rows, false, ldc, batch_count, c_batch_stride);
+  plan_key_.ldc = ldc;
+  plan_key_.c_batch_stride = c_batch_stride;
 }
 
 void CublasGemm::set_out(
@@ -124,14 +127,17 @@ void CublasGemm::set_out(
     int32_t batch_count,
     int64_t batch_stride) {
   CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutDestroy(out_desc_));
+  auto out_type = cublas_utils::dtype_to_cublas_type(dtype, "CublasGemm");
   out_desc_ = cublas_utils::create_matrix_layout(
-      cublas_utils::dtype_to_cublas_type(dtype, "CublasGemm"),
-      cols,
-      rows,
-      transposed,
-      ld,
-      batch_count,
-      batch_stride);
+      out_type, cols, rows, transposed, ld, batch_count, batch_stride);
+  plan_key_.has_out_override = 1;
+  plan_key_.output_type = static_cast<int32_t>(out_type);
+  plan_key_.out_transposed = transposed ? 1 : 0;
+  plan_key_.out_rows = rows;
+  plan_key_.out_cols = cols;
+  plan_key_.out_ld = ld;
+  plan_key_.out_batch_count = batch_count;
+  plan_key_.out_batch_stride = batch_stride;
 }
 
 void CublasGemm::run(

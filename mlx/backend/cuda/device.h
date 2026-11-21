@@ -104,9 +104,18 @@ class MLX_API CommandEncoder {
       cudaGraph_t child,
       const std::string& subgraph_key,
       bool is_updatable);
+  void add_captured_graph_cached(
+      CudaGraph& graph,
+      std::string& cached_key,
+      bool& cached_updatable,
+      bool& has_cached_key);
 
   void add_temporary(const array& arr) {
     temporaries_.push_back(arr.data_shared_ptr());
+  }
+
+  void add_graph_bytes(size_t nbytes) {
+    bytes_in_graph_ += nbytes;
   }
 
   void add_completed_handler(std::function<void()> task);
