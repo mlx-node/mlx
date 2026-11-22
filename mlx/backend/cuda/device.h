@@ -223,6 +223,9 @@ MLX_API Device& device(int cuda_device);
 MLX_API Device& device(mlx::core::Device d);
 MLX_API CommandEncoder& get_command_encoder(Stream s);
 
+MLX_API bool get_use_cuda_graphs();
+MLX_API bool set_use_cuda_graphs(bool enable);
+
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 

@@ -10,12 +10,20 @@
 #include "mlx/utils.h"
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include "mlx/backend/cuda/wddm.h"
 #endif
 
 #include <cuda_runtime.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <string>
@@ -148,16 +156,43 @@ CudaAllocator::CudaAllocator()
     : buffer_cache_(
           page_size,
           [](CudaBuffer* buf) { return buf->size; },
-          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }),
+          [this](CudaBuffer* buf) { free_cuda_buffer(buf); }
+#ifdef _WIN32
+          ,
+          size_t(64ULL << 20)
+#endif
+          ),
       host_buffer_cache_(
           page_size,
           [](CudaBuffer* buf) { return buf->size; },
           [this](CudaBuffer* buf) { free_cuda_buffer(buf); }) {
   size_t free;
   CHECK_CUDA_ERROR(cudaMemGetInfo(&free, &total_memory_));
+#ifdef _WIN32
+  // On Windows WDDM unified-memory integrated GPUs (e.g. RTX Spark N1X),
+  // cudaMemGetInfo may report only the small carved-out local segment (e.g.
+  // 8 GiB) rather than the full unified physical RAM accessible via
+  // cudaMallocAsync, causing premature buffer-cache eviction on large models.
+  {
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && prop.integrated) {
+      MEMORYSTATUSEX ms{};
+      ms.dwLength = sizeof(ms);
+      if (GlobalMemoryStatusEx(&ms) &&
+          static_cast<size_t>(ms.ullTotalPhys) > total_memory_) {
+        total_memory_ = static_cast<size_t>(ms.ullTotalPhys);
+      }
+    }
+  }
+#endif
   memory_limit_ = total_memory_ * 0.95;
   free_limit_ = total_memory_ - memory_limit_;
   max_pool_size_ = memory_limit_;
+#ifdef _WIN32
+  // Bound the freed-buffer cache on Windows WDDM so large unified-memory
+  // machines retain prefill working buffers without hoarding idle RAM.
+  max_pool_size_ = std::min(max_pool_size_, size_t(8ULL << 30));
+#endif
 
   int device_count = gpu::device_count();
   free_streams_.resize(device_count);

@@ -1,22 +1,31 @@
 // Copyright © 2025 Apple Inc.
 
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/worker.h"
 #include "mlx/backend/gpu/device_info.h"
+#include "mlx/stream.h"
 #include "mlx/utils.h"
 
 #include <fmt/format.h>
 #include <nvtx3/nvtx3.hpp>
+#include <atomic>
 #include <future>
+#include <mutex>
 #include <unordered_set>
 
 namespace mlx::core::cu {
 
 namespace {
 
-bool use_cuda_graphs() {
-  static bool use_graphs = env::get_var("MLX_USE_CUDA_GRAPHS", true);
+std::atomic<bool>& use_cuda_graphs_flag() {
+  static std::atomic<bool> use_graphs{
+      env::get_var("MLX_USE_CUDA_GRAPHS", true) != 0};
   return use_graphs;
+}
+
+bool use_cuda_graphs() {
+  return use_cuda_graphs_flag().load(std::memory_order_acquire);
 }
 
 const char* save_cuda_graphs_dot_file() {
@@ -650,6 +659,26 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
   // shutdown
   static auto* encoders = new std::unordered_map<int, CommandEncoder>();
   return *encoders;
+}
+
+bool get_use_cuda_graphs() {
+  return use_cuda_graphs_flag().load(std::memory_order_acquire);
+}
+
+bool set_use_cuda_graphs(bool enable) {
+  static std::mutex toggle_mutex;
+  std::lock_guard<std::mutex> lock(toggle_mutex);
+  bool prev = use_cuda_graphs_flag().load(std::memory_order_acquire);
+  if (prev == enable) {
+    return prev;
+  }
+  // Drain the default GPU stream before toggling graph capture so no in-flight
+  // CommandEncoder sees a mixed graph/non-graph batch.
+  if (is_available()) {
+    mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::gpu));
+  }
+  use_cuda_graphs_flag().store(enable, std::memory_order_release);
+  return prev;
 }
 
 } // namespace mlx::core::cu

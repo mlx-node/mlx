@@ -15,8 +15,10 @@ class BufferCache {
   BufferCache(
       size_t page_size,
       std::function<size_t(T*)> get_size,
-      std::function<void(T*)> free)
+      std::function<void(T*)> free,
+      size_t max_reuse_slack = 0)
       : page_size_(page_size),
+        max_reuse_slack_(max_reuse_slack ? max_reuse_slack : 2 * page_size),
         get_size_(std::move(get_size)),
         free_(std::move(free)) {}
 
@@ -29,9 +31,14 @@ class BufferCache {
 
   T* reuse_from_cache(size_t size) {
     // Find the closest buffer in pool.
+    // Apply relaxed reuse slack only to large buffers (>= 1 MiB) so small
+    // decode allocations preserve exact-size FIFO address stability for CUDA
+    // Graph exec updates.
     auto it = buffer_pool_.lower_bound(size);
+    const size_t slack =
+        (size >= (1ULL << 20)) ? max_reuse_slack_ : (2 * page_size_);
     if (it == buffer_pool_.end() ||
-        it->first >= std::min(2 * size, size + 2 * page_size_)) {
+        it->first >= std::min(2 * size, size + slack)) {
       return nullptr;
     }
 
@@ -151,6 +158,7 @@ class BufferCache {
   size_t pool_size_{0};
 
   const size_t page_size_;
+  const size_t max_reuse_slack_;
   std::function<size_t(T*)> get_size_;
   std::function<void(T*)> free_;
 };
