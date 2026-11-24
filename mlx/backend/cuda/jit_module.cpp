@@ -70,27 +70,69 @@ inline const char* cudart_dirname() {
 const std::vector<std::string>& include_path_args() {
   static std::vector<std::string> cached_args = []() {
     std::vector<std::string> args;
+    std::error_code ec;
     // Add path to bundled headers.
-    auto root_dir = current_binary_dir();
+    auto has_bundled_headers = [](const std::filesystem::path& include_dir) {
+      std::error_code check_ec;
+      return std::filesystem::exists(include_dir / "cccl", check_ec) ||
+          std::filesystem::exists(include_dir / "cutlass", check_ec);
+    };
+    auto binary_dir = current_binary_dir();
+    auto root_dir = binary_dir;
+    std::filesystem::path path;
+    // 1. Colocated `<binary_dir>/include` (flat npm addon layout, local dev).
+    // 2. `<binary_dir>/../include` (Python wheels `mlx/lib/libmlx.so`, Cargo <
+    //    1.100 `target/<profile>/deps/<bin>`).
+    // 3. Cargo >= 1.100 `target/<profile>/build/<pkg>/<hash>/out/<bin>` ->
+    //    `target/<profile>/include`.
+    // 4. Explicit `MLX_CUDA_INCLUDE_DIR` override.
+    if (has_bundled_headers(binary_dir / "include")) {
+      path = binary_dir / "include";
+    } else if (has_bundled_headers(binary_dir.parent_path() / "include")) {
+      root_dir = binary_dir.parent_path();
+      path = root_dir / "include";
+    } else if (
+        binary_dir.filename() == "out" &&
+        binary_dir.parent_path().parent_path().parent_path().filename() ==
+            "build" &&
+        has_bundled_headers(
+            binary_dir.parent_path()
+                .parent_path()
+                .parent_path()
+                .parent_path() /
+            "include")) {
+      root_dir = binary_dir.parent_path()
+                     .parent_path()
+                     .parent_path()
+                     .parent_path();
+      path = root_dir / "include";
+    } else if (const char* env_inc = std::getenv("MLX_CUDA_INCLUDE_DIR");
+               env_inc && *env_inc &&
+               std::filesystem::exists(std::filesystem::path(env_inc), ec)) {
+      path = std::filesystem::path(env_inc);
+    } else {
 #if !defined(_WIN32)
-    root_dir = root_dir.parent_path();
+      root_dir = binary_dir.parent_path();
 #endif
-    auto path = root_dir / "include";
-    if (std::filesystem::exists(path)) {
+      path = root_dir / "include";
+    }
+    if (std::filesystem::exists(path, ec)) {
       args.push_back(fmt::format("--include-path={}", path.string()));
     }
     // Add path to CCCL headers.
+    bool has_cccl = false;
     path = path / "cccl";
-    if (!std::filesystem::exists(path) && cccl_dir()) {
+    if (!std::filesystem::exists(path, ec) && cccl_dir()) {
       path = cccl_dir();
     }
-    if (std::filesystem::exists(path)) {
+    if (std::filesystem::exists(path, ec)) {
       args.push_back(fmt::format("--include-path={}", path.string()));
+      has_cccl = true;
     }
     // Add path to CUDA runtime headers, try local-installed python package
     // first and then system-installed headers.
     path = root_dir.parent_path() / "nvidia" / cudart_dirname() / "include";
-    if (!std::filesystem::exists(path)) {
+    if (!std::filesystem::exists(path, ec)) {
       const char* home = std::getenv("CUDA_HOME");
       if (!home) {
         home = std::getenv("CUDA_PATH");
@@ -99,13 +141,17 @@ const std::vector<std::string>& include_path_args() {
       if (!path.empty()) {
         path = path / "include";
       }
-      if (path.empty() || !std::filesystem::exists(path)) {
+      if (path.empty() || !std::filesystem::exists(path, ec)) {
         throw std::runtime_error(
             "Can not find locations of CUDA headers, please set environment "
             "variable CUDA_HOME or CUDA_PATH.");
       }
     }
     args.push_back(fmt::format("--include-path={}", path.string()));
+    if (!has_cccl && std::filesystem::exists(path / "cccl", ec)) {
+      args.push_back(
+          fmt::format("--include-path={}", (path / "cccl").string()));
+    }
     return args;
   }();
   return cached_args;
